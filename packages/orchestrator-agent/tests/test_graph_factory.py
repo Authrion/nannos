@@ -182,7 +182,7 @@ class TestStaticTools:
 
         # Verify it's a list of tools
         assert isinstance(tools, list)
-        assert len(tools) == 8  # 3 core + 5 playbook tools; FinalResponseSchema only added when with_response_tool=True
+        assert len(tools) == 7  # 3 core + 4 playbook tools; FinalResponseSchema only added when with_response_tool=True
 
         # Get tool names
         tool_names = [tool.name for tool in tools]
@@ -192,7 +192,6 @@ class TestStaticTools:
         assert "get_current_time" in tool_names
         assert "copy_file" in tool_names
         assert "list_skills" in tool_names
-        assert "fetch_skill" in tool_names
         assert "update_agents_md" in tool_names
         assert "create_skill_md" in tool_names
         assert "update_skill_md" in tool_names

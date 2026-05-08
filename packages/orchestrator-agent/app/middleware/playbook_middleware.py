@@ -141,7 +141,7 @@ class PlaybookInjectionMiddleware(AgentMiddleware[AgentState, GraphRuntimeContex
                 skill_lines = [f"- `{s.name}` ({s.scope}): {s.description}" for s in skills]
                 parts.append(
                     "<available_skills>\n"
-                    "The following skills are available. Use the fetch_skill tool to load full details when needed:\n"
+                    "The following skills are available. Use read_file('/skills/{name}/SKILL.md') to load full details:\n"
                     + "\n".join(skill_lines)
                     + "\n</available_skills>"
                 )

@@ -1,13 +1,16 @@
 """Playbook tools for reading and updating AGENTS.md and SKILLS.md files.
 
 Provides four tools:
-- fetch_skill: Read-only tool to load a skill file on-demand
+- list_skills: List available skills
 - update_agents_md: HITL-guarded tool to update AGENTS.md
 - create_skill_md: HITL-guarded tool to create a new skill file
 - update_skill_md: HITL-guarded tool to update an existing skill file
 
 The three write tools are designed to be registered in HITL_GUARDED_TOOLS
 so the user is always prompted for approval before changes are persisted.
+
+Skill content is accessible via read_file('/skills/{name}/SKILL.md') through
+the SkillsStoreBackend mounted on the virtual filesystem.
 """
 
 import logging
@@ -31,19 +34,6 @@ class ListSkillsInput(BaseModel):
     """Input schema for list_skills tool (no parameters)."""
 
     pass
-
-
-class FetchSkillInput(BaseModel):
-    """Input schema for fetch_skill tool."""
-
-    skill_name: str = Field(
-        ...,
-        description="Name of the skill to fetch (without .md extension). See available_skills in system prompt or use list_skills.",
-    )
-    scope: Literal["personal", "group", "auto"] = Field(
-        default="auto",
-        description="Scope to search: 'personal' (user only), 'group' (group only), 'auto' (personal first, fallback to group)",
-    )
 
 
 class UpdateAgentsMdInput(BaseModel):
@@ -292,48 +282,9 @@ def create_playbook_tools(store: AsyncPostgresStore) -> list[BaseTool]:
         store: AsyncPostgresStore for reading/writing playbook files
 
     Returns:
-        List of playbook tools [fetch_skill, update_agents_md, create_skill_md, update_skill_md]
+        List of playbook tools [list_skills, update_agents_md, create_skill_md, update_skill_md]
     """
     reader = PlaybookReaderService(store)
-
-    async def fetch_skill_handler(
-        skill_name: str,
-        scope: str = "auto",
-        runtime: Optional[ToolRuntime] = None,
-    ) -> str:
-        """Fetch a skill file for detailed workflow instructions.
-
-        Use this when you need guidance for a complex multi-step workflow
-        listed in <available_skills>. Returns the full skill content.
-
-        Args:
-            skill_name: Name of the skill (from available_skills index)
-            scope: "personal", "group", or "auto" (tries personal first)
-            runtime: Tool runtime (injected)
-
-        Returns:
-            Skill content or error message
-        """
-        user_id, group_id = _get_user_id_and_group_id(runtime)
-        if not user_id:
-            return "Error: Could not determine user identity. Cannot fetch skill."
-
-        # Determine agent_name from runtime context
-        # Skills are loaded relative to the current agent
-        agent_name = runtime.config.get("metadata", {}).get("agent_name", "orchestrator") if runtime else "orchestrator"
-
-        group_ids = _get_group_ids(runtime)
-        content = await reader.read_skill(
-            user_id=user_id,
-            agent_name=agent_name,
-            skill_name=skill_name,
-            group_ids=group_ids,
-            scope=scope,
-        )
-
-        if content:
-            return content
-        return f"Skill '{skill_name}' not found in {scope} scope. Check available_skills for valid names."
 
     async def update_agents_md_handler(
         agent_name: str,
@@ -427,6 +378,12 @@ def create_playbook_tools(store: AsyncPostgresStore) -> list[BaseTool]:
         if not user_id:
             return "Error: Could not determine user identity."
 
+        if scope not in ("personal", "group"):
+            return (
+                "Error: Standard skills are immutable and cannot be created at runtime. "
+                "To override a standard skill, create a personal or group skill with the same name."
+            )
+
         if scope == "group" and not group_id:
             return "Error: No group context available. Cannot create group skill."
 
@@ -494,6 +451,12 @@ def create_playbook_tools(store: AsyncPostgresStore) -> list[BaseTool]:
         if not user_id:
             return "Error: Could not determine user identity."
 
+        if scope not in ("personal", "group"):
+            return (
+                "Error: Standard skills are immutable and cannot be updated at runtime. "
+                "To override a standard skill, create a personal or group skill with the same name."
+            )
+
         if scope == "group" and not group_id:
             return "Error: No group context available. Cannot update group skill."
 
@@ -555,8 +518,13 @@ def create_playbook_tools(store: AsyncPostgresStore) -> list[BaseTool]:
         if not skills:
             return "No skills are currently defined. You can create one with the create_skill_md tool."
 
-        lines = [f"- `{s.name}` ({s.scope}): {s.description}" for s in skills]
-        return "Available skills:\n" + "\n".join(lines)
+        lines = []
+        for s in skills:
+            scope_label = s.scope
+            lines.append(f"- `{s.name}` ({scope_label}): {s.description}")
+        result = "Available skills:\n" + "\n".join(lines)
+        result += "\n\nUse `read_file('/skills/{name}/SKILL.md')` to load full skill content."
+        return result
 
     # Build tool objects
     list_skills_tool = StructuredTool.from_function(
@@ -564,21 +532,10 @@ def create_playbook_tools(store: AsyncPostgresStore) -> list[BaseTool]:
         name="list_skills",
         description=(
             "List all available skills (playbook workflows) for the current agent. "
-            "Returns skill names, descriptions, and scopes (personal/group). "
-            "Use this to discover what skills exist before fetching one with fetch_skill."
+            "Returns skill names, descriptions, and scopes (personal/group/standard). "
+            "Use read_file('/skills/{name}/SKILL.md') to load full skill content."
         ),
         args_schema=ListSkillsInput,
-    )
-
-    fetch_skill_tool = StructuredTool.from_function(
-        coroutine=fetch_skill_handler,
-        name="fetch_skill",
-        description=(
-            "Fetch a skill's full workflow instructions. Use when you need detailed guidance "
-            "for a complex multi-step workflow listed in <available_skills>. "
-            "Returns the complete skill content with steps, examples, and best practices."
-        ),
-        args_schema=FetchSkillInput,
     )
 
     update_agents_md_tool = StructuredTool.from_function(
@@ -598,7 +555,8 @@ def create_playbook_tools(store: AsyncPostgresStore) -> list[BaseTool]:
         description=(
             "Create a new skill file documenting a complex multi-step workflow. "
             "Use this when you've learned a repeatable process that should be captured "
-            "for future reference. Requires user approval. Available via fetch_skill after creation."
+            "for future reference. Only personal and group scopes; standard skills are immutable. "
+            "Requires user approval. Available via read_file('/skills/{name}/SKILL.md') after creation."
         ),
         args_schema=CreateSkillMdInput,
     )
@@ -609,9 +567,10 @@ def create_playbook_tools(store: AsyncPostgresStore) -> list[BaseTool]:
         description=(
             "Update an existing skill file with improved workflow instructions. "
             "Use when a skill's steps, examples, or best practices need refinement. "
+            "Only personal and group scopes; standard skills are immutable. "
             "Requires user approval. Changes take effect from the next message."
         ),
         args_schema=UpdateSkillMdInput,
     )
 
-    return [list_skills_tool, fetch_skill_tool, update_agents_md_tool, create_skill_md_tool, update_skill_md_tool]
+    return [list_skills_tool, update_agents_md_tool, create_skill_md_tool, update_skill_md_tool]

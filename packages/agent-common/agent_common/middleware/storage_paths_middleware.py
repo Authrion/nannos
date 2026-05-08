@@ -40,6 +40,8 @@ The filesystem supports different storage locations with different persistence:
 - Personal storage (`/memories/`): Files persist across conversations, private to you.
 - Channel storage (`/channel_memories/`): Files shared with all channel members.
 - Group storage (`/group_memories/`): Files shared with all group members.
+- Skills storage (`/skills/`): Read-only. Contains agent skills (instructions and scripts).
+  Use read_file to load full skill content. Use list_skills tool to discover available skills.
 
 Use `/memories/` for documents, notes, and data you want to keep long-term.
 Use `/channel_memories/` in Slack channels when sharing files with team members.

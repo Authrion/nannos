@@ -213,6 +213,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         )
         self._agent = None
         self._discovered_tools: Optional[List[BaseTool]] = None
+        self._resolved_skills: dict = {}
 
     @property
     def name(self) -> str:
@@ -329,7 +330,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         """Build the playbook addendum for the system prompt.
 
         Reads AGENTS.md from both group and personal scopes, plus builds
-        a skill index for on-demand loading via fetch_skill tool.
+        a Skills System block listing all resolved skills (standard + group + personal).
 
         Returns:
             Formatted string to append to the system prompt, or empty string if no playbooks
@@ -362,20 +363,24 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
                 "</playbook_conflict_resolution>"
             )
 
-        # Build skill index
-        skills = await reader.list_skills(
-            user_id=self.user_id,
-            agent_name=self.name,
-            group_ids=self.group_ids,
-        )
+        # Build Skills System block from resolved skills
+        if self._resolved_skills:
+            skill_lines = []
+            for skill in sorted(self._resolved_skills.values(), key=lambda s: s.name):
+                scope_label = skill.scope
+                if skill.overrides:
+                    scope_label += f", overrides {skill.overrides}"
+                skill_lines.append(f"- `{skill.name}` ({scope_label}): {skill.description}")
 
-        if skills:
-            skill_lines = [f"- `{s.name}` ({s.scope}): {s.description}" for s in skills]
             parts.append(
-                "<available_skills>\n"
-                "The following skills are available. Use the fetch_skill tool to load full details when needed:\n"
-                + "\n".join(skill_lines)
-                + "\n</available_skills>"
+                "## Skills System\n"
+                "You have access to the following skills. Each skill is a directory under /skills/\n"
+                "containing a SKILL.md file (and optionally scripts, references, assets).\n\n"
+                "To use a skill:\n"
+                "1. Match the user's request to a skill description below.\n"
+                "2. Read the full SKILL.md with read_file('/skills/<name>/SKILL.md').\n"
+                "3. Follow its instructions; read any referenced files as needed.\n\n"
+                "Available skills:\n" + "\n".join(skill_lines)
             )
 
         if not parts:
@@ -607,6 +612,27 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             playbook_tools = create_playbook_tools(self.store)
             tools = tools + playbook_tools
 
+        # Pre-resolve skills (standard + group + personal) for the virtual filesystem
+        if self.store and self.user_id:
+            from agent_common.core.skills_resolver import resolve_skills_for_agent
+            from agent_common.models.skill import SkillDefinition as AgentSkillDef
+
+            standard_skills = []
+            if hasattr(self.config, "skills") and self.config.skills:
+                standard_skills = [
+                    AgentSkillDef(name=s.name, description=s.description, body=s.body)
+                    if not isinstance(s, AgentSkillDef)
+                    else s
+                    for s in self.config.skills
+                ]
+            self._resolved_skills = await resolve_skills_for_agent(
+                store=self.store,
+                user_id=self.user_id,
+                agent_name=self.name,
+                group_ids=self.group_ids or [],
+                standard_skills=standard_skills,
+            )
+
         logger.info(f"Creating LangGraph agent '{self.name}' with {len(tools)} tools")
 
         # Build system prompt with A2A protocol addendum and user preferences
@@ -651,6 +677,16 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             else None
         )
 
+        # Build the backend factory with resolved skills mounted at /skills/
+        effective_backend_factory = self.backend_factory
+        if not effective_backend_factory and self._resolved_skills:
+            from agent_common.core.graph_utils import create_indexing_backend_factory
+
+            effective_backend_factory = create_indexing_backend_factory(
+                store=self.store,
+                resolved_skills=self._resolved_skills,
+            )
+
         self._agent = build_sub_agent_graph(
             model=self.model,
             tools=tools,
@@ -658,7 +694,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             checkpointer=self.checkpointer,  # Shared checkpointer for multi-turn conversations
             store=self.store,  # Shared document store for persistent memory
             response_format=response_format,
-            backend_factory=self.backend_factory or None,
+            backend_factory=effective_backend_factory or None,
             hitl_guarded_tools=hitl_guarded,
         )
 

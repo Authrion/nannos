@@ -46,8 +46,10 @@ from ringier_a2a_sdk.cost_tracking import CostLogger
 from ringier_a2a_sdk.middleware.tool_schema_cleaning import ToolSchemaCleaningMiddleware
 
 from agent_common.backends.indexing_store import IndexingStoreBackend
+from agent_common.backends.skills_store import SkillsStoreBackend
 from agent_common.middleware.loop_detection_middleware import RepeatedToolCallMiddleware
 from agent_common.middleware.storage_paths_middleware import StoragePathsInstructionMiddleware
+from agent_common.models.skill import ResolvedSkill
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +217,7 @@ def create_indexing_backend_factory(
     store: AsyncPostgresStore | None,
     bedrock_region: str | None = None,
     cost_logger: Optional[CostLogger] = None,
+    resolved_skills: dict[str, ResolvedSkill] | None = None,
 ) -> Callable[[Any], Any]:
     """Return a backend factory for FilesystemMiddleware.
 
@@ -242,6 +245,8 @@ def create_indexing_backend_factory(
         cost_logger: Optional ``CostLogger`` for reporting LLM usage costs
             incurred by the indexing pipeline (contextualisation calls to
             Claude).
+        resolved_skills: Pre-resolved skills dict to mount at ``/skills/``
+            as a read-only backend.  When ``None``, no skills route is added.
 
     Returns:
         A callable ``(Runtime) -> Backend`` suitable for passing to
@@ -295,14 +300,18 @@ def create_indexing_backend_factory(
                 namespace_factory=lambda ctx: _group_scoped_namespace(ctx),
             )
 
+            routes: dict[str, BackendProtocol] = {
+                "/memories/": user_documents_backend,
+                "/large_tool_results/": tool_results_backend,
+                "/channel_memories/": channel_documents_backend,
+                "/group_memories/": group_documents_backend,
+            }
+            if resolved_skills:
+                routes["/skills/"] = SkillsStoreBackend(resolved_skills)
+
             return CompositeBackend(
                 default=StateBackend(),
-                routes={
-                    "/memories/": user_documents_backend,
-                    "/large_tool_results/": tool_results_backend,
-                    "/channel_memories/": channel_documents_backend,
-                    "/group_memories/": group_documents_backend,
-                },
+                routes=routes,
             )
 
         return _backend_with_indexing
