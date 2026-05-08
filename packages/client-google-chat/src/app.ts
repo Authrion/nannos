@@ -341,15 +341,15 @@ function setupServerTimeouts(server: Server, config: Config) {
                 }
               }
 
-              if (actionMethod === 'bug_report_confirm' || actionMethod === 'bug_report_decline') {
-                // Extract bug report details from parameters
+              if (actionMethod === 'hitl_approve' || actionMethod === 'hitl_reject') {
+                // Extract details from parameters
                 const taskId = params.taskId;
                 
-                logger.info(`Bug report action: ${actionMethod} for taskId=${taskId}`);
+                logger.info(`HITL action: ${actionMethod} for taskId=${taskId} tool=${params.toolName || 'unknown'}`);
 
                 // Build decisions payload as structured data (DataPart)
                 let decisions: Record<string, unknown>;
-                if (actionMethod === 'bug_report_confirm') {
+                if (actionMethod === 'hitl_approve') {
                   decisions = { decisions: [{ type: 'approve' }] };
                 } else {
                   decisions = { decisions: [{ type: 'reject', message: 'User declined' }] };

@@ -163,6 +163,8 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         mcp_gateway_url: Optional[str] = None,
         mcp_gateway_client_id: Optional[str] = None,
         console_backend_client_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        group_ids: Optional[List[str]] = None,
     ):
         """Initialize the dynamic local agent runnable.
 
@@ -183,6 +185,8 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             mcp_gateway_url: MCP gateway URL (defaults to MCP_GATEWAY_URL env var)
             mcp_gateway_client_id: MCP gateway client ID (defaults to MCP_GATEWAY_CLIENT_ID env var)
             console_backend_client_id: Console backend OIDC client ID for token exchange (defaults to CONSOLE_BACKEND_CLIENT_ID env var)
+            user_id: User's stable database ID (for playbook loading)
+            group_ids: User's group IDs for group playbook loading (all groups)
         """
         self.config = config
         self.model = model
@@ -197,6 +201,8 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         self.custom_prompt = custom_prompt
         self.store = store
         self.backend_factory = backend_factory
+        self.user_id = user_id
+        self.group_ids = group_ids
         self.mcp_gateway_url = mcp_gateway_url or os.getenv("MCP_GATEWAY_URL", "")
         self.mcp_gateway_client_id = mcp_gateway_client_id or os.getenv("MCP_GATEWAY_CLIENT_ID", "gatana")
         self.console_backend_client_id = console_backend_client_id or os.getenv(
@@ -318,6 +324,64 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         )
 
         return addendum
+
+    async def _build_playbook_addendum(self) -> str:
+        """Build the playbook addendum for the system prompt.
+
+        Reads AGENTS.md from both group and personal scopes, plus builds
+        a skill index for on-demand loading via fetch_skill tool.
+
+        Returns:
+            Formatted string to append to the system prompt, or empty string if no playbooks
+        """
+        if not self.store or not self.user_id:
+            return ""
+
+        from agent_common.core.playbook_reader import PlaybookReaderService
+
+        reader = PlaybookReaderService(self.store)
+        parts: List[str] = []
+
+        # Load AGENTS.md from group and personal scopes
+        group_content, personal_content = await reader.read_agents_md(
+            user_id=self.user_id,
+            agent_name=self.name,
+            group_ids=self.group_ids,
+        )
+
+        if group_content:
+            parts.append(f"<group_playbook>\n{group_content}\n</group_playbook>")
+
+        if personal_content:
+            parts.append(f"<personal_playbook>\n{personal_content}\n</personal_playbook>")
+
+        if group_content and personal_content:
+            parts.append(
+                "<playbook_conflict_resolution>\n"
+                "If the personal playbook contradicts the group playbook, follow the personal playbook.\n"
+                "</playbook_conflict_resolution>"
+            )
+
+        # Build skill index
+        skills = await reader.list_skills(
+            user_id=self.user_id,
+            agent_name=self.name,
+            group_ids=self.group_ids,
+        )
+
+        if skills:
+            skill_lines = [f"- `{s.name}` ({s.scope}): {s.description}" for s in skills]
+            parts.append(
+                "<available_skills>\n"
+                "The following skills are available. Use the fetch_skill tool to load full details when needed:\n"
+                + "\n".join(skill_lines)
+                + "\n</available_skills>"
+            )
+
+        if not parts:
+            return ""
+
+        return "\n\n" + "\n".join(parts)
 
     async def _discover_mcp_tools(self) -> List[BaseTool]:
         """Discover tools from MCP servers with authentication.
@@ -535,6 +599,14 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             self._discovered_tools = await self._discover_mcp_tools()
 
         tools = self._get_effective_tools()
+
+        # Add playbook tools if store is available
+        if self.store:
+            from agent_common.core.playbook_tools import create_playbook_tools
+
+            playbook_tools = create_playbook_tools(self.store)
+            tools = tools + playbook_tools
+
         logger.info(f"Creating LangGraph agent '{self.name}' with {len(tools)} tools")
 
         # Build system prompt with A2A protocol addendum and user preferences
@@ -543,6 +615,12 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         if preferences_addendum:
             system_prompt += preferences_addendum
             logger.debug(f"Added user preferences addendum to {self.name} system prompt")
+
+        # Load playbooks from persistent store (AGENTS.md auto-loaded, skills indexed)
+        playbook_addendum = await self._build_playbook_addendum()
+        if playbook_addendum:
+            system_prompt += playbook_addendum
+            logger.debug(f"Added playbook addendum to {self.name} system prompt")
 
         # Get model-specific response_format strategy (may mutate tools list for Bedrock+thinking)
         response_format = get_response_format(
@@ -553,6 +631,26 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
 
         # Build agent via the shared helper: handles backend factory selection
         # (injected vs. auto-created), middleware stack assembly, and graph creation.
+        # Include HITL for playbook write tools so changes require user approval.
+        hitl_guarded = (
+            {
+                "update_agents_md": {
+                    "allowed_decisions": ["approve", "edit", "reject"],
+                    "description": "Agent wants to save a learned preference to your playbook.",
+                },
+                "create_skill_md": {
+                    "allowed_decisions": ["approve", "edit", "reject"],
+                    "description": "Agent wants to create a new skill in your playbook.",
+                },
+                "update_skill_md": {
+                    "allowed_decisions": ["approve", "edit", "reject"],
+                    "description": "Agent wants to update a skill in your playbook.",
+                },
+            }
+            if self.store
+            else None
+        )
+
         self._agent = build_sub_agent_graph(
             model=self.model,
             tools=tools,
@@ -561,6 +659,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             store=self.store,  # Shared document store for persistent memory
             response_format=response_format,
             backend_factory=self.backend_factory or None,
+            hitl_guarded_tools=hitl_guarded,
         )
 
         return self._agent
@@ -757,6 +856,8 @@ def create_dynamic_local_subagent(
     mcp_gateway_url: Optional[str] = None,
     mcp_gateway_client_id: Optional[str] = None,
     console_backend_client_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    group_ids: Optional[List[str]] = None,
 ) -> CompiledSubAgent:
     """Create a dynamic local sub-agent from configuration.
 
@@ -779,6 +880,8 @@ def create_dynamic_local_subagent(
         mcp_gateway_url: MCP gateway URL (defaults to MCP_GATEWAY_URL env var)
         mcp_gateway_client_id: MCP gateway client ID (defaults to MCP_GATEWAY_CLIENT_ID env var)
         console_backend_client_id: Console backend OIDC client ID for token exchange (defaults to CONSOLE_BACKEND_CLIENT_ID env var)
+        user_id: User's stable database ID (for playbook loading)
+        group_ids: User's group IDs for group playbook loading (all groups)
 
     Returns:
         CompiledSubAgent that can be registered with the orchestrator
@@ -810,6 +913,8 @@ def create_dynamic_local_subagent(
         mcp_gateway_url=mcp_gateway_url,
         mcp_gateway_client_id=mcp_gateway_client_id,
         console_backend_client_id=console_backend_client_id,
+        user_id=user_id,
+        group_ids=group_ids,
     )
 
     return CompiledSubAgent(

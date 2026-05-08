@@ -915,6 +915,11 @@ procs:
       AUTO_APPROVE_MAX_MCP_TOOLS_COUNT: "3"
       LANGSMITH_ORGANIZATION_ID: "${LANGSMITH_ORGANIZATION_ID:-}"
       LANGSMITH_PROJECT_ID: "${LANGSMITH_PROJECT_ID:-}"
+      DOCSTORE_HOST: "localhost"
+      DOCSTORE_PORT: "5402"
+      DOCSTORE_DB: "docstore"
+      DOCSTORE_USER: "postgres"
+      DOCSTORE_PASSWORD: "password"
 
   catalog-worker:
     cwd: "$ROOT_DIR/packages/console-backend"

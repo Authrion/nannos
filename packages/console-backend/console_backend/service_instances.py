@@ -38,14 +38,15 @@ from .services.file_storage_service import FileStorageService
 from .services.keycloak_admin_service import KeycloakAdminService
 from .services.messages_service import MessagesService
 from .services.notification_service import NotificationService
+from .services.outbound_scim_endpoint_service import OutboundScimEndpointService
+from .services.outbound_scim_push_service import OutboundScimPushService
+from .services.playbook_service import PlaybookService
 from .services.rate_card_service import RateCardService
 from .services.scheduler_engine import SchedulerEngine
 from .services.scheduler_service import SchedulerService
 from .services.scheduler_token_service import SchedulerTokenService
 from .services.scim_service import ScimGroupService, ScimUserService
 from .services.scim_token_service import ScimTokenService
-from .services.outbound_scim_endpoint_service import OutboundScimEndpointService
-from .services.outbound_scim_push_service import OutboundScimPushService
 from .services.sub_agent_service import SubAgentService
 from .services.usage_service import UsageService
 from .services.user_group_service import UserGroupService
@@ -284,6 +285,16 @@ async def initialize_services(app: "FastAPI") -> None:
         tick_interval_seconds=config.scheduler.tick_interval_seconds,
         claim_limit=config.scheduler.claim_limit,
     )
+
+    # Initialize playbook service (connects to docstore database)
+    from .db.docstore import get_docstore_session_factory
+
+    app.state.playbook_service = PlaybookService()
+    docstore_factory = get_docstore_session_factory()
+    if docstore_factory:
+        app.state.playbook_service.set_db_session_factory(docstore_factory)
+    else:
+        logger.warning("Docstore not configured — playbook management API will be unavailable")
 
     # Initialize orchestrator cookie cache
     app.state.orchestrator_cookie_cache = OrchestratorCookieCache(

@@ -7,6 +7,7 @@ agents are aware of:
 1. Ephemeral storage (root `/`) - temporary files cleared after conversation
 2. Personal storage (`/memories/`) - persistent files private to the user
 3. Channel storage (`/channel_memories/`) - shared files for channel members
+4. Group storage (`/group_memories/`) - shared files for group members
 
 This middleware is context-agnostic and works with any agent configuration that includes
 a filesystem backend with IndexingStoreBackend routes for `/memories/` and `/channel_memories/`.
@@ -38,9 +39,11 @@ The filesystem supports different storage locations with different persistence:
 - Ephemeral storage (root `/`): Files without a prefix are temporary and cleared after conversation ends.
 - Personal storage (`/memories/`): Files persist across conversations, private to you.
 - Channel storage (`/channel_memories/`): Files shared with all channel members.
+- Group storage (`/group_memories/`): Files shared with all group members.
 
 Use `/memories/` for documents, notes, and data you want to keep long-term.
 Use `/channel_memories/` in Slack channels when sharing files with team members.
+Use `/group_memories/` for files shared within a user group.
 </filesystem_storage_paths>"""
 
 

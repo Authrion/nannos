@@ -43,6 +43,32 @@ class PostgresConfig(BaseModel):
         return f"postgresql://{self.user}:{self.password.get_secret_value()}@{self.host}:{self.port}/{self.database}"
 
 
+class DocstoreConfig(BaseModel):
+    """Docstore (LangGraph store) database configuration.
+
+    Connects to the orchestrator's docstore database for reading/writing
+    playbook files directly from the store table.
+    """
+
+    host: str = Field(default_factory=lambda: os.getenv("DOCSTORE_HOST", os.getenv("POSTGRES_HOST", "localhost")))
+    port: int = Field(default_factory=lambda: int(os.getenv("DOCSTORE_PORT", os.getenv("POSTGRES_PORT", "5432"))))
+    database: str = Field(default_factory=lambda: os.getenv("DOCSTORE_DB", "docstore"))
+    user: str = Field(default_factory=lambda: os.getenv("DOCSTORE_USER", os.getenv("POSTGRES_USER", "postgres")))
+    password: SecretStr = Field(
+        default_factory=lambda: SecretStr(os.getenv("DOCSTORE_PASSWORD", os.getenv("POSTGRES_PASSWORD", "password")))
+    )
+
+    @property
+    def connection_url(self) -> str:
+        """Build async PostgreSQL connection URL for SQLAlchemy."""
+        return f"postgresql+asyncpg://{self.user}:{self.password.get_secret_value()}@{self.host}:{self.port}/{self.database}"
+
+    @property
+    def is_configured(self) -> bool:
+        """Check if docstore connection is properly configured."""
+        return bool(self.host and self.password.get_secret_value())
+
+
 class OrchestratorConfig(BaseModel):
     """Orchestrator agent configuration for token exchange."""
 
@@ -223,6 +249,7 @@ class Config(BaseModel):
 
     oidc: OidcConfig = Field(default_factory=OidcConfig)
     postgres: PostgresConfig = Field(default_factory=PostgresConfig)
+    docstore: DocstoreConfig = Field(default_factory=DocstoreConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
     keycloak_admin: KeycloakAdminConfig = Field(default_factory=KeycloakAdminConfig)
     mcp_gateway: MCPGatewayConfig = Field(default_factory=MCPGatewayConfig)

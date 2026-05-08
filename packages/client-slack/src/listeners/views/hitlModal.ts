@@ -3,23 +3,23 @@ import { Logger } from '../../utils/logger.js';
 import { handleIncomingMessage, HandlerDependencies, NormalizedMessage } from '../events/messageHandler.js';
 
 /**
- * Register handler for bug report modal submission.
+ * Register handler for generic HITL approval modal submission.
  * When user submits the modal, we send the HITL decision directly to the
  * orchestrator via handleIncomingMessage (not by posting a Slack message).
  */
-export function registerBugReportModalHandler(app: App, makeDeps: () => HandlerDependencies): void {
-  const logger = Logger.getLogger('bugReportModal');
+export function registerHitlModalHandler(app: App, makeDeps: () => HandlerDependencies): void {
+  const logger = Logger.getLogger('hitlModal');
 
-  app.view('bug_report_submit', async ({ ack, body, view, client }) => {
+  app.view('hitl_submit', async ({ ack, body, view, client }) => {
     await ack();
 
     const userId = body.user.id;
-    logger.info(`Bug report modal submitted by user ${userId}`);
+    logger.info(`HITL modal submitted by user ${userId}`);
 
     let privateMetadata: any;
     try {
       privateMetadata = JSON.parse(view.private_metadata);
-      const { channelId, threadTs, messageTs, actionRequests } = privateMetadata;
+      const { channelId, threadTs, messageTs, toolName, actionRequests } = privateMetadata;
 
       // Extract description from form
       const descriptionBlock = view.state?.values?.description_block;
@@ -32,7 +32,7 @@ export function registerBugReportModalHandler(app: App, makeDeps: () => HandlerD
         const originalAction = actionRequests?.[0] || {};
         const editedArgs = { ...(originalAction.args || {}), description };
         decisions = {
-          decisions: [{ type: 'edit', edited_action: { name: originalAction.name || 'console_create_bug_report', args: editedArgs } }],
+          decisions: [{ type: 'edit', edited_action: { name: originalAction.name || toolName, args: editedArgs } }],
         };
       } else {
         decisions = { decisions: [{ type: 'approve' }] };
@@ -60,21 +60,21 @@ export function registerBugReportModalHandler(app: App, makeDeps: () => HandlerD
 
       // Fire the message to the orchestrator (async, don't await the full stream)
       handleIncomingMessage(syntheticMessage, makeDeps()).catch((err) => {
-        logger.error(err, `Failed to send bug report confirmation to orchestrator: ${err}`);
+        logger.error(err, `Failed to send HITL approval to orchestrator: ${err}`);
       });
 
-      logger.info(`Bug report confirmation sent to orchestrator`);
+      logger.info(`HITL approval sent to orchestrator for tool ${toolName}`);
     } catch (error) {
-      logger.error(error, `Failed to process bug report submission: ${error}`);
+      logger.error(error, `Failed to process HITL modal submission: ${error}`);
       if (privateMetadata?.channelId && privateMetadata?.threadTs) {
         await client.chat.postMessage({
           channel: privateMetadata.channelId,
           thread_ts: privateMetadata.threadTs,
-          text: `❌ Failed to submit bug report: ${error instanceof Error ? error.message : 'unknown error'}`,
+          text: `❌ Failed to process approval: ${error instanceof Error ? error.message : 'unknown error'}`,
         });
       }
     }
   });
 
-  logger.info('Registered bug report modal handler');
+  logger.info('Registered HITL modal handler');
 }

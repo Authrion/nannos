@@ -3,19 +3,20 @@ import { Logger } from '../../utils/logger.js';
 import { handleIncomingMessage, HandlerDependencies, NormalizedMessage } from '../events/messageHandler.js';
 
 /**
- * Register handlers for bug report widget interactions.
- * Users can confirm/decline bug reports and optionally provide additional details.
+ * Register handlers for generic HITL interrupt widget interactions.
+ * Users can approve/reject any tool that triggers a human-in-the-loop interrupt,
+ * and optionally provide additional details via a modal.
  *
- * Button values encode taskId, contextId, reason as base64 JSON
+ * Button values encode taskId, contextId, toolName, reason as base64 JSON
  * to pass context through Slack's action flow.
  */
-export function registerBugReportActions(app: App, makeDeps: () => HandlerDependencies): void {
-  const logger = Logger.getLogger('bugReportButton');
+export function registerHitlActions(app: App, makeDeps: () => HandlerDependencies): void {
+  const logger = Logger.getLogger('hitlButton');
 
   /**
-   * Handle "Decline" button - send reject decision to orchestrator
+   * Handle "Reject" button - send reject decision to orchestrator
    */
-  app.action('bug_report_decline', async ({ ack, body, client }) => {
+  app.action('hitl_reject', async ({ ack, body, client }) => {
     await ack();
     
     const userId = body.user?.id;
@@ -26,15 +27,15 @@ export function registerBugReportActions(app: App, makeDeps: () => HandlerDepend
     const threadTs = (body as any).message?.thread_ts || messageTs;
 
     if (!actionValue || !userId || !channelId || !messageTs) {
-      logger.warn(`Missing required values in bug_report_decline action`);
+      logger.warn(`Missing required values in hitl_reject action`);
       return;
     }
 
     try {
       const decodedValue = JSON.parse(Buffer.from(actionValue, 'base64').toString());
-      const { taskId } = decodedValue;
+      const { taskId, toolName } = decodedValue;
 
-      logger.info(`Bug report declined by user ${userId} for task ${taskId}`);
+      logger.info(`HITL rejected by user ${userId} for task ${taskId} tool ${toolName}`);
 
       // Remove the interactive widget (orchestrator will post the outcome)
       await client.chat.delete({
@@ -57,19 +58,19 @@ export function registerBugReportActions(app: App, makeDeps: () => HandlerDepend
       };
 
       handleIncomingMessage(syntheticMessage, makeDeps()).catch((err) => {
-        logger.error(err, `Failed to send bug report decline to orchestrator: ${err}`);
+        logger.error(err, `Failed to send HITL reject to orchestrator: ${err}`);
       });
     } catch (error) {
-      logger.error(error, `Failed to process bug_report_decline: ${error}`);
+      logger.error(error, `Failed to process hitl_reject: ${error}`);
     }
   });
 
   /**
-   * Handle "Confirm" button - open modal for optional description
+   * Handle "Approve" button - open modal for optional edits
    */
-  app.action('bug_report_confirm', async ({ ack, body, client }) => {
+  app.action('hitl_approve', async ({ ack, body, client }) => {
     await ack();
-    const logger = Logger.getLogger('bugReportButton');
+    const logger = Logger.getLogger('hitlButton');
 
     const userId = body.user?.id;
     const action = (body as any).actions?.[0];
@@ -78,20 +79,21 @@ export function registerBugReportActions(app: App, makeDeps: () => HandlerDepend
     const messageTs = (body as any).message?.ts;
 
     if (!actionValue || !userId || !triggerId) {
-      logger.warn(`Missing required values in bug_report_confirm action`);
+      logger.warn(`Missing required values in hitl_approve action`);
       return;
     }
 
     try {
       const decodedValue = JSON.parse(Buffer.from(actionValue, 'base64').toString());
-      const { taskId, contextId, reason, channelId, threadTs, actionRequests } = decodedValue;
+      const { taskId, contextId, toolName, reason, channelId, threadTs, actionRequests } = decodedValue;
 
-      logger.info(`Bug report confirm clicked by user ${userId} for task ${taskId}`);
+      logger.info(`HITL approve clicked by user ${userId} for task ${taskId} tool ${toolName}`);
 
       // Encode callback data in private_metadata
       const privateMetadata = JSON.stringify({
         taskId,
         contextId,
+        toolName,
         reason,
         channelId,
         threadTs,
@@ -99,21 +101,23 @@ export function registerBugReportActions(app: App, makeDeps: () => HandlerDepend
         actionRequests,
       });
 
-      // Open modal for optional description
+      const toolLabel = (toolName || 'unknown').replace(/_/g, ' ');
+
+      // Open modal for optional edits
       await client.views.open({
         trigger_id: triggerId,
         view: {
           type: 'modal',
-          callback_id: 'bug_report_submit',
+          callback_id: 'hitl_submit',
           private_metadata: privateMetadata,
           title: {
             type: 'plain_text',
-            text: 'Bug Report',
+            text: 'Approve Action',
             emoji: true,
           },
           submit: {
             type: 'plain_text',
-            text: 'Submit Report',
+            text: 'Approve',
             emoji: true,
           },
           close: {
@@ -126,7 +130,7 @@ export function registerBugReportActions(app: App, makeDeps: () => HandlerDepend
               type: 'section',
               text: {
                 type: 'mrkdwn',
-                text: `*Reason:* ${reason}`,
+                text: `*Tool:* ${toolLabel}\n*Reason:* ${reason}`,
               },
             },
             {
@@ -138,7 +142,7 @@ export function registerBugReportActions(app: App, makeDeps: () => HandlerDepend
               optional: true,
               label: {
                 type: 'plain_text',
-                text: 'Additional details (optional)',
+                text: 'Additional details or edits (optional)',
                 emoji: true,
               },
               element: {
@@ -147,7 +151,7 @@ export function registerBugReportActions(app: App, makeDeps: () => HandlerDepend
                 multiline: true,
                 placeholder: {
                   type: 'plain_text',
-                  text: 'Add extra context or details about this bug...',
+                  text: 'Add extra context or modify the action...',
                 },
               },
             },
@@ -155,9 +159,9 @@ export function registerBugReportActions(app: App, makeDeps: () => HandlerDepend
         },
       });
     } catch (error) {
-      logger.error(error, `Failed to open bug report modal: ${error}`);
+      logger.error(error, `Failed to open HITL approval modal: ${error}`);
     }
   });
 
-  logger.info('Registered bug report action handlers');
+  logger.info('Registered HITL action handlers');
 }

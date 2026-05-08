@@ -368,34 +368,39 @@ export async function handleError(
 }
 
 /**
- * Build a bug report widget with Confirm/Decline buttons
+ * Build a generic HITL interrupt widget with Approve/Decline buttons.
+ * Works for any tool that triggers a human-in-the-loop interrupt.
  */
-export interface BugReportWidgetData {
+export interface HitlInterruptWidgetData {
   taskId: string;
   contextId: string;
+  toolName: string;
   reason: string;
   channelId: string;
   threadTs: string;
   actionRequests?: any[];
 }
 
-export function buildBugReportWidget(data: BugReportWidgetData): any[] {
-  // Encode only the IDs (not the full reason text) to stay within Slack's 2000-char value limit
+export function buildHitlInterruptWidget(data: HitlInterruptWidgetData): any[] {
+  // Encode only essential data to stay within Slack's 2000-char value limit
   const encodedData = Buffer.from(JSON.stringify({
     taskId: data.taskId,
     contextId: data.contextId,
+    toolName: data.toolName,
     reason: data.reason.substring(0, 500),
     channelId: data.channelId,
     threadTs: data.threadTs,
     actionRequests: data.actionRequests,
   })).toString('base64');
 
+  const toolLabel = data.toolName.replace(/_/g, ' ');
+
   return [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `🐛 *Bug Report*\n\n${data.reason.substring(0, 2000)}\n\nWould you like to confirm this report?`,
+        text: `⚠️ *Approval Required — ${toolLabel}*\n\n${data.reason.substring(0, 2000)}\n\nWould you like to approve this action?`,
       },
     },
     {
@@ -405,10 +410,10 @@ export function buildBugReportWidget(data: BugReportWidgetData): any[] {
           type: 'button',
           text: {
             type: 'plain_text',
-            text: '✅ Confirm',
+            text: '✅ Approve',
             emoji: true,
           },
-          action_id: 'bug_report_confirm',
+          action_id: 'hitl_approve',
           value: encodedData,
           style: 'primary',
         },
@@ -416,10 +421,10 @@ export function buildBugReportWidget(data: BugReportWidgetData): any[] {
           type: 'button',
           text: {
             type: 'plain_text',
-            text: '❌ Decline',
+            text: '❌ Reject',
             emoji: true,
           },
-          action_id: 'bug_report_decline',
+          action_id: 'hitl_reject',
           value: encodedData,
         },
       ],

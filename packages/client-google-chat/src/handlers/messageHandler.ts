@@ -12,7 +12,7 @@ import { A2AGoogleChatBasedRequest } from '../services/a2aClientService.js';
 import { GoogleChatService } from '../services/googleChatService.js';
 import type { Message, Task, TaskStatusUpdateEvent } from '@a2a-js/sdk';
 import type { ContextRecord } from '../storage/types.js';
-import { handleTask, handleError, buildBugReportCard } from '../utils/taskResponseHandler.js';
+import { handleTask, handleError, buildHitlInterruptCard } from '../utils/taskResponseHandler.js';
 import { HandlerDependencies } from './types.js';
 import { getSpinnerVerb } from '../utils/spinnerVerbs.js';
 
@@ -501,44 +501,39 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
                 }
               }
 
-              // Determine interrupt type from action_requests
+              // Generic HITL interrupt — show approval card for any tool
               const toolNames = actionRequests.map((ar: any) => ar?.name).filter(Boolean);
-              const isBugReport = toolNames.includes('console_create_bug_report');
+              const firstAction = actionRequests[0];
+              const toolName = firstAction?.name || 'unknown';
 
-              if (isBugReport) {
-                try {
-                  const interruptReason = actionRequests.find((ar: any) => ar.name === 'console_create_bug_report')?.args?.description || interruptMessage;
-                  const bugReportCard = buildBugReportCard({
-                    taskId: accumulatedTask.id,
-                    contextId: accumulatedTask.contextId || '',
-                    reason: interruptReason,
-                  });
+              try {
+                const interruptReason = (firstAction?.args?.description as string) || (firstAction?.args?.reason as string) || interruptMessage;
+                const hitlCard = buildHitlInterruptCard({
+                  taskId: accumulatedTask.id,
+                  contextId: accumulatedTask.contextId || '',
+                  toolName,
+                  reason: interruptReason,
+                });
 
-                  logger.info(
-                    { taskId: accumulatedTask?.id },
-                    `Posting bug report card to Google Chat`
-                  );
+                logger.info(
+                  { taskId: accumulatedTask?.id, toolNames },
+                  `Posting HITL interrupt card to Google Chat`
+                );
 
-                  await chatService.sendMessage({
-                    projectId,
-                    spaceId,
-                    threadId,
-                    cardsV2: [bugReportCard],
-                  });
-                  interruptWidgetPosted = true;
+                await chatService.sendMessage({
+                  projectId,
+                  spaceId,
+                  threadId,
+                  cardsV2: [hitlCard],
+                });
+                interruptWidgetPosted = true;
 
-                  // Store the interrupt context
-                  await inFlightTaskStore.touch(accumulatedTask.id).catch((err) => {
-                    logger.error(err, `Failed to update in-flight task for interrupt: ${err}`);
-                  });
-                } catch (widgetErr) {
-                  logger.error(widgetErr, `Failed to post bug report card, falling back to text: ${widgetErr}`);
-                  if (interruptMessage) {
-                    await chatService.sendTextMessage(projectId, spaceId, interruptMessage, threadId);
-                  }
-                }
-              } else {
-                // For other HITL interrupt types, post text
+                // Store the interrupt context
+                await inFlightTaskStore.touch(accumulatedTask.id).catch((err) => {
+                  logger.error(err, `Failed to update in-flight task for interrupt: ${err}`);
+                });
+              } catch (widgetErr) {
+                logger.error(widgetErr, `Failed to post HITL interrupt card, falling back to text: ${widgetErr}`);
                 if (interruptMessage) {
                   await chatService.sendTextMessage(projectId, spaceId, interruptMessage, threadId);
                 }

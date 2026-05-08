@@ -317,6 +317,8 @@ def build_runtime_context(
                         backend_factory=backend_factory,
                         mcp_gateway_url=agent_settings.MCP_GATEWAY_URL if agent_settings else None,
                         mcp_gateway_client_id=agent_settings.MCP_GATEWAY_CLIENT_ID if agent_settings else None,
+                        user_id=user_config.user_id,
+                        group_ids=user_config.groups if user_config.groups else None,
                     )
                     subagent_registry[config.name] = dynamic_subagent
                     if config.sub_agent_id is not None:
@@ -345,6 +347,7 @@ def build_runtime_context(
         message_formatting=user_config.message_formatting,
         slack_user_handle=user_config.slack_user_handle,
         custom_prompt=user_config.custom_prompt,
+        groups=user_config.groups,
         tool_registry=tool_registry,
         subagent_registry=subagent_registry,
         whitelisted_tool_names=whitelisted_tool_names,

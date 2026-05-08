@@ -43,6 +43,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from console_backend.config import config
 from console_backend.db import close_db, get_async_session_factory, init_db
+from console_backend.db.docstore import close_docstore, init_docstore
 from console_backend.dependencies import require_auth
 from console_backend.exceptions import ConversationOwnershipError
 from console_backend.middleware import OrchestratorAuth, ProxyHeadersMiddleware
@@ -66,6 +67,7 @@ from console_backend.routers.message_router import router as message_router
 from console_backend.routers.models_router import router as models_router
 from console_backend.routers.notification_router import router as notification_router
 from console_backend.routers.outbound_scim_router import router as outbound_scim_router
+from console_backend.routers.playbook_router import router as playbook_router
 from console_backend.routers.rate_card_router import router as rate_card_router
 from console_backend.routers.scheduler_router import router as scheduler_router
 from console_backend.routers.scim_router import router as scim_router
@@ -194,6 +196,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await init_db()
     logger.info("PostgreSQL database initialized")
 
+    # Initialize docstore connection (for playbook management)
+    await init_docstore()
+
     # Sync system-owned remote agent URLs from environment variables
     await _sync_remote_agent_urls()
 
@@ -229,6 +234,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("Internal cost logger stopped")
     await shutdown_handler()
     await cleanup_services(app)
+    await close_docstore()
     await close_db()
     logger.info("Application shutdown complete")
 
@@ -298,6 +304,7 @@ app.include_router(catalog_router)
 app.include_router(bug_report_router)
 app.include_router(bug_report_mcp_router)
 app.include_router(feedback_router)
+app.include_router(playbook_router)
 # SCIM token management (always available for admins)
 app.include_router(scim_token_router)
 # SCIM 2.0 provisioning endpoints

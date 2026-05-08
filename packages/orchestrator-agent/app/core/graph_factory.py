@@ -52,6 +52,7 @@ from ..middleware import (
     UserPreferencesMiddleware,
 )
 from ..middleware.error_classification_middleware import ErrorClassificationMiddleware
+from ..middleware.playbook_middleware import PlaybookInjectionMiddleware
 from ..models.config import AgentSettings, GraphRuntimeContext
 from ..models.schemas import FinalResponseSchema
 from .file_tools import create_presigned_url_tool
@@ -65,6 +66,18 @@ HITL_GUARDED_TOOLS = {
     "console_create_bug_report": {
         "allowed_decisions": ["approve", "edit", "reject"],
         "description": "Bug report requires your confirmation before submission.",
+    },
+    "update_agents_md": {
+        "allowed_decisions": ["approve", "edit", "reject"],
+        "description": "Agent wants to save a learned preference to your playbook.",
+    },
+    "create_skill_md": {
+        "allowed_decisions": ["approve", "edit", "reject"],
+        "description": "Agent wants to create a new skill in your playbook.",
+    },
+    "update_skill_md": {
+        "allowed_decisions": ["approve", "edit", "reject"],
+        "description": "Agent wants to update a skill in your playbook.",
     },
 }
 
@@ -451,6 +464,9 @@ class GraphFactory:
         # UserPreferencesMiddleware injects user preferences (language, etc.) into system prompt
         user_preferences_middleware = UserPreferencesMiddleware()
 
+        # PlaybookInjectionMiddleware injects AGENTS.md and skill index into system prompt
+        playbook_middleware = PlaybookInjectionMiddleware(store=self.store)
+
         # StoragePathsInstructionMiddleware adds filesystem storage paths documentation
         storage_paths_middleware = StoragePathsInstructionMiddleware()
 
@@ -525,6 +541,7 @@ class GraphFactory:
             BedrockPromptCachingMiddleware(),
             steering_middleware,
             user_preferences_middleware,
+            playbook_middleware,
             self._loop_detection_middleware,
             self._auth_middleware,
             ErrorClassificationMiddleware(),
@@ -553,6 +570,12 @@ class GraphFactory:
 
             # Add copy_file tool for efficient file copying without LLM context loading
             static_tools.append(create_copy_file_tool(self.backend_factory))
+
+            # Add playbook tools for reading/updating AGENTS.md and SKILLS.md
+            if self.store:
+                from agent_common.core.playbook_tools import create_playbook_tools
+
+                static_tools.extend(create_playbook_tools(self.store))
 
             self._static_tools_cache = static_tools
 

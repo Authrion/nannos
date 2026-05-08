@@ -259,22 +259,25 @@ export async function handleError(
 }
 
 /**
- * Build a bug report card for Google Chat
+ * Build a generic HITL interrupt card for Google Chat.
+ * Works for any tool that triggers a human-in-the-loop interrupt.
  */
-export interface BugReportCardData {
+export interface HitlInterruptCardData {
   taskId: string;
   contextId: string;
+  toolName: string;
   reason: string;
 }
 
-export function buildBugReportCard(data: BugReportCardData): chat_v1.Schema$CardWithId {
+export function buildHitlInterruptCard(data: HitlInterruptCardData): chat_v1.Schema$CardWithId {
+  const toolLabel = (data.toolName || 'unknown').replace(/_/g, ' ');
+
   return {
-    cardId: 'bug_report_card',
+    cardId: 'hitl_interrupt_card',
     card: {
       header: {
-        title: '🐛 Bug Report',
-        subtitle: 'Please confirm this bug report',
-        imageUrl: 'https://fonts.gstatic.com/s/i/short-term/release/googlesymbols/bug_report/default/48px.svg',
+        title: '⚠️ Approval Required',
+        subtitle: toolLabel,
         imageType: 'CIRCLE',
       },
       sections: [
@@ -290,17 +293,17 @@ export function buildBugReportCard(data: BugReportCardData): chat_v1.Schema$Card
             },
             {
               textParagraph: {
-                text: '<b>Would you like to confirm this report?</b>',
+                text: '<b>Would you like to approve this action?</b>',
               },
             } as any,
             {
               buttonList: {
                 buttons: [
                   {
-                    text: '✅ Confirm',
+                    text: '✅ Approve',
                     onClick: {
                       action: {
-                        function: 'bug_report_confirm',
+                        function: 'hitl_approve',
                         parameters: [
                           {
                             key: 'taskId',
@@ -309,6 +312,10 @@ export function buildBugReportCard(data: BugReportCardData): chat_v1.Schema$Card
                           {
                             key: 'contextId',
                             value: data.contextId,
+                          },
+                          {
+                            key: 'toolName',
+                            value: data.toolName,
                           },
                           {
                             key: 'reason',
@@ -325,10 +332,10 @@ export function buildBugReportCard(data: BugReportCardData): chat_v1.Schema$Card
                     },
                   },
                   {
-                    text: '❌ Decline',
+                    text: '❌ Reject',
                     onClick: {
                       action: {
-                        function: 'bug_report_decline',
+                        function: 'hitl_reject',
                         parameters: [
                           {
                             key: 'taskId',

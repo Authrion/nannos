@@ -793,47 +793,38 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
               }
 
               if (interruptMessage) {
-                // Determine interrupt type from action_requests
-                const toolNames = actionRequests.map((ar: any) => ar?.name).filter(Boolean);
-                const isBugReport = toolNames.includes('console_create_bug_report');
+                // Generic HITL interrupt — show approval widget for any tool
+                interruptWidgetPosted = true;
+                const { buildHitlInterruptWidget } = await import('../../utils/taskResponseHandler.js');
 
-                if (isBugReport) {
-                  // Mark as handled regardless of widget success/failure to prevent duplicate from handleTask
-                  interruptWidgetPosted = true;
-                  const { buildBugReportWidget } = await import('../../utils/taskResponseHandler.js');
-                  
-                  try {
-                    const interruptReason = actionRequests.find((ar: any) => ar.name === 'console_create_bug_report')?.args?.description || interruptMessage;
-                    const bugReportWidget = buildBugReportWidget({
-                      taskId: accumulatedTask.id,
-                      contextId: accumulatedTask.contextId || '',
-                      reason: interruptReason,
-                      channelId,
-                      threadTs,
-                      actionRequests,
-                    });
+                try {
+                  const toolNames = actionRequests.map((ar: any) => ar?.name).filter(Boolean);
+                  const firstAction = actionRequests[0];
+                  const toolName = firstAction?.name || 'unknown';
+                  const interruptReason = (firstAction?.args?.description as string) || (firstAction?.args?.reason as string) || interruptMessage;
+                  const hitlWidget = buildHitlInterruptWidget({
+                    taskId: accumulatedTask.id,
+                    contextId: accumulatedTask.contextId || '',
+                    toolName,
+                    reason: interruptReason,
+                    channelId,
+                    threadTs,
+                    actionRequests,
+                  });
 
-                    logger.info(
-                      { taskId: accumulatedTask?.id },
-                      `Posting bug report widget to Slack`
-                    );
-
-                    await client.chat.postMessage({
-                      channel: channelId,
-                      thread_ts: threadTs,
-                      text: `🐛 Bug Report`,
-                      blocks: bugReportWidget,
-                    });
-                  } catch (widgetErr) {
-                    logger.error(widgetErr, `Failed to post bug report widget, falling back to text: ${widgetErr}`);
-                    await postMessage(client, channelId, threadTs, interruptMessage);
-                  }
-                } else {
-                  // For other HITL interrupt types, post message with tool info
                   logger.info(
                     { taskId: accumulatedTask?.id, toolNames },
-                    `Posting HITL interrupt message to Slack`
+                    `Posting HITL interrupt widget to Slack`
                   );
+
+                  await client.chat.postMessage({
+                    channel: channelId,
+                    thread_ts: threadTs,
+                    text: `⚠️ Approval Required`,
+                    blocks: hitlWidget,
+                  });
+                } catch (widgetErr) {
+                  logger.error(widgetErr, `Failed to post HITL interrupt widget, falling back to text: ${widgetErr}`);
                   await postMessage(client, channelId, threadTs, interruptMessage);
                 }
 

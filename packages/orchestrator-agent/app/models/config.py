@@ -83,6 +83,13 @@ class GraphRuntimeContext:
     Allows users to customize agent behavior with personal preferences or guidelines.
     """
 
+    groups: list[str] = field(default_factory=list)
+    """User's group memberships (Keycloak group paths).
+    
+    Used for group-scoped playbook resolution. The first group is treated as
+    the primary group for filesystem namespace scoping.
+    """
+
     tool_registry: dict[str, Any] = field(default_factory=dict)
     """Registry of tool name -> BaseTool instance for this user.
 

@@ -459,6 +459,8 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                     else user.id,  # Use database ID (not OIDC sub) to match docstore tools
                     "user_id": user.id,  # Stable database ID (not OIDC sub)
                     "conversation_id": task.context_id,  # For conversation-scoped tool result storage
+                    "group_id": user_groups[0] if user_groups else None,  # Primary group for filesystem namespace
+                    "group_ids": user_groups or None,  # All groups for playbook aggregation
                     "user_name": user_name,
                     "slack_thread_ts": request_metadata.get("slackThreadTs"),
                     "scope": "personal" if not slack_channel_id else "channel",

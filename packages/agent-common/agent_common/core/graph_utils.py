@@ -34,7 +34,7 @@ from deepagents.middleware import FilesystemMiddleware, SummarizationMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.summarization import compute_summarization_defaults
 from langchain.agents import create_agent
-from langchain.agents.middleware import ToolRetryMiddleware
+from langchain.agents.middleware import HumanInTheLoopMiddleware, ToolRetryMiddleware
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_aws.middleware.prompt_caching import BedrockPromptCachingMiddleware
 from langchain_core.language_models import BaseChatModel
@@ -122,6 +122,7 @@ def build_common_middleware_stack(
     backend: Any,
     exclude_deep_agents_middlewares: bool = False,
     add_docstore_hint: bool = False,
+    hitl_guarded_tools: dict[str, dict] | None = None,
 ) -> list:
     """Build the common middleware stack shared by every LangGraph agent in this project.
 
@@ -166,9 +167,12 @@ def build_common_middleware_stack(
             whenever the backend includes ``IndexingStoreBackend`` so that
             eviction messages tell the agent it can run ``docstore_search``
             on the indexed content.
+        hitl_guarded_tools: Optional dict of tool names -> config for
+            HumanInTheLoopMiddleware. When provided, adds HITL middleware
+            that interrupts execution for approval before running these tools.
 
     Returns:
-        Ordered list of seven middleware instances ready to be included in a
+        Ordered list of middleware instances ready to be included in a
         ``create_agent`` / ``create_deep_agent`` call.
     """
     middleware = []
@@ -195,6 +199,10 @@ def build_common_middleware_stack(
                 backoff_factor=2.0,
             ),
         ]
+
+    # Add HITL middleware if guarded tools are specified
+    if hitl_guarded_tools:
+        middleware.append(HumanInTheLoopMiddleware(interrupt_on=hitl_guarded_tools))
 
     middleware += [
         RepeatedToolCallMiddleware(max_repeats=5, window_size=10),
@@ -243,16 +251,18 @@ def create_indexing_backend_factory(
     if store is not None:
 
         def _backend_with_indexing(rt: Any) -> CompositeBackend:
-            # Create three IndexingStoreBackend instances with explicit path-based routing:
+            # Create IndexingStoreBackend instances with explicit path-based routing:
             # 1. /memories/ → user-scoped (user_id, "filesystem") - personal files
             # 2. /large_tool_results/ → conversation-scoped (conversation_id, "filesystem") - tool results
             # 3. /channel_memories/ → channel-scoped (assistant_id, "filesystem") - shared channel files
+            # 4. /group_memories/ → group-scoped (group_id, "filesystem") - shared group files
             #
             # Application logic decides which path to use:
             # - write_file("/memories/foo") → personal, user-scoped
             # - write_file("/channel_memories/foo") → shared, channel-scoped
+            # - write_file("/group_memories/foo") → shared, group-scoped
             # - Tool results always go to /large_tool_results/ (conversation-scoped)
-
+            #
             # Personal files: user-scoped namespace
             user_documents_backend = IndexingStoreBackend(
                 rt,
@@ -277,12 +287,21 @@ def create_indexing_backend_factory(
                 namespace_factory=lambda ctx: _channel_scoped_namespace(ctx),
             )
 
+            # Group files: group-scoped namespace for shared group files
+            group_documents_backend = IndexingStoreBackend(
+                rt,
+                bedrock_region=bedrock_region,
+                cost_logger=cost_logger,
+                namespace_factory=lambda ctx: _group_scoped_namespace(ctx),
+            )
+
             return CompositeBackend(
                 default=StateBackend(rt),
                 routes={
                     "/memories/": user_documents_backend,
                     "/large_tool_results/": tool_results_backend,
                     "/channel_memories/": channel_documents_backend,
+                    "/group_memories/": group_documents_backend,
                 },
             )
 
@@ -349,6 +368,30 @@ def _channel_scoped_namespace(ctx: Any) -> tuple[str, ...]:
     return (assistant_id, "filesystem")
 
 
+def _group_scoped_namespace(ctx: Any) -> tuple[str, ...]:
+    """Namespace factory for group-scoped files (shared group playbooks).
+
+    Returns (group_id, "filesystem") for files shared within a user group.
+    Validates that group_id is in the user's group_ids membership list.
+    Returns impossible-to-match sentinel if group_id missing or not authorized.
+    """
+    metadata = ctx.runtime.config.get("metadata", {})
+    group_id = metadata.get("group_id")
+
+    if not group_id:
+        logger.warning("[NAMESPACE] group_id missing, using sentinel namespace")
+        return ("__missing_group_id__", "filesystem")
+
+    # Validate group_id against the user's verified memberships
+    group_ids = metadata.get("group_ids") or []
+    if group_ids and str(group_id) not in [str(g) for g in group_ids]:
+        logger.warning(f"[NAMESPACE] group_id {group_id} not in user's group_ids, denied")
+        return ("__unauthorized_group_id__", "filesystem")
+
+    logger.info(f"[NAMESPACE] group-scoped: ({group_id}, 'filesystem')")
+    return (str(group_id), "filesystem")
+
+
 def build_sub_agent_graph(
     model: BaseChatModel,
     tools: list,
@@ -360,6 +403,7 @@ def build_sub_agent_graph(
     response_format: Any = None,
     exclude_deep_agents_middlewares: bool = False,
     backend_factory: Optional[Callable[[Any], Any]] = None,
+    hitl_guarded_tools: dict[str, dict] | None = None,
     **kwargs: Any,
 ) -> CompiledStateGraph:
     """Build a standard deep-agent LangGraph graph.
@@ -418,6 +462,7 @@ def build_sub_agent_graph(
         backend,
         exclude_deep_agents_middlewares,
         add_docstore_hint=store is not None or backend_factory is not None,
+        hitl_guarded_tools=hitl_guarded_tools,
     )
     return create_agent(
         model,
