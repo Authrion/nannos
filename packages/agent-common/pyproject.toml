@@ -56,8 +56,11 @@ docstore = [
     # Semantic chunking (used by IndexingStoreBackend)
     "nltk>=3.9.0",
 ]
+sandbox-gatana = [
+    "gatana-langchain>=0.1.0",
+]
 all = [
-    "agent-common[openai,google,anthropic,foundry,docstore]",
+    "agent-common[openai,google,anthropic,foundry,docstore,sandbox-gatana]",
 ]
 
 [build-system]
