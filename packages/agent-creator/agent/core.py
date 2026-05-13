@@ -215,6 +215,39 @@ When configuring MCP tools (on top of the built-in tools above):
 - Common MCP tool categories: external APIs (JIRA, GitHub, Slack, Confluence), communication (email, messaging), domain-specific (data pipelines, CRM), data access (database queries)
 </section>
 
+<section name="Bundling Skills with Agents">
+When creating a local agent, you can bundle "standard skills" — reusable workflows and instructions
+that ship with the agent definition. Standard skills are:
+- Immutable at runtime (only changed via new agent versions through updates)
+- Versioned alongside system_prompt, mcp_tools, etc.
+- Overridable: users can create personal or group skills with the same name to customize behavior
+
+Each skill has:
+- name: lowercase alphanumeric + hyphens, max 64 chars (e.g., "incident-triage", "weekly-report")
+- description: 1-1024 chars, describes what the skill does and when to use it
+- body: markdown instructions (the SKILL.md content the agent reads at runtime)
+- files: optional scripts, references, or assets (e.g., "scripts/check.py", "references/API.md")
+
+When to bundle skills:
+- The agent has distinct workflows or procedures it should follow
+- You want structured, reusable instructions beyond what fits in the system prompt
+- Scripts need to be available for execution (requires sandbox_enabled=true)
+
+When NOT to use skills:
+- Simple agents with one clear purpose (system prompt alone is sufficient)
+- The instructions are short enough for the system prompt
+
+Example skill:
+  name: "incident-triage"
+  description: "Use this skill when handling production incidents. Provides step-by-step triage procedure."
+  body: "# Incident Triage\\n\\n1. Check monitoring dashboards\\n2. Identify affected services\\n..."
+  files: [{"path": "scripts/check_alerts.py", "content": "import requests\\n..."}]
+
+Setting sandbox_enabled=true makes skill scripts executable in a secure sandbox environment
+(requires sandbox provider to be configured by the platform admin). Without sandbox, scripts
+are still readable but not executable.
+</section>
+
 <section name="Access Control">
 - Set is_public: false by default (requires group permissions)
 - Set is_public: true only for genuinely universal agents

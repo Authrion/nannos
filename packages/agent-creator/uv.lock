@@ -60,12 +60,13 @@ openai = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", extras = ["http-server"], specifier = ">=0.3.25,<1.0.0" },
-    { name = "agent-common", extras = ["openai", "google", "anthropic", "foundry", "docstore"], marker = "extra == 'all'" },
+    { name = "agent-common", extras = ["openai", "google", "anthropic", "foundry", "docstore", "sandbox-gatana"], marker = "extra == 'all'" },
     { name = "aiobotocore", marker = "extra == 'docstore'", specifier = ">=2.26.0" },
     { name = "aiobotocore", marker = "extra == 'foundry'", specifier = ">=2.26.0" },
     { name = "boto3", specifier = ">=1.35.0" },
     { name = "deepagents", specifier = ">=0.5.7,<0.6.0" },
     { name = "foundry-platform-sdk", marker = "extra == 'foundry'", specifier = "==1.63.0" },
+    { name = "gatana-langchain", marker = "extra == 'sandbox-gatana'", specifier = ">=0.1.0" },
     { name = "google-auth", specifier = ">=2.25.0" },
     { name = "google-auth", marker = "extra == 'google'", specifier = ">=2.36.0" },
     { name = "google-genai", specifier = ">=1.72.0" },
@@ -89,7 +90,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.10.6" },
     { name = "ringier-a2a-sdk", editable = "../ringier-a2a-sdk" },
 ]
-provides-extras = ["openai", "google", "anthropic", "foundry", "docstore", "all"]
+provides-extras = ["openai", "google", "anthropic", "foundry", "docstore", "sandbox-gatana", "all"]
 
 [package.metadata.requires-dev]
 dev = [

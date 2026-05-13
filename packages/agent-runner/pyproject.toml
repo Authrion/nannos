@@ -32,6 +32,8 @@ dependencies = [
     "rcplus-alloy-common>=8.6.1",
     "ringier-a2a-sdk>=0.1.0",
     "agent-common[all]>=0.1.0",
+    # Sandbox (optional provider — only loaded when SANDBOX_PROVIDER is set)
+    "gatana-langchain>=0.1.0",
     # Utilities
     "python-dotenv>=1.1.0",
     "pyyaml>=6.0.2",
