@@ -1,4 +1,4 @@
-"""Three-tier skill resolution: personal > group > standard."""
+"""Three-tier skill resolution: personal > group > default."""
 
 from __future__ import annotations
 
@@ -17,34 +17,34 @@ async def resolve_skills_for_agent(
     user_id: str,
     agent_name: str,
     group_ids: list[str],
-    standard_skills: list[SkillDefinition],
+    default_skills: list[SkillDefinition],
 ) -> dict[str, ResolvedSkill]:
     """Resolve skills from all three tiers, applying override semantics.
 
-    Resolution order: personal > group > standard.
-    A personal skill with the same name as a standard skill overrides it.
+    Resolution order: personal > group > default.
+    A personal skill with the same name as a default skill overrides it.
 
     Args:
         store: Document store for reading personal/group skills
         user_id: User's stable database ID
         agent_name: Sub-agent name
         group_ids: Group IDs for group-scoped skills
-        standard_skills: Immutable skills from sub-agent config
+        default_skills: Immutable skills from sub-agent config
 
     Returns:
         Dict mapping skill name -> ResolvedSkill (overrides applied)
     """
     resolved: dict[str, ResolvedSkill] = {}
 
-    # 1. Start with standard skills (lowest priority)
-    standard_names = set()
-    for skill in standard_skills:
-        standard_names.add(skill.name)
+    # 1. Start with default skills (lowest priority)
+    default_names = set()
+    for skill in default_skills:
+        default_names.add(skill.name)
         resolved[skill.name] = ResolvedSkill(
             name=skill.name,
             description=skill.description,
             body=skill.body,
-            scope="standard",
+            scope="default",
             files=skill.files,
         )
 
@@ -56,7 +56,7 @@ async def resolve_skills_for_agent(
         group_ids=group_ids,
     )
 
-    # 3. Apply overrides: group skills override standard, personal overrides both
+    # 3. Apply overrides: group skills override default, personal overrides both
     for entry in docstore_skills:
         # Read full skill content
         content = await reader.read_skill(
@@ -69,12 +69,22 @@ async def resolve_skills_for_agent(
         if not content:
             continue
 
-        overrides = "standard" if entry.name in standard_names else None
+        # Load bundled files for this skill
+        skill_files = await reader.read_skill_files(
+            user_id=user_id,
+            agent_name=agent_name,
+            skill_name=entry.name,
+            group_ids=group_ids,
+            scope=entry.scope,
+        )
+
+        overrides = "default" if entry.name in default_names else None
         resolved[entry.name] = ResolvedSkill(
             name=entry.name,
             description=entry.description,
             body=content,
             scope=entry.scope,
+            files=skill_files,
             overrides=overrides,
         )
 

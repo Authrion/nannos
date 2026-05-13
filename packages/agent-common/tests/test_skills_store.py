@@ -106,8 +106,8 @@ async def test_ls_root(backend):
     assert result.error is None
     assert result.entries is not None
     paths = [e["path"] for e in result.entries]
-    assert "incident-triage/" in paths
-    assert "weekly-report/" in paths
+    assert "/incident-triage/" in paths
+    assert "/weekly-report/" in paths
 
 
 @pytest.mark.asyncio
@@ -122,9 +122,9 @@ async def test_ls_skill_directory(backend):
     result = await backend.als("/skills/incident-triage/")
     assert result.error is None
     paths = [e["path"] for e in result.entries]
-    assert "SKILL.md" in paths
-    assert "scripts/check.py" in paths
-    assert "references/runbook.md" in paths
+    assert "/SKILL.md" in paths
+    assert "/scripts/check.py" in paths
+    assert "/references/runbook.md" in paths
 
 
 @pytest.mark.asyncio
@@ -132,7 +132,7 @@ async def test_ls_skill_no_files(backend):
     result = await backend.als("/skills/weekly-report/")
     assert result.error is None
     paths = [e["path"] for e in result.entries]
-    assert paths == ["SKILL.md"]
+    assert paths == ["/SKILL.md"]
 
 
 @pytest.mark.asyncio

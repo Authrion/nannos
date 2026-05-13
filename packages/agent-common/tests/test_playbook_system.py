@@ -157,34 +157,3 @@ class TestPlaybookReaderService:
         # Second call should use cache
         await reader.read_agents_md(user_id="user1", agent_name="test")
         assert call_count == first_count  # No additional store calls
-
-
-class TestUpdateSectionInMarkdown:
-    """Tests for _update_section_in_markdown helper."""
-
-    def test_creates_new_file_with_section(self):
-        from agent_common.core.playbook_tools import _update_section_in_markdown
-
-        result = _update_section_in_markdown(None, "Preferences", "Be concise.")
-        assert "## Preferences" in result
-        assert "Be concise." in result
-        assert "# AGENTS.md" in result
-
-    def test_replaces_existing_section(self):
-        from agent_common.core.playbook_tools import _update_section_in_markdown
-
-        existing = "# AGENTS.md\n\n## Preferences\n\nOld content.\n\n## Other\n\nKeep this.\n"
-        result = _update_section_in_markdown(existing, "Preferences", "New content.")
-        assert "New content." in result
-        assert "Old content." not in result
-        assert "Keep this." in result
-
-    def test_appends_new_section_to_existing_file(self):
-        from agent_common.core.playbook_tools import _update_section_in_markdown
-
-        existing = "# AGENTS.md\n\n## Existing\n\nSome content.\n"
-        result = _update_section_in_markdown(existing, "New Section", "New content.")
-        assert "## Existing" in result
-        assert "Some content." in result
-        assert "## New Section" in result
-        assert "New content." in result

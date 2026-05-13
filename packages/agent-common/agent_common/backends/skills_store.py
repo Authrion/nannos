@@ -23,7 +23,10 @@ from agent_common.models.skill import ResolvedSkill
 
 logger = logging.getLogger(__name__)
 
-_READ_ONLY_MSG = "/skills/ is read-only. Use create_skill_md or update_skill_md to modify skills."
+_READ_ONLY_MSG = (
+    "/skills/ is read-only. Use console_create_skill, console_update_skill, "
+    "or console_write_skill_file to manage skills."
+)
 
 
 class SkillsStoreBackend(BackendProtocol):
@@ -71,16 +74,16 @@ class SkillsStoreBackend(BackendProtocol):
         normalized = path.rstrip("/") + "/"
 
         if normalized == "/skills/" or normalized == "/":
-            entries = [FileInfo(path=f"{name}/", is_dir=True) for name in sorted(self._skills)]
+            entries = [FileInfo(path=f"/{name}/", is_dir=True) for name in sorted(self._skills)]
             return LsResult(entries=entries)
 
         # /skills/{name}/ — list files in a skill
         name, _ = self._parse_path(path)
         if name and name in self._skills:
             skill = self._skills[name]
-            entries: list[FileInfo] = [FileInfo(path="SKILL.md")]
+            entries: list[FileInfo] = [FileInfo(path="/SKILL.md")]
             for f in skill.files:
-                entries.append(FileInfo(path=f.path))
+                entries.append(FileInfo(path=f"/{f.path}"))
             return LsResult(entries=entries)
 
         return LsResult(error=f"Directory not found: {path}")
@@ -144,6 +147,19 @@ class SkillsStoreBackend(BackendProtocol):
         raise NotImplementedError("Use aglob()")
 
     # ---- helpers ----
+
+    async def alist_recursive(self, prefix: str = "/skills/") -> list[str]:
+        """List all file paths recursively under the given prefix.
+
+        Returns flat list of absolute paths (e.g., /skills/my-skill/SKILL.md).
+        Used by SkillSandboxSyncMiddleware to enumerate files for upload.
+        """
+        paths: list[str] = []
+        for name, skill in self._skills.items():
+            paths.append(f"/skills/{name}/SKILL.md")
+            for f in skill.files:
+                paths.append(f"/skills/{name}/{f.path}")
+        return paths
 
     @staticmethod
     def _parse_path(path: str) -> tuple[str | None, str]:

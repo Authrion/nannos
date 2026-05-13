@@ -26,7 +26,7 @@ def _std_skills():
 
 @pytest.mark.asyncio
 async def test_standard_skills_passthrough():
-    """Standard skills returned when no personal/group overrides exist."""
+    """Default skills returned when no personal/group overrides exist."""
     with patch("agent_common.core.skills_resolver.PlaybookReaderService") as MockReader:
         reader = MockReader.return_value
         reader.list_skills = AsyncMock(return_value=[])
@@ -36,15 +36,15 @@ async def test_standard_skills_passthrough():
             user_id="user-1",
             agent_name="my-agent",
             group_ids=[],
-            standard_skills=_std_skills(),
+            default_skills=_std_skills(),
         )
 
     assert len(result) == 2
     assert "incident-triage" in result
     assert "weekly-report" in result
-    assert result["incident-triage"].scope == "standard"
+    assert result["incident-triage"].scope == "default"
     assert result["incident-triage"].files[0].path == "scripts/check.py"
-    assert result["weekly-report"].scope == "standard"
+    assert result["weekly-report"].scope == "default"
     assert result["weekly-report"].overrides is None
 
 
@@ -67,14 +67,14 @@ async def test_personal_overrides_standard():
             user_id="user-1",
             agent_name="my-agent",
             group_ids=[],
-            standard_skills=_std_skills(),
+            default_skills=_std_skills(),
         )
 
     assert result["incident-triage"].scope == "personal"
     assert result["incident-triage"].body == "Custom steps for triage."
-    assert result["incident-triage"].overrides == "standard"
+    assert result["incident-triage"].overrides == "default"
     # Standard skill that wasn't overridden stays
-    assert result["weekly-report"].scope == "standard"
+    assert result["weekly-report"].scope == "default"
 
 
 @pytest.mark.asyncio
@@ -96,12 +96,12 @@ async def test_group_overrides_standard():
             user_id="user-1",
             agent_name="my-agent",
             group_ids=["group-1"],
-            standard_skills=_std_skills(),
+            default_skills=_std_skills(),
         )
 
     assert result["weekly-report"].scope == "group"
     assert result["weekly-report"].body == "Team-specific weekly report format."
-    assert result["weekly-report"].overrides == "standard"
+    assert result["weekly-report"].overrides == "default"
 
 
 @pytest.mark.asyncio
@@ -123,19 +123,19 @@ async def test_personal_skill_no_override():
             user_id="user-1",
             agent_name="my-agent",
             group_ids=[],
-            standard_skills=_std_skills(),
+            default_skills=_std_skills(),
         )
 
     assert "my-custom-workflow" in result
     assert result["my-custom-workflow"].scope == "personal"
     assert result["my-custom-workflow"].overrides is None
-    # Standards still present
+    # Defaults still present
     assert len(result) == 3
 
 
 @pytest.mark.asyncio
 async def test_empty_standard_skills():
-    """Works with no standard skills."""
+    """Works with no default skills."""
     from agent_common.core.playbook_reader import SkillIndexEntry
 
     with patch("agent_common.core.skills_resolver.PlaybookReaderService") as MockReader:
@@ -152,7 +152,7 @@ async def test_empty_standard_skills():
             user_id="user-1",
             agent_name="my-agent",
             group_ids=[],
-            standard_skills=[],
+            default_skills=[],
         )
 
     assert len(result) == 1
@@ -172,7 +172,7 @@ async def test_no_skills_at_all():
             user_id="user-1",
             agent_name="my-agent",
             group_ids=[],
-            standard_skills=[],
+            default_skills=[],
         )
 
     assert result == {}
@@ -197,10 +197,10 @@ async def test_unreadable_skill_skipped():
             user_id="user-1",
             agent_name="my-agent",
             group_ids=[],
-            standard_skills=_std_skills(),
+            default_skills=_std_skills(),
         )
 
-    # Only standard skills remain; broken one was skipped
+    # Only default skills remain; broken one was skipped
     assert len(result) == 2
     assert "broken" not in result
 
@@ -217,7 +217,7 @@ async def test_no_group_ids():
             user_id="user-1",
             agent_name="my-agent",
             group_ids=[],
-            standard_skills=_std_skills(),
+            default_skills=_std_skills(),
         )
 
     assert len(result) == 2
