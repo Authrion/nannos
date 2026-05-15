@@ -360,3 +360,329 @@ class TestSkillsRegistryService:
 
         content = "# Just a markdown file\nNo frontmatter here."
         assert service._extract_description_from_frontmatter(content) == ""
+
+
+# --- Import endpoint tests ---
+
+
+class TestImportSkill:
+    """Tests for POST /api/v1/skills/registry/import."""
+
+    def _mock_request(self, playbook_service):
+        """Create a mock request with playbook_service on app state."""
+        request = MagicMock()
+        request.app.state.playbook_service = playbook_service
+        return request
+
+    def _mock_playbook_service(self, skill_exists=False):
+        """Create a mock playbook service."""
+        service = MagicMock()
+        service.is_available = True
+        service.get_skill = AsyncMock(return_value="existing content" if skill_exists else None)
+        service.put_skill_with_files = AsyncMock(return_value=None)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_import_from_skills_sh(self):
+        """Import a skill from skills.sh by ID."""
+        from console_backend.models.skills_registry import (
+            SkillDetailResponse,
+            SkillImportRequest,
+            SkillImportResponse,
+        )
+        from console_backend.routers.skills_registry_router import import_skill
+
+        mock_detail = SkillDetailResponse(
+            id="vercel-labs/agent-skills/next-js-development",
+            source="vercel-labs/agent-skills",
+            slug="next-js-development",
+            installs=1500,
+            hash="abc123",
+            files=[
+                SkillFile(path="SKILL.md", contents="---\nname: next-js-development\n---\n\n# Next.js"),
+                SkillFile(path="examples/config.ts", contents="export default {}"),
+            ],
+        )
+
+        playbook_service = self._mock_playbook_service()
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(
+            id="vercel-labs/agent-skills/next-js-development",
+            agent="orchestrator",
+            scope="personal",
+        )
+
+        with patch(
+            "console_backend.routers.skills_registry_router.skills_registry_service.get_skill_detail",
+            new_callable=AsyncMock,
+            return_value=mock_detail,
+        ):
+            result = await import_skill(body=body, request=request, user=_make_user())
+
+        assert isinstance(result, SkillImportResponse)
+        assert result.skill_name == "next-js-development"
+        assert result.agent == "orchestrator"
+        assert result.scope == "personal"
+        assert result.source.type == "skills.sh"
+        assert result.source.hash == "abc123"
+        assert result.files_count == 2
+        assert result.overwritten is False
+
+        playbook_service.put_skill_with_files.assert_called_once_with(
+            user_id="user-id-1",
+            agent_name="orchestrator",
+            skill_name="next-js-development",
+            scope="personal",
+            content="---\nname: next-js-development\n---\n\n# Next.js",
+            files=[{"path": "examples/config.ts", "content": "export default {}"}],
+            group_id=None,
+            replace_files=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_import_from_github(self):
+        """Import a skill from GitHub by repo+skill."""
+        from console_backend.models.skills_registry import (
+            GitHubSkillDetail,
+            SkillImportRequest,
+            SkillImportResponse,
+        )
+        from console_backend.routers.skills_registry_router import import_skill
+
+        mock_github = GitHubSkillDetail(
+            files=[
+                SkillFile(path="SKILL.md", contents="---\nname: planning\n---\n\n# Planning Skill"),
+            ],
+            tree_sha="def456",
+        )
+
+        playbook_service = self._mock_playbook_service()
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(
+            repo="OthmanAdi/planning-with-files",
+            skill="planning-with-files",
+            agent="orchestrator",
+            scope="personal",
+        )
+
+        with patch(
+            "console_backend.routers.skills_registry_router.skills_registry_service.fetch_skill_files_from_github",
+            new_callable=AsyncMock,
+            return_value=mock_github,
+        ):
+            result = await import_skill(body=body, request=request, user=_make_user())
+
+        assert isinstance(result, SkillImportResponse)
+        assert result.skill_name == "planning-with-files"
+        assert result.source.type == "github"
+        assert result.source.repo == "OthmanAdi/planning-with-files"
+        assert result.source.hash == "def456"
+        assert result.files_count == 1
+
+        playbook_service.put_skill_with_files.assert_called_once_with(
+            user_id="user-id-1",
+            agent_name="orchestrator",
+            skill_name="planning-with-files",
+            scope="personal",
+            content="---\nname: planning\n---\n\n# Planning Skill",
+            files=None,
+            group_id=None,
+            replace_files=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_import_conflict_without_overwrite(self):
+        """Returns 409 when skill exists and overwrite is False."""
+        from console_backend.models.skills_registry import SkillDetailResponse, SkillImportRequest
+        from console_backend.routers.skills_registry_router import import_skill
+
+        mock_detail = SkillDetailResponse(
+            id="owner/repo/my-skill",
+            source="owner/repo",
+            slug="my-skill",
+            installs=0,
+            hash="hash1",
+            files=[SkillFile(path="SKILL.md", contents="# Skill content")],
+        )
+
+        playbook_service = self._mock_playbook_service(skill_exists=True)
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(id="owner/repo/my-skill", agent="orchestrator", scope="personal")
+
+        with patch(
+            "console_backend.routers.skills_registry_router.skills_registry_service.get_skill_detail",
+            new_callable=AsyncMock,
+            return_value=mock_detail,
+        ):
+            with pytest.raises(Exception) as exc_info:
+                await import_skill(body=body, request=request, user=_make_user())
+
+        assert exc_info.value.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_import_overwrite_existing(self):
+        """Overwrites existing skill when overwrite=True."""
+        from console_backend.models.skills_registry import (
+            SkillDetailResponse,
+            SkillImportRequest,
+            SkillImportResponse,
+        )
+        from console_backend.routers.skills_registry_router import import_skill
+
+        mock_detail = SkillDetailResponse(
+            id="owner/repo/my-skill",
+            source="owner/repo",
+            slug="my-skill",
+            installs=0,
+            hash="hash2",
+            files=[SkillFile(path="SKILL.md", contents="# Updated content")],
+        )
+
+        playbook_service = self._mock_playbook_service(skill_exists=True)
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(id="owner/repo/my-skill", agent="orchestrator", scope="personal", overwrite=True)
+
+        with patch(
+            "console_backend.routers.skills_registry_router.skills_registry_service.get_skill_detail",
+            new_callable=AsyncMock,
+            return_value=mock_detail,
+        ):
+            result = await import_skill(body=body, request=request, user=_make_user())
+
+        assert isinstance(result, SkillImportResponse)
+        assert result.overwritten is True
+        playbook_service.put_skill_with_files.assert_called_once()
+        call_kwargs = playbook_service.put_skill_with_files.call_args[1]
+        assert call_kwargs["replace_files"] is True
+
+    @pytest.mark.asyncio
+    async def test_import_skill_not_found_skills_sh(self):
+        """Returns 404 when skills.sh skill doesn't exist."""
+        from console_backend.models.skills_registry import SkillImportRequest
+        from console_backend.routers.skills_registry_router import import_skill
+
+        playbook_service = self._mock_playbook_service()
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(id="nonexistent/repo/skill", agent="orchestrator", scope="personal")
+
+        with patch(
+            "console_backend.routers.skills_registry_router.skills_registry_service.get_skill_detail",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            with pytest.raises(Exception) as exc_info:
+                await import_skill(body=body, request=request, user=_make_user())
+
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_import_skill_not_found_github(self):
+        """Returns 404 when GitHub skill doesn't exist."""
+        from console_backend.models.skills_registry import SkillImportRequest
+        from console_backend.routers.skills_registry_router import import_skill
+
+        playbook_service = self._mock_playbook_service()
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(repo="owner/repo", skill="nonexistent-skill", agent="orchestrator", scope="personal")
+
+        with patch(
+            "console_backend.routers.skills_registry_router.skills_registry_service.fetch_skill_files_from_github",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            with pytest.raises(Exception) as exc_info:
+                await import_skill(body=body, request=request, user=_make_user())
+
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_import_no_skill_md(self):
+        """Returns 422 when skill has no SKILL.md file."""
+        from console_backend.models.skills_registry import SkillDetailResponse, SkillImportRequest
+        from console_backend.routers.skills_registry_router import import_skill
+
+        mock_detail = SkillDetailResponse(
+            id="owner/repo/broken-skill",
+            source="owner/repo",
+            slug="broken-skill",
+            installs=0,
+            hash="hash3",
+            files=[SkillFile(path="README.md", contents="# Not a skill")],
+        )
+
+        playbook_service = self._mock_playbook_service()
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(id="owner/repo/broken-skill", agent="orchestrator", scope="personal")
+
+        with patch(
+            "console_backend.routers.skills_registry_router.skills_registry_service.get_skill_detail",
+            new_callable=AsyncMock,
+            return_value=mock_detail,
+        ):
+            with pytest.raises(Exception) as exc_info:
+                await import_skill(body=body, request=request, user=_make_user())
+
+        assert exc_info.value.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_import_missing_source_params(self):
+        """Returns 400 when neither id nor repo+skill is provided."""
+        from console_backend.models.skills_registry import SkillImportRequest
+        from console_backend.routers.skills_registry_router import import_skill
+
+        playbook_service = self._mock_playbook_service()
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(agent="orchestrator", scope="personal")
+
+        with pytest.raises(Exception) as exc_info:
+            await import_skill(body=body, request=request, user=_make_user())
+
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_import_group_scope(self):
+        """Import with group scope passes group_id to playbook service."""
+        from console_backend.models.skills_registry import (
+            SkillDetailResponse,
+            SkillImportRequest,
+        )
+        from console_backend.routers.skills_registry_router import import_skill
+
+        mock_detail = SkillDetailResponse(
+            id="owner/repo/team-skill",
+            source="owner/repo",
+            slug="team-skill",
+            installs=0,
+            hash="hash4",
+            files=[SkillFile(path="SKILL.md", contents="# Team skill")],
+        )
+
+        playbook_service = self._mock_playbook_service()
+        request = self._mock_request(playbook_service)
+
+        body = SkillImportRequest(
+            id="owner/repo/team-skill",
+            agent="orchestrator",
+            scope="group",
+            group_id="group-123",
+        )
+
+        with patch(
+            "console_backend.routers.skills_registry_router.skills_registry_service.get_skill_detail",
+            new_callable=AsyncMock,
+            return_value=mock_detail,
+        ):
+            result = await import_skill(body=body, request=request, user=_make_user())
+
+        assert result.scope == "group"
+        call_kwargs = playbook_service.put_skill_with_files.call_args[1]
+        assert call_kwargs["group_id"] == "group-123"
+        assert call_kwargs["scope"] == "group"

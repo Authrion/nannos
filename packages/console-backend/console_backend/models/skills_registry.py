@@ -109,8 +109,10 @@ class SkillImportRequest(BaseModel):
 class SkillSourceInfo(BaseModel):
     """Provenance metadata stored with imported skills."""
 
+    type: str = Field(description="Source type: 'skills.sh' or 'github'")
     id: str | None = Field(default=None, description="skills.sh skill ID")
     repo: str | None = Field(default=None, description="GitHub repo (owner/repo)")
+    skill: str | None = Field(default=None, description="Skill name within repo (GitHub source)")
     hash: str | None = Field(default=None, description="Content hash (skills.sh SHA-256 or git tree SHA)")
     imported_at: str = Field(description="ISO 8601 timestamp of import")
 
@@ -118,10 +120,12 @@ class SkillSourceInfo(BaseModel):
 class SkillImportResponse(BaseModel):
     """Response after successful skill import."""
 
-    name: str = Field(description="Imported skill name")
+    skill_name: str = Field(description="Imported skill name")
     agent: str = Field(description="Target sub-agent name")
     scope: str = Field(description="Scope where skill was stored")
     source: SkillSourceInfo = Field(description="Provenance metadata")
+    files_count: int = Field(description="Total number of files imported (including SKILL.md)")
+    overwritten: bool = Field(default=False, description="Whether an existing skill was overwritten")
 
 
 class SkillBrowseRequest(BaseModel):

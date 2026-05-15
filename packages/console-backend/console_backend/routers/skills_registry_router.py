@@ -1,18 +1,23 @@
 """Skills Registry API endpoints.
 
-Provides search and browse endpoints for discovering skills from external
-registries (skills.sh, GitHub) before importing them.
+Provides search, browse, and import endpoints for discovering and importing
+skills from external registries (skills.sh, GitHub) into the local skill store.
 """
 
 import logging
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from console_backend.dependencies import require_auth
 from console_backend.models.skills_registry import (
     SkillAuditResponse,
     SkillDetailResponse,
+    SkillFile,
+    SkillImportRequest,
+    SkillImportResponse,
     SkillSearchResponse,
+    SkillSourceInfo,
 )
 from console_backend.models.user import User
 from console_backend.services.skills_registry_service import skills_registry_service
@@ -94,3 +99,158 @@ async def get_skill_audit(
             detail=f"No audit found for skill '{skill_id}'",
         )
     return audit
+
+
+@router.post("/import", response_model=SkillImportResponse, status_code=status.HTTP_201_CREATED)
+async def import_skill(
+    body: SkillImportRequest,
+    request: Request,
+    user: User = Depends(require_auth),
+) -> SkillImportResponse:
+    """Import a skill from skills.sh or GitHub into the local skill store.
+
+    Fetches the skill files from the external registry and writes them to the
+    docstore via PlaybookService. Supports both skills.sh (by ID) and GitHub
+    (by repo + skill name) as sources.
+
+    Returns 409 if the skill already exists (unless overwrite=True).
+    Returns 404 if the skill cannot be found at the source.
+    """
+    from console_backend.routers.playbook_router import get_playbook_service
+
+    playbook_service = get_playbook_service(request)
+
+    # Resolve skill files from external source
+    skill_content: str | None = None
+    bundled_files: list[SkillFile] = []
+    source_info: SkillSourceInfo
+
+    if body.id:
+        # Fetch from skills.sh by ID
+        detail = await skills_registry_service.get_skill_detail(body.id)
+        if detail is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Skill '{body.id}' not found on skills.sh",
+            )
+        if not detail.files:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Skill '{body.id}' has no files on skills.sh",
+            )
+        # Find SKILL.md (entry point)
+        for f in detail.files:
+            if f.path == "SKILL.md":
+                skill_content = f.contents
+            else:
+                bundled_files.append(f)
+
+        if not skill_content:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Skill '{body.id}' has no SKILL.md file",
+            )
+
+        source_info = SkillSourceInfo(
+            type="skills.sh",
+            id=body.id,
+            hash=detail.hash,
+            imported_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    elif body.repo and body.skill:
+        # Fetch from GitHub
+        github_detail = await skills_registry_service.fetch_skill_files_from_github(
+            repo=body.repo, skill_name=body.skill, ref="main"
+        )
+        if github_detail is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Skill '{body.skill}' not found in repo '{body.repo}'",
+            )
+        # Find SKILL.md
+        for f in github_detail.files:
+            if f.path == "SKILL.md":
+                skill_content = f.contents
+            else:
+                bundled_files.append(f)
+
+        if not skill_content:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Skill '{body.skill}' in '{body.repo}' has no SKILL.md file",
+            )
+
+        source_info = SkillSourceInfo(
+            type="github",
+            repo=body.repo,
+            skill=body.skill,
+            hash=github_detail.tree_sha,
+            imported_at=datetime.now(timezone.utc).isoformat(),
+        )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Must provide either 'id' (skills.sh) or both 'repo' and 'skill' (GitHub)",
+        )
+
+    # Determine skill name for storage
+    if body.skill:
+        skill_name = body.skill
+    elif body.id:
+        skill_name = body.id.split("/")[-1]
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot determine skill name from request",
+        )
+
+    # Check if skill already exists
+    if not body.overwrite:
+        existing = await playbook_service.get_skill(
+            user_id=user.id,
+            agent_name=body.agent,
+            skill_name=skill_name,
+            scope=body.scope,
+            group_id=body.group_id,
+        )
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Skill '{skill_name}' already exists for agent '{body.agent}'. Set overwrite=true to replace.",
+            )
+
+    # Write to docstore
+    files_data = [{"path": f.path, "content": f.contents} for f in bundled_files] if bundled_files else None
+
+    try:
+        await playbook_service.put_skill_with_files(
+            user_id=user.id,
+            agent_name=body.agent,
+            skill_name=skill_name,
+            scope=body.scope,
+            content=skill_content,
+            files=files_data,
+            group_id=body.group_id,
+            replace_files=body.overwrite,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    logger.info(
+        "Imported skill '%s' from %s for agent '%s' (scope=%s, user=%s)",
+        skill_name,
+        source_info.type,
+        body.agent,
+        body.scope,
+        user.id,
+    )
+
+    return SkillImportResponse(
+        skill_name=skill_name,
+        agent=body.agent,
+        scope=body.scope,
+        source=source_info,
+        files_count=1 + len(bundled_files),
+        overwritten=body.overwrite,
+    )
