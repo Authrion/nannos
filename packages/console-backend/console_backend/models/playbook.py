@@ -1,13 +1,24 @@
 """Pydantic models for the Playbook API."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
+
+# Activation scope: where the skill is delivered at runtime.
+#   - personal: only the activating user sees it (highest priority)
+#   - group: shared with all group members (middle priority)
+#   - default: baked into sub-agent config, visible to all users (lowest priority)
+ActivationScope = Literal["personal", "group", "default"]
+
+# Playbook scope: playbooks only support personal/group (no default tier).
+PlaybookScope = Literal["personal", "group"]
 
 
 class PlaybookContent(BaseModel):
     """AGENTS.md content for an agent."""
 
     agent_name: str
-    scope: str = Field(description="'personal' or 'group'")
+    scope: PlaybookScope = Field(description="'personal' or 'group'")
     content: str | None = Field(default=None, description="Markdown content of the AGENTS.md file")
     group_id: str | None = Field(default=None, description="Group ID (present for group scope)")
     group_name: str | None = Field(default=None, description="Group display name (present for group scope)")
@@ -33,7 +44,7 @@ class SkillSummary(BaseModel):
     description: str = Field(
         default="", description="Description from frontmatter (what the skill does and when to use it)"
     )
-    scope: str = Field(description="'personal' or 'group'")
+    scope: ActivationScope = Field(description="'personal', 'group', or 'default'")
     file_count: int = Field(default=0, description="Number of bundled files (excluding SKILL.md)")
     group_id: str | None = Field(default=None, description="Group ID (present for group scope)")
     group_name: str | None = Field(default=None, description="Group display name (present for group scope)")
@@ -43,7 +54,7 @@ class SkillDetail(BaseModel):
     """Full skill file content."""
 
     name: str
-    scope: str
+    scope: ActivationScope
     content: str = Field(description="Full SKILL.md content (frontmatter + body)")
     files: list[SkillFileSummary] = Field(default_factory=list, description="Bundled file paths (excluding SKILL.md)")
 
@@ -63,8 +74,8 @@ class McpSkillFile(BaseModel):
         segments = v.split("/")
         if ".." in segments:
             raise ValueError(f"Path traversal not allowed: {v}")
-        if len(segments) > 3:
-            raise ValueError(f"Skill file path exceeds max depth (3): {v}")
+        if len(segments) > 6:
+            raise ValueError(f"Skill file path exceeds max depth (6): {v}")
         if not v or not all(segments):
             raise ValueError(f"Invalid skill file path: {v}")
         if v == "SKILL.md":
@@ -117,67 +128,80 @@ class SkillListResponse(BaseModel):
 class McpSkillCreate(BaseModel):
     """Request body for the console_create_skill MCP tool.
 
-    Creates a runtime skill in the specified scope. Personal and group skills
-    are stored in the docstore; standard skills are stored in the sub-agent
-    config version (requires approval workflow).
+    Creates a skill in the registry and auto-activates it on the calling agent.
+    The skill is immediately usable after creation.
     """
 
     agent_name: str | None = Field(
         default=None,
         description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
     )
-    scope: str = Field(
-        description=(
-            "Where to store the skill: "
-            "'personal' (user-only, immediate), "
-            "'group' (shared with group, immediate), or "
-            "'default' (stored in sub-agent config version, requires approval)"
-        ),
+    scope: ActivationScope = Field(
+        description="Activation scope: 'personal' (user-only), 'group' (shared with group), or 'default' (baked into sub-agent config for all users)",
     )
     skill_name: str = Field(description="Skill identifier (lowercase letters, numbers, hyphens only)")
     description: str = Field(default="", description="What the skill does and when to use it")
     body: str = Field(description="Skill instructions body (Markdown)")
     files: list[McpSkillFile] | None = Field(default=None, description="Optional files to bundle with the skill")
     group_id: str | None = Field(default=None, description="Group ID (required when scope='group')")
-    sub_agent_id: int | None = Field(default=None, description="Sub-agent ID (required when scope='default')")
+    sub_agent_id: int | None = Field(
+        default=None, description="Sub-agent ID (resolved from agent_name if not provided)"
+    )
+    visibility: str = Field(
+        default="private",
+        description="Registry visibility: 'private' (only you), 'group' (your group), or 'public' (everyone)",
+    )
 
 
 class McpSkillUpdate(BaseModel):
-    """Request body for the console_update_skill MCP tool."""
+    """Request body for the console_update_skill MCP tool.
+
+    Updates a skill in the registry and auto-refreshes the calling agent's
+    own activation. Other consumers' activations remain pinned.
+    """
 
     agent_name: str | None = Field(
         default=None,
         description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
     )
-    scope: str = Field(
+    scope: ActivationScope = Field(
         description="Scope of the skill to update: 'personal', 'group', or 'default'",
     )
     skill_name: str = Field(description="Skill identifier to update")
-    description: str | None = Field(default=None, description="Updated description (default scope only)")
+    description: str | None = Field(default=None, description="Updated description")
     body: str | None = Field(default=None, description="Updated skill instructions body (Markdown)")
     content: str | None = Field(
         default=None,
-        description="Full SKILL.md content including frontmatter (personal/group scope). Mutually exclusive with body.",
+        description="Full SKILL.md content including frontmatter. Mutually exclusive with body.",
     )
     files: list[McpSkillFile] | None = Field(
         default=None,
         description="If provided, replaces ALL bundled files. If omitted, existing files are untouched.",
     )
     group_id: str | None = Field(default=None, description="Group ID (required when scope='group')")
-    sub_agent_id: int | None = Field(default=None, description="Sub-agent ID (required when scope='default')")
+    sub_agent_id: int | None = Field(
+        default=None, description="Sub-agent ID (resolved from agent_name if not provided)"
+    )
+    registry_id: str | None = Field(default=None, description="Registry entry UUID (alternative to skill_name lookup)")
 
 
 class McpSkillRemove(BaseModel):
-    """Request body for the console_remove_skill MCP tool."""
+    """Request body for the console_remove_skill MCP tool.
+
+    Deactivates a skill from the calling agent. The registry entry is preserved
+    for other consumers.
+    """
 
     agent_name: str | None = Field(
         default=None,
         description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
     )
-    scope: str = Field(description="Scope of the skill to remove: 'personal', 'group', or 'default'")
-    skill_name: str = Field(description="Skill identifier to remove")
+    scope: ActivationScope = Field(description="Scope of the skill to remove: 'personal', 'group', or 'default'")
+    skill_name: str = Field(description="Skill identifier to deactivate")
     group_id: str | None = Field(default=None, description="Group ID (required when scope='group')")
-    sub_agent_id: int | None = Field(default=None, description="Sub-agent ID (required when scope='default')")
+    sub_agent_id: int | None = Field(
+        default=None, description="Sub-agent ID (resolved from agent_name if not provided)"
+    )
 
 
 class McpPlaybookUpdate(BaseModel):
@@ -191,7 +215,7 @@ class McpPlaybookUpdate(BaseModel):
         default=None,
         description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
     )
-    scope: str = Field(description="Scope: 'personal' or 'group'")
+    scope: PlaybookScope = Field(description="Scope: 'personal' or 'group'")
     content: str = Field(description="Full Markdown content to write")
     group_id: str | None = Field(default=None, description="Group ID (required when scope='group')")
 
@@ -203,12 +227,14 @@ class McpSkillWriteFile(BaseModel):
         default=None,
         description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
     )
-    scope: str = Field(description="Scope of the skill: 'personal', 'group', or 'default'")
+    scope: ActivationScope = Field(description="Scope of the skill: 'personal', 'group', or 'default'")
     skill_name: str = Field(description="Skill identifier that the file belongs to")
     file_path: str = Field(description="Relative path within the skill folder (e.g., 'scripts/check.py')")
     content: str = Field(description="File content (text)")
     group_id: str | None = Field(default=None, description="Group ID (required when scope='group')")
-    sub_agent_id: int | None = Field(default=None, description="Sub-agent ID (required when scope='default')")
+    sub_agent_id: int | None = Field(
+        default=None, description="Sub-agent ID (resolved from agent_name if not provided)"
+    )
 
 
 class McpSkillDeleteFile(BaseModel):
@@ -218,17 +244,44 @@ class McpSkillDeleteFile(BaseModel):
         default=None,
         description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
     )
-    scope: str = Field(description="Scope of the skill: 'personal', 'group', or 'default'")
+    scope: ActivationScope = Field(description="Scope of the skill: 'personal', 'group', or 'default'")
     skill_name: str = Field(description="Skill identifier that the file belongs to")
     file_path: str = Field(description="Relative path of the file to delete (e.g., 'scripts/check.py')")
     group_id: str | None = Field(default=None, description="Group ID (required when scope='group')")
-    sub_agent_id: int | None = Field(default=None, description="Sub-agent ID (required when scope='default')")
+    sub_agent_id: int | None = Field(
+        default=None, description="Sub-agent ID (resolved from agent_name if not provided)"
+    )
 
 
 class McpSkillResponse(BaseModel):
     """Response from MCP skill operations."""
 
     skill_name: str
-    scope: str
+    scope: ActivationScope
     agent_name: str
     message: str
+    registry_id: str | None = Field(default=None, description="Registry entry UUID (for create/update operations)")
+
+
+class McpSkillActivate(BaseModel):
+    """Request body for the console_activate_skill MCP tool.
+
+    Activates an existing registry skill on the calling agent.
+    Use this to adopt a skill created by someone else.
+    """
+
+    agent_name: str | None = Field(
+        default=None,
+        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    )
+    registry_id: str | None = Field(default=None, description="Registry entry UUID to activate")
+    skill_name: str | None = Field(
+        default=None, description="Skill name to search in registry (alternative to registry_id)"
+    )
+    scope: ActivationScope = Field(
+        default="personal", description="Activation scope: 'personal', 'group', or 'default'"
+    )
+    group_id: str | None = Field(default=None, description="Group ID (required when scope='group')")
+    sub_agent_id: int | None = Field(
+        default=None, description="Sub-agent ID (resolved from agent_name if not provided)"
+    )

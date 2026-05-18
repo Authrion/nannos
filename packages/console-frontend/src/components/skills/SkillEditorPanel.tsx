@@ -87,7 +87,7 @@ export function SkillEditorPanel({
   skillName,
   scope,
   groupId,
-  onClose,
+  onClose: _onClose,
 }: SkillEditorPanelProps) {
   const queryClient = useQueryClient();
 

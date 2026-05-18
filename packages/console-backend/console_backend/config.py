@@ -239,16 +239,25 @@ class CatalogConfig(BaseModel):
 
 
 class SkillsRegistryConfig(BaseModel):
-    """Configuration for external skills registry integration (skills.sh + GitHub)."""
+    """Configuration for skills sourcing (Git-first, registry-optional)."""
 
-    skills_sh_base_url: str = Field(default_factory=lambda: os.getenv("SKILLS_SH_BASE_URL", "https://skills.sh"))
-    skills_sh_api_key: SecretStr | None = Field(
-        default_factory=lambda: SecretStr(t) if (t := os.getenv("SKILLS_SH_API_KEY")) else None
-    )
+    # Git provider (primary source — always available)
     github_token: SecretStr | None = Field(
         default_factory=lambda: SecretStr(t) if (t := os.getenv("GITHUB_TOKEN")) else None
     )
+    github_app_id: str | None = Field(default_factory=lambda: os.getenv("GITHUB_APP_ID"))
+    github_app_private_key: SecretStr | None = Field(
+        default_factory=lambda: SecretStr(t) if (t := os.getenv("GITHUB_APP_PRIVATE_KEY")) else None
+    )
     github_api_base_url: str = Field(default_factory=lambda: os.getenv("GITHUB_API_BASE_URL", "https://api.github.com"))
+
+    # Registry adapter (optional discovery/search layer)
+    registry_url: str = Field(
+        default_factory=lambda: os.getenv("SKILL_REGISTRY_URL", "https://skills.sh")
+    )
+    registry_api_key: SecretStr | None = Field(
+        default_factory=lambda: SecretStr(t) if (t := os.getenv("SKILL_REGISTRY_API_KEY")) else None
+    )
 
 
 class Config(BaseModel):

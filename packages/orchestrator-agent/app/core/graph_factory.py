@@ -29,6 +29,7 @@ from agent_common.core.graph_utils import build_common_middleware_stack, create_
 from agent_common.core.model_factory import _has_aws_credentials, create_model
 from agent_common.middleware.steering_middleware import SteeringMiddleware
 from agent_common.middleware.storage_paths_middleware import StoragePathsInstructionMiddleware
+from agent_common.middleware.tool_status import ToolStatusMiddleware
 from agent_common.models.base import DEFAULT_MODEL, ModelType, ThinkingLevel
 from deepagents import create_deep_agent
 from langchain.agents import create_agent
@@ -82,6 +83,14 @@ HITL_GUARDED_TOOLS = {
     "console_update_playbook": {
         "allowed_decisions": ["approve", "edit", "reject"],
         "description": "Agent wants to update the playbook (AGENTS.md).",
+    },
+    "console_import_skill": {
+        "allowed_decisions": ["approve", "reject"],
+        "description": "Agent wants to import a skill from an external source.",
+    },
+    "console_activate_skill": {
+        "allowed_decisions": ["approve", "reject"],
+        "description": "Agent wants to activate a skill on a sub-agent.",
     },
 }
 
@@ -563,6 +572,7 @@ class GraphFactory:
             steering_middleware,
             user_preferences_middleware,
             playbook_middleware,
+            ToolStatusMiddleware(),
             self._loop_detection_middleware,
             self._auth_middleware,
             ErrorClassificationMiddleware(),

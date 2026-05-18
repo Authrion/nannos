@@ -116,20 +116,50 @@ class SkillFile(BaseModel):
         segments = v.split("/")
         if ".." in segments:
             raise ValueError(f"Path traversal not allowed: {v}")
-        if len(segments) > 3:
-            raise ValueError(f"Skill file path exceeds max depth (3): {v}")
+        if len(segments) > 6:
+            raise ValueError(f"Skill file path exceeds max depth (6): {v}")
         if not v or not all(segments):
             raise ValueError(f"Invalid skill file path: {v}")
         return v
 
 
 class SkillDefinition(BaseModel):
-    """A standard (immutable) skill bundled with a sub-agent config version."""
+    """A standard (immutable) skill bundled with a sub-agent config version.
+
+    Two modes:
+    - Custom skills (source=None): full content stored inline (body + files)
+    - Imported skills (source set): only reference stored (name, description, source, source_hash).
+      Body and files are empty/absent — resolve from skill registry at runtime.
+    """
 
     name: str = Field(..., description="Skill identifier (lowercase, alphanumeric + hyphens)")
     description: str = Field(..., max_length=1024, description="What the skill does")
-    body: str = Field(..., description="SKILL.md body content (markdown)")
-    files: list[SkillFile] = Field(default_factory=list, description="Optional scripts/references/assets")
+    body: str = Field(
+        default="", description="SKILL.md body content (markdown). Empty for imported skills (resolve from registry)."
+    )
+    files: list[SkillFile] = Field(
+        default_factory=list, description="Optional scripts/references/assets. Empty for imported skills."
+    )
+    source: str | None = Field(
+        default=None,
+        description="Registry skill ID if imported (e.g., 'vercel-labs/agent-skills/next-js-dev'). Null for custom skills.",
+    )
+    source_hash: str | None = Field(
+        default=None,
+        description="Content hash of the registry skill at import time. Used to detect available updates.",
+    )
+    update_available: bool = Field(
+        default=False,
+        description="True when the registry has a newer version than the pinned source_hash.",
+    )
+    latest_hash: str | None = Field(
+        default=None,
+        description="Current content_hash in the registry. Present when update_available=True.",
+    )
+    sandbox_required: bool = Field(
+        default=False,
+        description="Whether the skill contains executable files (.py, .sh, etc.) that require sandbox.",
+    )
 
     @field_validator("name")
     @classmethod
@@ -142,28 +172,34 @@ class SkillDefinition(BaseModel):
         return v
 
 
-class SubAgentConfigVersion(BaseModel):
-    """Version history entry for sub-agent configurations."""
+class SkillSummary(BaseModel):
+    """Lightweight skill metadata for list responses (no body/files content)."""
 
-    id: int | None = None  # Primary key from sub_agent_config_versions table
-    sub_agent_id: int | None = None  # Foreign key to sub_agents
+    name: str
+    description: str = ""
+    source: str | None = None
+    source_hash: str | None = None
+    update_available: bool = False
+    latest_hash: str | None = None
+    sandbox_required: bool = False
+
+
+class SubAgentConfigVersionBase(BaseModel):
+    """Base fields shared between full and summary config versions."""
+
+    id: int | None = None
+    sub_agent_id: int | None = None
     version: int
-    version_hash: str | None = None  # Content hash (12 chars) - identifies drafts/pending
-    release_number: int | None = None  # Sequential release number - only for approved versions
+    version_hash: str | None = None
+    release_number: int | None = None
     description: str  # Agent skill set description - crucial for orchestrator routing
-
-    # Configuration data: Local sub-agents use system_prompt, Remote sub-agents use agent_url, Foundry agents use foundry_* fields
-    model: str | None = (
-        None  # LLM model: 'gpt-4o', 'gpt-4o-mini', 'claude-sonnet-4.5', 'claude-sonnet-4.6', 'claude-haiku-4-5'
-    )
-    system_prompt: str | None = None  # For local sub-agents: the system prompt
-    agent_url: str | None = None  # For remote sub-agents: the URL of the agent
-    mcp_tools: list[str] = Field(default_factory=list)  # MCP tool names enabled for this version
-
-    # Foundry agent configuration
+    model: str | None = None
+    system_prompt: str | None = None
+    agent_url: str | None = None
+    mcp_tools: list[str] = Field(default_factory=list)
     foundry_hostname: str | None = None
     foundry_client_id: str | None = None
-    foundry_client_secret_ref: int | None = None  # Reference to secrets table
+    foundry_client_secret_ref: int | None = None
     foundry_client_secret_ssmkey: str | None = Field(
         default=None,
         description=(
@@ -173,10 +209,8 @@ class SubAgentConfigVersion(BaseModel):
     )
     foundry_ontology_rid: str | None = None
     foundry_query_api_name: str | None = None
-    foundry_scopes: list[str] | None = None  # Stored as TEXT[] in database
+    foundry_scopes: list[str] | None = None
     foundry_version: str | None = None
-
-    # Agent-specific pricing configuration (remote and foundry agents only)
     pricing_config: dict | None = Field(
         default=None,
         description=(
@@ -185,32 +219,27 @@ class SubAgentConfigVersion(BaseModel):
             "or {'price_per_million_requests': 0.05}"
         ),
     )
-
-    # Extended thinking configuration (only supported for Claude Sonnet and Gemini models)
     enable_thinking: bool | None = None
     thinking_level: ThinkingLevel | None = ThinkingLevel.LOW
-
-    # Standard skills and sandbox execution
-    skills: list[SkillDefinition] = Field(default_factory=list)
     sandbox_enabled: bool = False
-
     change_summary: str | None = None
     status: SubAgentStatus = SubAgentStatus.DRAFT
-    submitted_by_user_id: str | None = None  # User who submitted for approval
+    submitted_by_user_id: str | None = None
     approved_by_user_id: str | None = None
     approved_at: datetime | None = None
     rejection_reason: str | None = None
-    deleted_at: datetime | None = None  # Soft delete timestamp
+    deleted_at: datetime | None = None
     created_at: datetime
 
 
-class SubAgent(BaseModel):
-    """Sub-agent model.
+class SubAgentConfigVersion(SubAgentConfigVersionBase):
+    """Full version with complete skill content (body + files)."""
 
-    Metadata (name, owner, type) lives on sub_agents table.
-    Configuration data (description, model, config, status) lives on sub_agent_config_versions.
-    The config_version field holds the joined version data (default or specific version).
-    """
+    skills: list[SkillDefinition] = Field(default_factory=list)
+
+
+class SubAgentBase(BaseModel):
+    """Base fields shared between SubAgent (detail) and SubAgentListItem (list)."""
 
     id: int
     name: str
@@ -218,21 +247,31 @@ class SubAgent(BaseModel):
     owner: SubAgentOwner | None = None
     owner_status: OwnerStatus = OwnerStatus.ACTIVE
     type: SubAgentType
-    system_role: str | None = None  # e.g. 'debug' — identifies agents with special system purposes
+    system_role: str | None = None
     current_version: int = 1
-    default_version: int | None = None  # NULL means no approved version yet
-    config_version: SubAgentConfigVersion | None = None  # Joined version data
-    is_public: bool | None = None  # If true, accessible to all users without group permissions
-    is_activated: bool | None = None  # If true, user has activated this sub-agent
-    activated_by: ActivationSource | None = None  # Activation source: 'user', 'group', or 'admin'
-    activated_by_groups: list[int] | None = None  # List of group IDs that activated this agent
-    effective_permission: Literal["owner", "write", "read"] | None = None  # User's effective permission level
+    default_version: int | None = None
+    is_public: bool | None = None
+    is_activated: bool | None = None
+    activated_by: ActivationSource | None = None
+    activated_by_groups: list[int] | None = None
+    effective_permission: Literal["owner", "write", "read"] | None = None
     deleted_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     class Config:
         from_attributes = True
+
+
+class SubAgent(SubAgentBase):
+    """Sub-agent model with full config version (including skill body/files).
+
+    Metadata (name, owner, type) lives on sub_agents table.
+    Configuration data (description, model, config, status) lives on sub_agent_config_versions.
+    The config_version field holds the joined version data (default or specific version).
+    """
+
+    config_version: SubAgentConfigVersion | None = None  # Joined version data
 
 
 ModelName = Literal[
@@ -384,8 +423,53 @@ class SubAgentGroupPermissionResponse(BaseModel):
     permissions: list[Literal["read", "write"]]
 
 
+class SubAgentConfigVersionSummary(SubAgentConfigVersionBase):
+    """Lightweight config version for list responses (skills without body/files)."""
+
+    skills: list[SkillSummary] = Field(default_factory=list)
+
+    @classmethod
+    def from_full(cls, cv: SubAgentConfigVersion) -> "SubAgentConfigVersionSummary":
+        """Convert a full config version to a summary (strips skill body/files)."""
+        data = cv.model_dump(exclude={"skills"})
+        data["skills"] = [
+            SkillSummary(
+                name=s.name,
+                description=s.description,
+                source=s.source,
+                source_hash=s.source_hash,
+                update_available=s.update_available,
+                latest_hash=s.latest_hash,
+                sandbox_required=s.sandbox_required,
+            )
+            for s in cv.skills
+        ]
+        return cls(**data)
+
+
+class SubAgentListItem(SubAgentBase):
+    """Lightweight sub-agent for list responses (skills without body/files)."""
+
+    config_version: SubAgentConfigVersionSummary | None = None
+
+    @classmethod
+    def from_sub_agent(cls, sa: "SubAgent") -> "SubAgentListItem":
+        """Convert a full SubAgent to a list item (strips skill body/files)."""
+        data = sa.model_dump(exclude={"config_version"})
+        if sa.config_version:
+            data["config_version"] = SubAgentConfigVersionSummary.from_full(sa.config_version)
+        return cls(**data)
+
+
 class SubAgentListResponse(BaseModel):
     """Response model for listing sub-agents."""
+
+    items: list[SubAgentListItem]
+    total: int
+
+
+class SubAgentListFullResponse(BaseModel):
+    """Response model for listing sub-agents with full details."""
 
     items: list[SubAgent]
     total: int

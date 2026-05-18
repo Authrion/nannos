@@ -443,7 +443,7 @@ class PlaybookService:
         skill_name: str,
         scope: str,
         content: str,
-        files: list[dict[str, str]] | None = None,
+        files: list[dict[str, str | None]] | None = None,
         group_id: str | None = None,
         replace_files: bool = False,
     ) -> None:
@@ -455,7 +455,7 @@ class PlaybookService:
             skill_name: Skill identifier.
             scope: 'personal' or 'group'.
             content: SKILL.md content.
-            files: Optional list of dicts with 'path' and 'content' keys.
+            files: Optional list of dicts with 'path', 'content', and optional 'encoding' keys.
             group_id: Group ID (required for group scope).
             replace_files: If True and files is provided, delete all existing
                            non-SKILL.md files first (for bulk replacement).
@@ -465,7 +465,7 @@ class PlaybookService:
         if not self._db_session_factory:
             raise RuntimeError("Playbook service not configured")
 
-        if files and len(files) > MAX_SKILL_FILES:
+        if files and len(files) > MAX_SKILL_FILES and not replace_files:
             raise ValueError(f"Too many files ({len(files)}). Maximum is {MAX_SKILL_FILES} files per skill.")
 
         # Validate file sizes
@@ -514,7 +514,11 @@ class PlaybookService:
                             ON CONFLICT (prefix, key)
                             DO UPDATE SET value = :value, updated_at = NOW()
                         """),
-                        {"prefix": prefix, "key": file_key, "value": _to_jsonb(f["content"])},
+                        {
+                            "prefix": prefix,
+                            "key": file_key,
+                            "value": _to_jsonb(f["content"], encoding=f.get("encoding")),
+                        },
                     )
 
             await db.commit()
@@ -567,8 +571,11 @@ class PlaybookService:
         return title, description
 
 
-def _to_jsonb(content: str) -> str:
+def _to_jsonb(content: str, encoding: str | None = None) -> str:
     """Serialize content to JSON string for PostgreSQL JSONB column."""
     import json
 
-    return json.dumps({"content": content})
+    data: dict[str, str] = {"content": content}
+    if encoding:
+        data["encoding"] = encoding
+    return json.dumps(data)

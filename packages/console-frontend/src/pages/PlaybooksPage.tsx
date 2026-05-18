@@ -2,7 +2,6 @@ import { useState, useCallback } from 'react';
 import { useSearchParams } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  BookOpen,
   Save,
   Loader2,
   Users,
@@ -131,7 +130,7 @@ export function PlaybooksPage() {
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Playbooks</h1>
         <p className="text-sm text-muted-foreground">
-          Configure agent behavior with AGENTS.md playbooks
+          Personalize agent behavior with AGENTS.md playbooks. This allows you to set specific instructions and preferences for each agent, either just for yourself or for your entire team, without needing to modify the agent's core configuration.
         </p>
       </div>
 

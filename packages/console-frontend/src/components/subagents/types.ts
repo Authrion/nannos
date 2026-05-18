@@ -11,8 +11,8 @@ export type {
   SubAgentPermissionsUpdate,
   SubAgentListResponse,
   FoundryScope,
-  SkillDefinition,
-  SkillFile,
+  SkillDefinitionInput as SkillDefinition,
+  ConsoleBackendModelsSubAgentSkillFile as SkillFile,
 } from '@/api/generated/types.gen';
 
 // Local type aliases for backward compatibility
@@ -25,7 +25,7 @@ export interface LocalAgentConfiguration {
   mcp_tools?: string[];
   enable_thinking?: boolean;
   thinking_level?: string | null;
-  skills?: Array<{ name: string; description: string; body: string; files?: Array<{ path: string; content: string }> }>;
+  skills?: Array<{ name: string; description: string; body: string; files?: Array<{ path: string; content: string }>; source?: string | null; source_hash?: string | null }>;
   sandbox_enabled?: boolean;
 }
 
@@ -64,7 +64,7 @@ export interface SubAgentFormData {
   is_public?: boolean;  // If true, accessible to all users without group permissions
   configuration: SubAgentConfiguration;
   mcp_tools?: string[];  // MCP tool names for local agents
-  skills?: Array<{ name: string; description: string; body: string; files?: Array<{ path: string; content: string }> }>;
+  skills?: Array<{ name: string; description: string; body: string; files?: Array<{ path: string; content: string }>; source?: string | null; source_hash?: string | null; sandbox_required?: boolean }>;
   sandbox_enabled?: boolean;
 }
 

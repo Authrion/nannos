@@ -352,7 +352,7 @@ function setupServerTimeouts(server: Server, config: Config) {
                 if (actionMethod === 'hitl_approve') {
                   decisions = { decisions: [{ type: 'approve' }] };
                 } else {
-                  decisions = { decisions: [{ type: 'reject', message: 'User declined' }] };
+                  decisions = { decisions: [{ type: 'reject', message: 'The user explicitly rejected this tool call via the human-in-the-loop approval. The tool was NOT executed. Do not retry or attempt workarounds unless the user explicitly asks.' }] };
                 }
 
                 // Send as a synthetic message via handleIncomingMessage (no visible chat message)

@@ -550,6 +550,20 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                     logger.info(f"Resuming from HITL interrupt for tools: {tool_names}")
 
                     resume_value = self._extract_hitl_decisions(context)
+
+                    # The HITL middleware expects exactly one decision per interrupted
+                    # tool call.  Models that support parallel tool calling (e.g. Gemini)
+                    # can produce N tool calls in a single AIMessage, resulting in N
+                    # action_requests.  The UI currently sends a single blanket decision
+                    # (approve / reject).  Replicate that decision so the count matches,
+                    # otherwise the middleware raises ValueError on mismatch.
+                    # see https://docs.langchain.com/oss/python/deepagents/human-in-the-loop#multiple-tool-calls
+                    decisions = resume_value.get("decisions", [])
+                    expected_count = len(action_requests)
+                    if len(decisions) == 1 and expected_count > 1:
+                        logger.info(f"Replicating single HITL decision to match {expected_count} action_requests")
+                        resume_value = {"decisions": decisions * expected_count}
+
                     logger.info(f"HITL resume_value: {resume_value}")
                 else:
                     # Other interrupt types (auth, etc.)

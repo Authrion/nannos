@@ -105,6 +105,9 @@ function formatVersionForDiff(version: SubAgentConfigVersion | null): string {
       if (skill.description) {
         lines.push(`description: ${skill.description}`);
       }
+      if ((skill as any).source) {
+        lines.push(`source: ${(skill as any).source}`);
+      }
       if (skill.body) {
         lines.push('');
         lines.push(skill.body);
@@ -112,15 +115,16 @@ function formatVersionForDiff(version: SubAgentConfigVersion | null): string {
       lines.push('');
 
       if (skill.files && skill.files.length > 0) {
+        // Show file manifest with sizes instead of full contents to keep diffs fast
+        lines.push(`diff --config a/${skillPath}/files b/${skillPath}/files`);
+        lines.push(`--- a/${skillPath}/files`);
+        lines.push(`+++ b/${skillPath}/files`);
+        lines.push(`# ${skill.files.length} file(s)`);
         skill.files.forEach(f => {
-          lines.push(`diff --config a/${skillPath}/${f.path} b/${skillPath}/${f.path}`);
-          lines.push(`--- a/${skillPath}/${f.path}`);
-          lines.push(`+++ b/${skillPath}/${f.path}`);
-          if (f.content) {
-            lines.push(f.content);
-          }
-          lines.push('');
+          const sizeKb = f.content ? (f.content.length / 1024).toFixed(1) : '0.0';
+          lines.push(`  ${f.path} (${sizeKb} KB)`);
         });
+        lines.push('');
       }
     });
   }

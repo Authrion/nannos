@@ -29,9 +29,9 @@ export function InterruptConfirmCard() {
   const toolLabel = TOOL_LABELS[pendingInterrupt.toolName] || pendingInterrupt.toolName;
 
   // Separate content fields from metadata fields
-  const contentValue = CONTENT_KEYS.values().toArray()
-    .map((k) => args[k] as string | undefined)
-    .find((v) => v);
+  const contentValue = [...CONTENT_KEYS.values()]
+    .map((k: string) => args[k] as string | undefined)
+    .find((v: string | undefined) => v);
 
   const metaEntries = Object.entries(args).filter(
     ([k]) => !CONTENT_KEYS.has(k) && !HIDDEN_KEYS.has(k)
@@ -50,7 +50,7 @@ export function InterruptConfirmCard() {
   };
 
   const handleReject = () => {
-    sendSilentMessage('', [{ decisions: [{ type: 'reject', message: 'User declined' }] }]);
+    sendSilentMessage('', [{ decisions: [{ type: 'reject', message: 'The user explicitly rejected this tool call via the human-in-the-loop approval. The tool was NOT executed. Do not retry or attempt workarounds unless the user explicitly asks.' }] }]);
     dismissInterrupt();
     setEditedContent('');
   };
@@ -62,7 +62,7 @@ export function InterruptConfirmCard() {
     }
     // Merge edited content into the original args.
     // Use the first content key found, or fall back to 'content'.
-    const contentKey = CONTENT_KEYS.values().toArray().find((k) => k in args) ?? 'content';
+    const contentKey = [...CONTENT_KEYS.values()].find((k: string) => k in args) ?? 'content';
     const editedArgs = { ...args, [contentKey]: editedContent };
     sendSilentMessage('', [{
       decisions: [{

@@ -115,6 +115,17 @@ class PlaybookReaderService:
             logger.debug(f"Could not read {file_path} from namespace {namespace}: {e}")
             return None
 
+    async def _read_raw_value(self, namespace: tuple[str, ...], file_path: str) -> dict | None:
+        """Read the raw JSONB value dict from the store (content + encoding)."""
+        try:
+            items = await self._store.aget(namespace=namespace, key=file_path)
+            if items and hasattr(items, "value") and items.value:
+                return items.value
+            return None
+        except Exception as e:
+            logger.debug(f"Could not read {file_path} from namespace {namespace}: {e}")
+            return None
+
     async def _list_files_in_store(self, namespace: tuple[str, ...], prefix: str) -> list[str]:
         """List file keys in a store namespace matching a prefix.
 
@@ -384,9 +395,15 @@ class PlaybookReaderService:
                 rel_path = key.removeprefix(folder_prefix)
                 if rel_path == "SKILL.md" or not rel_path:
                     continue
-                content = await self._read_file_from_store(namespace=namespace, file_path=key)
-                if content:
-                    files.append(SkillFile(path=rel_path, content=content))
+                value = await self._read_raw_value(namespace=namespace, file_path=key)
+                if value and value.get("content"):
+                    files.append(
+                        SkillFile(
+                            path=rel_path,
+                            content=value["content"],
+                            encoding=value.get("encoding"),
+                        )
+                    )
             return files if files else []
 
         if scope in ("personal", "auto"):

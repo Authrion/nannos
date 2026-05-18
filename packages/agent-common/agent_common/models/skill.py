@@ -11,6 +11,7 @@ class SkillFile:
 
     path: str
     content: str
+    encoding: str | None = None  # None for UTF-8 text, "base64" for binary
 
 
 @dataclass

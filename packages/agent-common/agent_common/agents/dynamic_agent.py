@@ -417,17 +417,15 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         if permission == "owner" or permission == "write":
             scope_guidance = (
                 "You have **write** access to this agent's configuration.\n"
-                "- Use scope='default' to save skills that all users of this agent will benefit from.\n"
-                "  Default skill changes create a new config version (may need approval).\n"
                 "- Use scope='personal' for quick experiments or user-specific preferences.\n"
-                "- Use scope='group' to share improvements with your team."
+                "- Use scope='group' to share improvements with your team.\n"
+                "- Skills are created in the registry and activated on your agent automatically."
             )
         elif permission == "read":
             scope_guidance = (
                 "You have **read-only** access to this agent's default skills.\n"
                 "- Use scope='personal' to save skills/playbooks for the current user only.\n"
-                "- Use scope='group' to share improvements with the user's team.\n"
-                "- Do NOT attempt scope='default' — it will be rejected."
+                "- Use scope='group' to share improvements with the user's team."
             )
         else:
             scope_guidance = (
@@ -442,11 +440,16 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             "**When to create a skill** (console_create_skill):\n"
             "- You discovered a multi-step procedure that worked well and could be reused\n"
             "- The user taught you a domain-specific workflow or pattern\n"
-            "- You built a solution that required non-obvious steps worth documenting\n\n"
+            "- You built a solution that required non-obvious steps worth documenting\n"
+            "- Note: This creates the skill in the registry AND activates it on your agent\n\n"
             "**When to update a skill** (console_update_skill):\n"
             "- An existing skill's instructions were incomplete or incorrect\n"
             "- You found a better approach than what a skill currently describes\n"
-            "- The user corrected your behavior on something a skill covers\n\n"
+            "- The user corrected your behavior on something a skill covers\n"
+            "- Note: This updates the registry and self-updates your activation instantly\n\n"
+            "**When to activate an existing skill** (console_activate_skill):\n"
+            "- You found a skill in the registry (via console_search_skills) that should be active\n"
+            "- A previously deactivated skill needs to be re-enabled\n\n"
             "**When to update the playbook** (console_update_playbook):\n"
             "- The user expressed a preference about how you should behave (tone, format, approach)\n"
             "- You learned a constraint or context that affects future interactions\n"
@@ -619,9 +622,12 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             "console_create_skill",
             "console_update_skill",
             "console_remove_skill",
+            "console_activate_skill",
             "console_update_playbook",
             "console_write_skill_file",
             "console_delete_skill_file",
+            "console_search_skills",
+            "console_import_skill",
         }
     )
 
@@ -894,7 +900,11 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             },
             "console_remove_skill": {
                 "allowed_decisions": ["approve", "edit", "reject"],
-                "description": "Agent wants to remove a skill.",
+                "description": "Agent wants to deactivate a skill.",
+            },
+            "console_activate_skill": {
+                "allowed_decisions": ["approve", "reject"],
+                "description": "Agent wants to activate a skill from the registry.",
             },
             "console_update_playbook": {
                 "allowed_decisions": ["approve", "edit", "reject"],

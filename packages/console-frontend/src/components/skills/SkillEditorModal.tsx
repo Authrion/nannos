@@ -7,9 +7,8 @@ import {
   Save,
   Pencil,
   FolderOpen,
-  X,
 } from 'lucide-react';
-import type { SkillDefinition, SkillFile } from '@/api/generated/types.gen';
+import type { SkillDefinitionInput as SkillDefinition } from '@/api/generated/types.gen';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -127,7 +126,7 @@ export function SkillEditorModal({
       if (activeSkillIdx === null) return;
       setLocalSkills((prev) => {
         const updated = [...prev];
-        const files = (updated[activeSkillIdx].files ?? []).filter((f) => f.path !== filePath);
+        const files = (updated[activeSkillIdx].files ?? []).filter((f: { path: string }) => f.path !== filePath);
         updated[activeSkillIdx] = {
           ...updated[activeSkillIdx],
           files: files.length > 0 ? files : undefined,
@@ -147,8 +146,8 @@ export function SkillEditorModal({
   // Get content for active file of active skill
   const getActiveContent = (): string => {
     if (!activeSkill) return '';
-    if (activeFile === 'SKILL.md') return activeSkill.body;
-    return activeSkill.files?.find((f) => f.path === activeFile)?.content ?? '';
+    if (activeFile === 'SKILL.md') return activeSkill.body ?? '';
+    return activeSkill.files?.find((f: { path: string; content: string }) => f.path === activeFile)?.content ?? '';
   };
 
   const setActiveContent = (content: string) => {
@@ -159,7 +158,7 @@ export function SkillEditorModal({
     }
     setLocalSkills((prev) => {
       const updated = [...prev];
-      const files = (updated[activeSkillIdx].files ?? []).map((f) =>
+      const files = (updated[activeSkillIdx].files ?? []).map((f: { path: string; content: string }) =>
         f.path === activeFile ? { ...f, content } : f,
       );
       updated[activeSkillIdx] = { ...updated[activeSkillIdx], files };
@@ -168,7 +167,7 @@ export function SkillEditorModal({
   };
 
   const activeFiles: string[] = activeSkill
-    ? ['SKILL.md', ...(activeSkill.files ?? []).map((f) => f.path)]
+    ? ['SKILL.md', ...(activeSkill.files ?? []).map((f: { path: string }) => f.path)]
     : [];
 
   return (
@@ -321,7 +320,7 @@ export function SkillEditorModal({
                               if (renameFileValue.trim() && renameFileValue !== fp && activeSkillIdx !== null) {
                                 setLocalSkills((prev) => {
                                   const updated = [...prev];
-                                  const files = (updated[activeSkillIdx].files ?? []).map((f) =>
+                                  const files = (updated[activeSkillIdx].files ?? []).map((f: { path: string; content: string }) =>
                                     f.path === fp ? { ...f, path: renameFileValue.trim() } : f,
                                   );
                                   updated[activeSkillIdx] = { ...updated[activeSkillIdx], files };

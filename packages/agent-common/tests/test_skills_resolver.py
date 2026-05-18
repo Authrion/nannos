@@ -61,6 +61,7 @@ async def test_personal_overrides_standard():
             ]
         )
         reader.read_skill = AsyncMock(return_value="Custom steps for triage.")
+        reader.read_skill_files = AsyncMock(return_value=[])
 
         result = await resolve_skills_for_agent(
             store=AsyncMock(),
@@ -90,6 +91,7 @@ async def test_group_overrides_standard():
             ]
         )
         reader.read_skill = AsyncMock(return_value="Team-specific weekly report format.")
+        reader.read_skill_files = AsyncMock(return_value=[])
 
         result = await resolve_skills_for_agent(
             store=AsyncMock(),
@@ -117,6 +119,7 @@ async def test_personal_skill_no_override():
             ]
         )
         reader.read_skill = AsyncMock(return_value="Do custom things.")
+        reader.read_skill_files = AsyncMock(return_value=[])
 
         result = await resolve_skills_for_agent(
             store=AsyncMock(),
@@ -146,6 +149,7 @@ async def test_empty_standard_skills():
             ]
         )
         reader.read_skill = AsyncMock(return_value="Body text.")
+        reader.read_skill_files = AsyncMock(return_value=[])
 
         result = await resolve_skills_for_agent(
             store=AsyncMock(),

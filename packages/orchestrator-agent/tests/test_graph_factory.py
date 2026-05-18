@@ -118,7 +118,7 @@ class TestMiddlewareStack:
 
         # Verify correct order (DynamicTool first, static content before cache point,
         # steering after cache, user prefs after steering, playbook after prefs)
-        assert len(stack) == 13
+        assert len(stack) == 14
         assert isinstance(stack[0], DynamicToolDispatchMiddleware)
         assert isinstance(stack[1], StoragePathsInstructionMiddleware)
         assert isinstance(stack[2], BedrockPromptCachingMiddleware)
@@ -127,14 +127,16 @@ class TestMiddlewareStack:
         assert isinstance(stack[4], UserPreferencesMiddleware)
         # stack[5] = PlaybookInjectionMiddleware
         assert stack[5].__class__.__name__ == "PlaybookInjectionMiddleware"
-        assert isinstance(stack[6], RepeatedToolCallMiddleware)
-        assert isinstance(stack[7], AuthErrorDetectionMiddleware)
-        assert stack[8].__class__.__name__ == "ErrorClassificationMiddleware"
-        # stack[9] = HumanInTheLoopMiddleware
-        assert stack[9].__class__.__name__ == "HumanInTheLoopMiddleware"
-        assert isinstance(stack[10], ToolRetryMiddleware)
-        assert isinstance(stack[11], A2ATaskTrackingMiddleware)
-        assert isinstance(stack[12], TodoStatusMiddleware)
+        # stack[6] = ToolStatusMiddleware (emits status for tool calls)
+        assert stack[6].__class__.__name__ == "ToolStatusMiddleware"
+        assert isinstance(stack[7], RepeatedToolCallMiddleware)
+        assert isinstance(stack[8], AuthErrorDetectionMiddleware)
+        assert stack[9].__class__.__name__ == "ErrorClassificationMiddleware"
+        # stack[10] = HumanInTheLoopMiddleware
+        assert stack[10].__class__.__name__ == "HumanInTheLoopMiddleware"
+        assert isinstance(stack[11], ToolRetryMiddleware)
+        assert isinstance(stack[12], A2ATaskTrackingMiddleware)
+        assert isinstance(stack[13], TodoStatusMiddleware)
 
     @patch("app.core.graph_factory._has_aws_credentials", return_value=True)
     @patch("langgraph.store.postgres.aio.AsyncPostgresStore")

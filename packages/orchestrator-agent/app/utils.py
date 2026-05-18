@@ -257,6 +257,9 @@ def build_runtime_context(
         "console_update_playbook",
         "console_write_skill_file",
         "console_delete_skill_file",
+        "console_search_skills",
+        "console_import_skill",
+        "console_activate_skill",
     }
     orchestrator_auto_tools = {
         name for name in tool_registry.keys() if name.startswith("scheduler_") or name in allowed_orchestrator_tools
@@ -278,6 +281,8 @@ def build_runtime_context(
         "console_update_playbook",
         "console_write_skill_file",
         "console_delete_skill_file",
+        "console_import_skill",
+        "console_activate_skill",
     }
     for tool_name in _SKILL_TOOLS_NEEDING_AGENT_NAME:
         if tool_name in tool_registry:

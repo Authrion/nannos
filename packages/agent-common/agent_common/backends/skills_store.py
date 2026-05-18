@@ -32,10 +32,11 @@ _READ_ONLY_MSG = (
 class SkillsStoreBackend(BackendProtocol):
     """Read-only backend serving merged skills at /skills/{name}/...
 
-    Resolution order (applied upstream by skills_resolver):
-      personal > group > standard.
+    Skills are pre-resolved by the upstream skills_resolver in order of precedence
+    (personal > group > standard) and passed as an in-memory dictionary. This backend
+    operates entirely against that dictionary.
 
-    Built once per agent invocation with pre-resolved skills.
+    Instantiated once per agent invocation.
     """
 
     def __init__(self, merged_skills: dict[str, ResolvedSkill]):
@@ -58,17 +59,19 @@ class SkillsStoreBackend(BackendProtocol):
                 description=skill.description,
                 body=skill.body,
             )
+            encoding = "utf-8"
         else:
             # Look for bundled file
             matched = next((f for f in skill.files if f.path == rel), None)
             if not matched:
                 return ReadResult(error=f"File not found: {file_path}")
             content = matched.content
+            encoding = matched.encoding or "utf-8"
 
         # Apply offset/limit (line-based)
         lines = content.splitlines(keepends=True)
         sliced = lines[offset : offset + limit]
-        return ReadResult(file_data=create_file_data("".join(sliced)))
+        return ReadResult(file_data=create_file_data("".join(sliced), encoding=encoding))
 
     async def als(self, path: str) -> LsResult:
         normalized = path.rstrip("/") + "/"
@@ -81,40 +84,50 @@ class SkillsStoreBackend(BackendProtocol):
         name, _ = self._parse_path(path)
         if name and name in self._skills:
             skill = self._skills[name]
-            entries: list[FileInfo] = [FileInfo(path="/SKILL.md")]
+            entries: list[FileInfo] = [FileInfo(path=f"/{name}/SKILL.md")]
             for f in skill.files:
-                entries.append(FileInfo(path=f"/{f.path}"))
+                entries.append(FileInfo(path=f"/{name}/{f.path}"))
             return LsResult(entries=entries)
 
         return LsResult(error=f"Directory not found: {path}")
 
     async def agrep(self, pattern: str, path: str | None = None, glob: str | None = None) -> GrepResult:
-        regex = re.compile(pattern, re.IGNORECASE)
+        pattern_lower = pattern.lower()
         matches: list[GrepMatch] = []
 
+        # Compile glob filter if provided
+        glob_re = self._glob_to_regex(glob) if glob else None
+
         for name, skill in self._skills.items():
-            content = build_skill_content(name=skill.name, description=skill.description, body=skill.body)
-            for i, line in enumerate(content.splitlines()):
-                if regex.search(line):
-                    matches.append(
-                        GrepMatch(
-                            path=f"/skills/{name}/SKILL.md",
-                            line=i + 1,
-                            text=line,
-                        )
-                    )
+            # SKILL.md
+            skill_path = f"/{name}/SKILL.md"
+            if (not glob_re or glob_re.search(skill_path)) and (not path or skill_path.startswith(path)):
+                content = build_skill_content(name=skill.name, description=skill.description, body=skill.body)
+                for i, line in enumerate(content.splitlines()):
+                    if pattern_lower in line.lower():
+                        matches.append(GrepMatch(path=skill_path, line=i + 1, text=line))
+
+            # Bundled files
+            for f in skill.files:
+                fpath = f"/{name}/{f.path}"
+                if (glob_re and not glob_re.search(fpath)) or (path and not fpath.startswith(path)):
+                    continue
+                for i, line in enumerate(f.content.splitlines()):
+                    if pattern_lower in line.lower():
+                        matches.append(GrepMatch(path=fpath, line=i + 1, text=line))
 
         return GrepResult(matches=matches)
 
     async def aglob(self, pattern: str, path: str = "/") -> GlobResult:
         entries: list[FileInfo] = []
+        glob_re = self._glob_to_regex(pattern)
         for name, skill in self._skills.items():
-            skill_path = f"/skills/{name}/SKILL.md"
-            if re.search(pattern.replace("*", ".*").replace("?", "."), skill_path):
+            skill_path = f"/{name}/SKILL.md"
+            if skill_path.startswith(path) and glob_re.search(skill_path):
                 entries.append(FileInfo(path=skill_path))
             for f in skill.files:
-                fpath = f"/skills/{name}/{f.path}"
-                if re.search(pattern.replace("*", ".*").replace("?", "."), fpath):
+                fpath = f"/{name}/{f.path}"
+                if fpath.startswith(path) and glob_re.search(fpath):
                     entries.append(FileInfo(path=fpath))
         return GlobResult(matches=entries)
 
@@ -160,6 +173,42 @@ class SkillsStoreBackend(BackendProtocol):
             for f in skill.files:
                 paths.append(f"/skills/{name}/{f.path}")
         return paths
+
+    @staticmethod
+    def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+        """Convert a glob pattern to a compiled regex.
+
+        Supports: * (single segment), ** (cross-directory), ? (single char), [abc] (set).
+        All other characters are regex-escaped.
+        """
+        i, n = 0, len(pattern)
+        parts: list[str] = []
+        while i < n:
+            c = pattern[i]
+            if c == "*":
+                if i + 1 < n and pattern[i + 1] == "*":
+                    parts.append(".*")
+                    i += 2
+                    # Skip trailing / after ** (e.g., **/ means "any dirs")
+                    if i < n and pattern[i] == "/":
+                        i += 1
+                else:
+                    parts.append("[^/]*")
+                    i += 1
+            elif c == "?":
+                parts.append("[^/]")
+                i += 1
+            elif c == "[":
+                # Pass through character class verbatim until ]
+                j = i + 1
+                while j < n and pattern[j] != "]":
+                    j += 1
+                parts.append(pattern[i : j + 1])
+                i = j + 1
+            else:
+                parts.append(re.escape(c))
+                i += 1
+        return re.compile("".join(parts))
 
     @staticmethod
     def _parse_path(path: str) -> tuple[str | None, str]:

@@ -11,10 +11,11 @@ import {
   Database,
   Key,
   Users,
+  ShieldAlert,
   Plus,
   Trash2,
-  ShieldAlert,
   Pencil,
+  Loader2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -28,13 +29,15 @@ import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { useAvailableModels, modelSupportsThinking, getAvailableThinkingLevels } from '@/config/models';
 import type { SubAgent, SubAgentType, SubAgentFormData, SkillDefinition } from './types';
-import type { OrchestratorThinkingLevel } from '@/api/generated/types.gen';
+import type { OrchestratorThinkingLevel, SkillSearchResult } from '@/api/generated/types.gen';
 import { SkillEditorModal } from '@/components/skills/SkillEditorModal';
+import { SkillRegistryBrowseDialog } from '@/components/skills/SkillRegistryBrowseDialog';
 import { MCPToolToggleList } from '@/components/settings/MCPToolToggleList';
 import { ExtendedThinkingConfig } from '@/components/settings/ExtendedThinkingConfig';
 import { PricingConfigurationSection } from '@/components/subagents/PricingConfigurationSection';
 import { useQuery } from '@tanstack/react-query';
 import { listSecretsApiV1SecretsGetOptions } from '@/api/generated/@tanstack/react-query.gen';
+import { client } from '@/api/generated/client.gen';
 
 interface SubAgentFormProps {
   subAgent?: SubAgent;
@@ -92,16 +95,39 @@ export function SubAgentForm({ subAgent, onSubmit, onCancel, isSubmitting = fals
   const [isPricingOpen, setIsPricingOpen] = useState(false);
 
   // Skills configuration (local agents only)
-  const [skills, setSkills] = useState<Array<{ name: string; description: string; body: string; files?: Array<{ path: string; content: string }> }>>(
+  const [skills, setSkills] = useState<Array<{ name: string; description: string; body: string; files?: Array<{ path: string; content: string }>; source?: string | null; source_hash?: string | null }>>(
     (config?.skills as SkillDefinition[] | undefined)?.map((s) => ({
       name: s.name,
       description: s.description,
-      body: s.body,
-      files: s.files?.map((f) => ({ path: f.path, content: f.content })),
+      body: s.body ?? '',
+      files: s.files?.map((f: { path: string; content: string }) => ({ path: f.path, content: f.content })),
+      source: (s as any).source ?? null,
+      source_hash: (s as any).source_hash ?? null,
     })) ?? []
   );
   const [isSkillModalOpen, setIsSkillModalOpen] = useState(false);
+  const [isSkillImportOpen, setIsSkillImportOpen] = useState(false);
+  const [importingSkillId, setImportingSkillId] = useState<string | null>(null);
   const [sandboxEnabled, setSandboxEnabled] = useState(config?.sandbox_enabled ?? false);
+  const [sandboxAutoEnabled, setSandboxAutoEnabled] = useState(false);
+
+  // Auto-enable sandbox when any skill has executable files
+  const SANDBOX_EXTENSIONS = new Set(['.py', '.sh', '.bash', '.zsh', '.js', '.ts', '.rb', '.pl', '.ps1', '.bat', '.cmd', '.mjs', '.cjs']);
+  useEffect(() => {
+    const hasExecutableFiles = skills.some((skill) =>
+      skill.files?.some((f) => {
+        const ext = f.path.includes('.') ? '.' + f.path.split('.').pop()!.toLowerCase() : '';
+        return SANDBOX_EXTENSIONS.has(ext);
+      })
+    );
+    if (hasExecutableFiles && !sandboxEnabled) {
+      setSandboxEnabled(true);
+      setSandboxAutoEnabled(true);
+    } else if (!hasExecutableFiles && sandboxAutoEnabled) {
+      setSandboxEnabled(false);
+      setSandboxAutoEnabled(false);
+    }
+  }, [skills]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Query for secrets
   const { data: secretsData, isLoading: isLoadingSecrets } = useQuery({
@@ -114,6 +140,44 @@ export function SubAgentForm({ subAgent, onSubmit, onCancel, isSubmitting = fals
 
   // Find the currently selected secret for display purposes
   const selectedSecret = availableSecrets.find((secret) => secret.id === foundryClientSecretRef);
+
+  const handleImportSkillFromRegistry = async (skill: SkillSearchResult) => {
+    if (!skill.id) return;
+    setImportingSkillId(skill.id);
+    try {
+      const { data, error } = await client.get({
+        url: '/api/v1/skills/registry/detail/{skill_id}',
+        path: { skill_id: skill.id },
+      });
+      if (error || !data) {
+        toast.error('Failed to fetch skill details');
+        return;
+      }
+      const detail = data as { name?: string; description?: string; content_hash?: string; files?: Array<{ path: string; contents: string }> };
+      const skillMdFile = detail.files?.find((f) => f.path === 'SKILL.md');
+      const body = skillMdFile?.contents ?? '';
+      const otherFiles = (detail.files ?? [])
+        .filter((f) => f.path !== 'SKILL.md')
+        .map((f) => ({ path: f.path, content: f.contents }));
+      const newSkill = {
+        name: detail.name ?? skill.name,
+        description: detail.description ?? '',
+        body,
+        files: otherFiles.length > 0 ? otherFiles : undefined,
+        source: skill.id,
+        source_hash: detail.content_hash ?? null,
+      };
+      if (skills.some((s) => s.name === newSkill.name)) {
+        toast.error(`Skill "${newSkill.name}" is already added`);
+        return;
+      }
+      setSkills((prev) => [...prev, newSkill]);
+      toast.success(`Imported "${newSkill.name}"`);
+      setIsSkillImportOpen(false);
+    } finally {
+      setImportingSkillId(null);
+    }
+  };
 
   // Automatically disable thinking when model doesn't support it
   useEffect(() => {
@@ -790,7 +854,7 @@ export function SubAgentForm({ subAgent, onSubmit, onCancel, isSubmitting = fals
                 <div className="flex items-center justify-between">
                   <div className="text-left">
                     <CardTitle className="flex items-center gap-2">
-                      Standard Skills (Optional)
+                      Skills (Optional)
                       {skills.length > 0 && (
                         <span className="text-sm font-normal text-muted-foreground">
                           ({skills.length} defined)
@@ -799,20 +863,45 @@ export function SubAgentForm({ subAgent, onSubmit, onCancel, isSubmitting = fals
                     </CardTitle>
                     <CardDescription>
                       {skills.length === 0
-                        ? 'No skills defined — click Edit to add workflow skills'
+                        ? 'No skills defined — import from registry or create custom skills'
                         : 'Reusable workflow skills for this agent'}
                     </CardDescription>
                   </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setIsSkillModalOpen(true)}
-                    disabled={isSubmitting}
-                  >
-                    <Pencil className="h-4 w-4 mr-1" />
-                    Edit Skills
-                  </Button>
+                  <div className="flex gap-1.5">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setIsSkillImportOpen(true)}
+                      disabled={isSubmitting}
+                    >
+                      <Plus className="h-4 w-4 mr-1" />
+                      Import
+                    </Button>
+                    {skills.some((s) => !(s as any).source) ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setIsSkillModalOpen(true)}
+                        disabled={isSubmitting}
+                      >
+                        <Pencil className="h-4 w-4 mr-1" />
+                        Edit Custom
+                      </Button>
+                    ) : (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setIsSkillModalOpen(true)}
+                        disabled={isSubmitting}
+                      >
+                        <Plus className="h-4 w-4 mr-1" />
+                        Create
+                      </Button>
+                    )}
+                  </div>
                 </div>
               </CardHeader>
               {skills.length > 0 && (
@@ -821,36 +910,56 @@ export function SubAgentForm({ subAgent, onSubmit, onCancel, isSubmitting = fals
                     {skills.map((skill, idx) => (
                       <div
                         key={idx}
-                        className="flex items-center gap-2 py-1.5 px-2 rounded bg-muted/40 text-sm"
+                        className="flex items-center gap-2 py-1.5 px-2 rounded bg-muted/40 text-sm group/skill"
                       >
-                        <code className="font-mono text-xs font-medium">{skill.name || '(unnamed)'}</code>
+                        <code className="font-mono text-xs font-medium shrink-0">{skill.name || '(unnamed)'}</code>
+                        {(skill as any).source && (
+                          <span className="text-[10px] text-muted-foreground bg-muted px-1 rounded shrink-0">imported</span>
+                        )}
                         {(skill.files?.length ?? 0) > 0 && (
-                          <span className="text-[10px] text-muted-foreground">
+                          <span className="text-[10px] text-muted-foreground shrink-0">
                             {skill.files!.length} files
                           </span>
                         )}
                         {skill.description && (
-                          <span className="text-xs text-muted-foreground truncate">
-                            — {skill.description}
+                          <span className="text-xs text-muted-foreground truncate flex-1">
+                            — {skill.description.length > 50 ? skill.description.slice(0, 50) + '…' : skill.description}
                           </span>
                         )}
+                        <button
+                          type="button"
+                          className="opacity-0 group-hover/skill:opacity-100 text-destructive hover:text-destructive/80 transition-opacity ml-auto shrink-0"
+                          onClick={() => setSkills((prev) => prev.filter((_, i) => i !== idx))}
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
                       </div>
                     ))}
                   </div>
-                  <p className="text-xs text-muted-foreground mt-3">
-                    Standard skills are versioned with the agent config and available via the agent's virtual
-                    filesystem at <code className="bg-muted px-1 rounded">/skills/{'<name>'}/SKILL.md</code>.
-                  </p>
                 </CardContent>
               )}
             </Card>
           )}
 
+          {/* Skill import from registry dialog */}
+          <SkillRegistryBrowseDialog
+            open={isSkillImportOpen}
+            onOpenChange={setIsSkillImportOpen}
+            title="Add skill from registry"
+            description="Search for a skill to import into this agent's configuration."
+            actionLabel="Import"
+            onAction={(skill) => handleImportSkillFromRegistry(skill)}
+            actionPending={!!importingSkillId}
+          />
+
           <SkillEditorModal
             open={isSkillModalOpen}
             onOpenChange={setIsSkillModalOpen}
-            skills={skills}
-            onChange={setSkills}
+            skills={skills.filter((s) => !(s as any).source)}
+            onChange={(updated) => {
+              const importedSkills = skills.filter((s) => (s as any).source);
+              setSkills([...importedSkills, ...updated.map(s => ({ ...s, body: s.body ?? '' }))]);
+            }}
             disabled={isSubmitting}
           />
 
@@ -872,10 +981,18 @@ export function SubAgentForm({ subAgent, onSubmit, onCancel, isSubmitting = fals
                   <Switch
                     id="sandbox_enabled"
                     checked={sandboxEnabled}
-                    onCheckedChange={setSandboxEnabled}
+                    onCheckedChange={(checked) => {
+                      setSandboxEnabled(checked);
+                      if (!checked) setSandboxAutoEnabled(false);
+                    }}
                     disabled={isSubmitting}
                   />
                 </div>
+                {sandboxAutoEnabled && (
+                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-2">
+                    Auto-enabled because one or more skills contain executable files (.py, .sh, etc.)
+                  </p>
+                )}
               </CardContent>
             </Card>
           )}

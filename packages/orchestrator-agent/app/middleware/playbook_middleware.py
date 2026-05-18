@@ -190,12 +190,14 @@ class PlaybookInjectionMiddleware(AgentMiddleware[AgentState, GraphRuntimeContex
 
             # Resolve skills for both the system prompt index and the
             # filesystem backend (LazySkillsBackend reads from context var).
+            from ..core.default_skills import ORCHESTRATOR_DEFAULT_SKILLS
+
             resolved = await resolve_skills_for_agent(
                 store=self._store,
                 user_id=user_id,
                 agent_name=ORCHESTRATOR_PLAYBOOK_NAME,
                 group_ids=group_ids or [],
-                default_skills=[],
+                default_skills=ORCHESTRATOR_DEFAULT_SKILLS,
             )
             # Cache for awrap_tool_call to re-set the context var in tool node.
             self._skills_cache[user_id] = resolved

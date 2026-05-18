@@ -14,6 +14,7 @@ import {
   File,
   X,
   ChevronDown,
+  Download,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
@@ -25,7 +26,7 @@ import {
   listMyGroupsApiV1GroupsGetOptions,
 } from '@/api/generated/@tanstack/react-query.gen';
 import { getSkillApiV1PlaybooksAgentsAgentNameSkillsSkillNameGet, deleteSkillApiV1PlaybooksAgentsAgentNameSkillsScopeSkillNameDelete, createSkillApiV1PlaybooksAgentsAgentNameSkillsScopePost, listSkillFilesApiV1PlaybooksAgentsAgentNameSkillsSkillNameFilesGet, getSkillFileApiV1PlaybooksAgentsAgentNameSkillsSkillNameFilesFilePathGet, writeSkillFileApiV1PlaybooksAgentsAgentNameSkillsSkillNameFilesFilePathPut } from '@/api/generated/sdk.gen';
-import type { SkillSummary, SkillDefinition } from '@/api/generated/types.gen';
+import type { SkillSummary, SkillDefinitionInput as SkillDefinition } from '@/api/generated/types.gen';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
@@ -50,6 +51,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { SkillEditorPanel } from '@/components/skills/SkillEditorPanel';
+import { SkillImportPanel } from '@/components/skills/SkillImportPanel';
 
 export function SkillsPage() {
   const queryClient = useQueryClient();
@@ -68,6 +70,9 @@ export function SkillsPage() {
 
   // Active skill for the editor panel
   const [activeSkill, setActiveSkill] = useState<{ name: string; scope: string } | null>(null);
+
+  // Import panel state
+  const [showImport, setShowImport] = useState(false);
 
   // Create dialog state
   const [showCreateDialog, setShowCreateDialog] = useState(false);
@@ -353,16 +358,27 @@ export function SkillsPage() {
             <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
               Skills
             </span>
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-6 w-6 p-0"
-              onClick={() => setShowCreateDialog(true)}
-              title="New skill"
-              disabled={view === 'standard'}
-            >
-              <Plus className="h-3.5 w-3.5" />
-            </Button>
+            <div className="flex items-center gap-0.5">
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 w-6 p-0"
+                onClick={() => { setShowImport(true); setActiveSkill(null); }}
+                title="Import from registry"
+              >
+                <Download className="h-3.5 w-3.5" />
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 w-6 p-0"
+                onClick={() => setShowCreateDialog(true)}
+                title="New skill"
+                disabled={view === 'standard'}
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </Button>
+            </div>
           </div>
           <Select value={selectedAgent} onValueChange={handleAgentChange}>
             <SelectTrigger className="h-8 text-xs bg-background w-full">
@@ -531,7 +547,15 @@ export function SkillsPage() {
       </div>
 
       {/* Editor area */}
-      {activeSkill ? (
+      {showImport ? (
+        <SkillImportPanel
+          onClose={() => setShowImport(false)}
+          onImported={(skillName) => {
+            setShowImport(false);
+            setActiveSkill({ name: skillName, scope: 'default' });
+          }}
+        />
+      ) : activeSkill ? (
         <div className="flex-1 min-w-0 flex flex-col">
           {/* Editor tab bar */}
           <div className="flex items-center justify-between px-4 py-2 border-b bg-muted/30">

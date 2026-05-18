@@ -1,6 +1,8 @@
 """Tests for SkillsStoreBackend."""
 
 import pytest
+from deepagents.backends.composite import CompositeBackend
+from deepagents.backends.protocol import GlobResult, GrepResult, LsResult, ReadResult
 
 from agent_common.backends.skills_store import SkillsStoreBackend
 from agent_common.models.skill import ResolvedSkill, SkillFile
@@ -119,25 +121,26 @@ async def test_ls_root_bare(backend):
 
 @pytest.mark.asyncio
 async def test_ls_skill_directory(backend):
-    result = await backend.als("/skills/incident-triage/")
+    # CompositeBackend strips /skills/ before calling backend
+    result = await backend.als("/incident-triage/")
     assert result.error is None
     paths = [e["path"] for e in result.entries]
-    assert "/SKILL.md" in paths
-    assert "/scripts/check.py" in paths
-    assert "/references/runbook.md" in paths
+    assert "/incident-triage/SKILL.md" in paths
+    assert "/incident-triage/scripts/check.py" in paths
+    assert "/incident-triage/references/runbook.md" in paths
 
 
 @pytest.mark.asyncio
 async def test_ls_skill_no_files(backend):
-    result = await backend.als("/skills/weekly-report/")
+    result = await backend.als("/weekly-report/")
     assert result.error is None
     paths = [e["path"] for e in result.entries]
-    assert paths == ["/SKILL.md"]
+    assert paths == ["/weekly-report/SKILL.md"]
 
 
 @pytest.mark.asyncio
 async def test_ls_nonexistent(backend):
-    result = await backend.als("/skills/nonexistent/")
+    result = await backend.als("/nonexistent/")
     assert result.error is not None
 
 
@@ -157,7 +160,7 @@ async def test_grep_finds_match(backend):
     assert result.error is None
     assert len(result.matches) >= 1
     match = result.matches[0]
-    assert match["path"] == "/skills/incident-triage/SKILL.md"
+    assert match["path"] == "/incident-triage/SKILL.md"
     assert match["line"] > 0
     assert "Check alerts" in match["text"]
 
@@ -176,6 +179,30 @@ async def test_grep_no_match(backend):
     assert result.matches == []
 
 
+@pytest.mark.asyncio
+async def test_grep_searches_bundled_files(backend):
+    result = await backend.agrep("checking")
+    assert result.error is None
+    assert any(m["path"] == "/incident-triage/scripts/check.py" for m in result.matches)
+
+
+@pytest.mark.asyncio
+async def test_grep_with_glob_filter(backend):
+    result = await backend.agrep("checking", glob="*.py")
+    assert result.error is None
+    paths = [m["path"] for m in result.matches]
+    assert "/incident-triage/scripts/check.py" in paths
+    # Should NOT include SKILL.md matches
+    assert all(not p.endswith("SKILL.md") for p in paths)
+
+
+@pytest.mark.asyncio
+async def test_grep_with_path_filter(backend):
+    result = await backend.agrep("Check alerts", path="/weekly-report")
+    assert result.error is None
+    assert result.matches == []
+
+
 # ---- aglob tests ----
 
 
@@ -184,9 +211,9 @@ async def test_glob_all_skill_mds(backend):
     result = await backend.aglob("*.md")
     assert result.error is None
     paths = [e["path"] for e in result.matches]
-    assert "/skills/incident-triage/SKILL.md" in paths
-    assert "/skills/weekly-report/SKILL.md" in paths
-    assert "/skills/incident-triage/references/runbook.md" in paths
+    assert "/incident-triage/SKILL.md" in paths
+    assert "/weekly-report/SKILL.md" in paths
+    assert "/incident-triage/references/runbook.md" in paths
 
 
 @pytest.mark.asyncio
@@ -194,7 +221,7 @@ async def test_glob_scripts(backend):
     result = await backend.aglob("*.py")
     assert result.error is None
     paths = [e["path"] for e in result.matches]
-    assert "/skills/incident-triage/scripts/check.py" in paths
+    assert "/incident-triage/scripts/check.py" in paths
 
 
 # ---- write operations (blocked) ----
@@ -262,3 +289,90 @@ async def test_empty_backend_read():
     backend = SkillsStoreBackend({})
     result = await backend.aread("/skills/anything/SKILL.md")
     assert result.error is not None
+
+
+# ---- Integration tests: CompositeBackend + SkillsStoreBackend ----
+# These test the full path the agent sees in production.
+
+
+class _EmptyBackend:
+    """Minimal no-op backend for testing (avoids StateBackend's LangGraph requirement)."""
+
+    async def als(self, path):
+        return LsResult(entries=[])
+
+    async def aread(self, path, offset=0, limit=2000):
+        return ReadResult(error="not found")
+
+    async def agrep(self, pattern, path=None, glob=None):
+        return GrepResult(matches=[])
+
+    async def aglob(self, pattern, path=None):
+        return GlobResult(matches=[])
+
+
+@pytest.fixture
+def composite():
+    """CompositeBackend with SkillsStoreBackend mounted at /skills/ (production setup)."""
+    return CompositeBackend(
+        default=_EmptyBackend(),
+        routes={"/skills/": SkillsStoreBackend(_make_skills())},
+    )
+
+
+@pytest.mark.asyncio
+async def test_composite_ls_root_shows_skills_dir(composite):
+    result = await composite.als("/")
+    paths = [e["path"] for e in result.entries]
+    assert "/skills/" in paths
+
+
+@pytest.mark.asyncio
+async def test_composite_ls_skills_root(composite):
+    result = await composite.als("/skills/")
+    assert result.error is None
+    paths = [e["path"] for e in result.entries]
+    assert "/skills/incident-triage/" in paths
+    assert "/skills/weekly-report/" in paths
+
+
+@pytest.mark.asyncio
+async def test_composite_ls_skill_directory(composite):
+    result = await composite.als("/skills/incident-triage/")
+    assert result.error is None
+    paths = [e["path"] for e in result.entries]
+    assert "/skills/incident-triage/SKILL.md" in paths
+    assert "/skills/incident-triage/scripts/check.py" in paths
+    assert "/skills/incident-triage/references/runbook.md" in paths
+
+
+@pytest.mark.asyncio
+async def test_composite_read_skill(composite):
+    result = await composite.aread("/skills/incident-triage/SKILL.md")
+    assert result.error is None
+    assert "name: incident-triage" in result.file_data["content"]
+
+
+@pytest.mark.asyncio
+async def test_composite_read_bundled_file(composite):
+    result = await composite.aread("/skills/incident-triage/scripts/check.py")
+    assert result.error is None
+    assert result.file_data["content"] == "print('checking')"
+
+
+@pytest.mark.asyncio
+async def test_composite_grep(composite):
+    result = await composite.agrep("Check alerts")
+    assert result.error is None
+    assert len(result.matches) >= 1
+    assert result.matches[0]["path"] == "/skills/incident-triage/SKILL.md"
+
+
+@pytest.mark.asyncio
+async def test_composite_glob(composite):
+    result = await composite.aglob("/skills/**/*.md")
+    assert result.error is None
+    paths = [e["path"] for e in result.matches]
+    assert "/skills/incident-triage/SKILL.md" in paths
+    assert "/skills/weekly-report/SKILL.md" in paths
+    assert "/skills/incident-triage/references/runbook.md" in paths

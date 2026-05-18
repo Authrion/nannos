@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -36,6 +36,10 @@ import {
   Cpu,
   FileText,
   Plug,
+  ExternalLink,
+  Blocks,
+  ArrowUpCircle,
+  RefreshCw,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -55,6 +59,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { ApprovalDialog } from '@/components/subagents/ApprovalDialog';
 import { SubAgentPermissionsDialog } from '@/components/subagents/SubAgentPermissionsDialog';
@@ -75,13 +80,20 @@ import {
   reviewVersionApiV1SubAgentsSubAgentIdVersionsVersionReviewPostMutation,
   listSecretsApiV1SecretsGetOptions,
   getSubAgentPermissionsApiV1SubAgentsSubAgentIdPermissionsGetOptions,
+  listActivationsApiV1SkillsActivationsSubAgentIdGetOptions,
+  listActivationsApiV1SkillsActivationsSubAgentIdGetQueryKey,
+  activateSkillApiV1SkillsActivationsPostMutation,
+  deactivateSkillApiV1SkillsActivationsActivationIdDeleteMutation,
+  updateActivationApiV1SkillsActivationsActivationIdUpdatePostMutation,
+  listMyGroupsApiV1GroupsGetOptions,
 } from '@/api/generated/@tanstack/react-query.gen';
-import type { SubAgentConfigVersion, OrchestratorThinkingLevel, SkillDefinition, SkillFile } from '@/api/generated/types.gen';
+import type { SubAgentConfigVersion, OrchestratorThinkingLevel, SkillDefinitionInput, McpSkillFile, SkillSearchResult, SkillActivationWithStatus } from '@/api/generated/types.gen';
 import type { SubAgentStatus } from '@/components/subagents/types';
 import { client } from '@/api/generated/client.gen';
 import { Markdown } from '@/components/ui/markdown';
 import { usePlaygroundChat } from '@/hooks/usePlaygroundChat';
 import { SkillEditorModal } from '@/components/skills/SkillEditorModal';
+import { SkillRegistryBrowseDialog } from '@/components/skills/SkillRegistryBrowseDialog';
 
 const statusConfig: Record<
   SubAgentStatus,
@@ -167,15 +179,44 @@ export function SubAgentDetailPage() {
   const [pricingExpanded, setPricingExpanded] = useState(false);
 
   // Skills and sandbox state (local agents only)
-  const [editSkills, setEditSkills] = useState<Array<{ name: string; description: string; body: string; files?: Array<{ path: string; content: string }> }>>([]);
+  const [editSkills, setEditSkills] = useState<Array<{ name: string; description: string; body: string; files?: Array<{ path: string; content: string }>; source?: string | null; source_hash?: string | null }>>([]);
   const [editSandboxEnabled, setEditSandboxEnabled] = useState(false);
+  const [editSandboxAutoEnabled, setEditSandboxAutoEnabled] = useState(false);
   const [isSkillModalOpen, setIsSkillModalOpen] = useState(false);
+  const [isSkillImportOpen, setIsSkillImportOpen] = useState(false);
+  const [importingSkillId, setImportingSkillId] = useState<string | null>(null);
+  const [updatingSkillName, setUpdatingSkillName] = useState<string | null>(null);
+  const [skillsWithUpdates, setSkillsWithUpdates] = useState<Set<string>>(new Set());
+
+  // Personal/group skill activations state
+  const [showActivateSkillDialog, setShowActivateSkillDialog] = useState(false);
+  const [deactivatingActivation, setDeactivatingActivation] = useState<SkillActivationWithStatus | null>(null);
+  const [activateScope, setActivateScope] = useState<'personal' | 'group'>('personal');
+  const [activateGroupId, setActivateGroupId] = useState<number | null>(null);
 
   // Chat input state
   const [inputValue, setInputValue] = useState('');
   const [showConversationList, setShowConversationList] = useState(false);
   const [versionSidebarCollapsed, setVersionSidebarCollapsed] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-enable sandbox when any skill has executable files
+  const SANDBOX_EXTENSIONS = useMemo(() => new Set(['.py', '.sh', '.bash', '.zsh', '.js', '.ts', '.rb', '.pl', '.ps1', '.bat', '.cmd', '.mjs', '.cjs']), []);
+  useEffect(() => {
+    const hasExecutableFiles = editSkills.some((skill) =>
+      skill.files?.some((f) => {
+        const ext = f.path.includes('.') ? '.' + f.path.split('.').pop()!.toLowerCase() : '';
+        return SANDBOX_EXTENSIONS.has(ext);
+      })
+    );
+    if (hasExecutableFiles && !editSandboxEnabled) {
+      setEditSandboxEnabled(true);
+      setEditSandboxAutoEnabled(true);
+    } else if (!hasExecutableFiles && editSandboxAutoEnabled) {
+      setEditSandboxEnabled(false);
+      setEditSandboxAutoEnabled(false);
+    }
+  }, [editSkills]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fetch sub-agent
   const { data: subAgent } = useQuery({
@@ -210,6 +251,66 @@ export function SubAgentDetailPage() {
       path: { sub_agent_id: parseInt(id || '0', 10) },
     }),
     enabled: !!id,
+  });
+
+  // Fetch skill activations for this agent (personal/group)
+  const { data: activationsData } = useQuery({
+    ...listActivationsApiV1SkillsActivationsSubAgentIdGetOptions({
+      path: { sub_agent_id: parseInt(id || '0', 10) },
+    }),
+    enabled: !!id,
+  });
+  const myActivations = (activationsData?.items ?? []).filter((a) => !a.locked);
+
+  // Fetch user's groups (for group scope activation)
+  const { data: myGroupsData } = useQuery(listMyGroupsApiV1GroupsGetOptions());
+  const myGroups = Array.isArray(myGroupsData) ? myGroupsData : [];
+
+  // Activation mutations
+  const invalidateActivations = () => {
+    if (id) {
+      queryClient.invalidateQueries({
+        queryKey: listActivationsApiV1SkillsActivationsSubAgentIdGetQueryKey({
+          path: { sub_agent_id: parseInt(id, 10) },
+        }),
+      });
+    }
+  };
+
+  const activateSkillMutation = useMutation({
+    ...activateSkillApiV1SkillsActivationsPostMutation(),
+    onSuccess: () => {
+      toast.success('Skill activated');
+      invalidateActivations();
+      setShowActivateSkillDialog(false);
+    },
+    onError: (error: any) => {
+      const status = error?.status ?? error?.response?.status;
+      if (status === 409) {
+        toast.error('Skill is already activated on this agent');
+      } else {
+        toast.error('Failed to activate skill');
+      }
+    },
+  });
+
+  const deactivateSkillMutation = useMutation({
+    ...deactivateSkillApiV1SkillsActivationsActivationIdDeleteMutation(),
+    onSuccess: () => {
+      toast.success('Skill deactivated');
+      invalidateActivations();
+      setDeactivatingActivation(null);
+    },
+    onError: () => toast.error('Failed to deactivate skill'),
+  });
+
+  const updateActivationMutation = useMutation({
+    ...updateActivationApiV1SkillsActivationsActivationIdUpdatePostMutation(),
+    onSuccess: () => {
+      toast.success('Skill updated to latest');
+      invalidateActivations();
+    },
+    onError: () => toast.error('Failed to update skill'),
   });
   // Sort versions in descending order (newest first)
   const versionHistory: SubAgentConfigVersion[] = (versionHistoryData || [])
@@ -385,6 +486,16 @@ export function SubAgentDetailPage() {
   // Can submit if owner or has write access through groups, and current version is draft
   const canSubmitForApproval = (isOwner || hasGroupWriteAccess) && currentVersionStatus === 'draft';
 
+  // Left panel tab: owners/writers default to config, everyone else to personalize
+  const [leftPanelTab, setLeftPanelTab] = useState<'config' | 'personalize'>('config');
+  const leftPanelTabInitialized = useRef(false);
+  useEffect(() => {
+    if (!leftPanelTabInitialized.current && subAgent) {
+      leftPanelTabInitialized.current = true;
+      setLeftPanelTab(canEdit ? 'config' : 'personalize');
+    }
+  }, [subAgent, canEdit]);
+
   // Get displayed data based on whether viewing historical version
   const displayedDescription = isViewingHistoricalVersion
     ? (viewedVersion?.description ?? subAgent?.config_version?.description ?? '')
@@ -443,6 +554,49 @@ export function SubAgentDetailPage() {
       initEditState(subAgent);
     }
   }, [subAgent]);
+
+  // Check for available updates on imported skills when entering edit mode
+  useEffect(() => {
+    if (!isEditing) {
+      setSkillsWithUpdates(new Set());
+      return;
+    }
+    // Use backend-provided update_available flag
+    const updatable = new Set<string>();
+    for (const skill of editSkills) {
+      if (skill.source && (skill as any).update_available) {
+        updatable.add(skill.name);
+      }
+    }
+    if (updatable.size > 0) {
+      setSkillsWithUpdates(updatable);
+      return;
+    }
+    // Fallback: check registry for skills without update_available flag
+    const importedSkills = editSkills.filter((s) => s.source && s.source_hash && !(s as any).update_available);
+    if (importedSkills.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      for (const skill of importedSkills) {
+        try {
+          const { data } = await client.get({
+            url: '/api/v1/skills/registry/detail/{skill_id}',
+            path: { skill_id: skill.source! },
+          });
+          if (cancelled) return;
+          const detail = data as { content_hash?: string } | undefined;
+          if (detail?.content_hash && detail.content_hash !== skill.source_hash) {
+            updatable.add(skill.name);
+          }
+        } catch {
+          // Skip check if registry is unreachable
+        }
+      }
+      if (!cancelled) setSkillsWithUpdates(updatable);
+    })();
+    return () => { cancelled = true; };
+  }, [isEditing, editSkills.length]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -530,11 +684,13 @@ export function SubAgentDetailPage() {
       const cfgSkills = sa.config_version?.skills;
       setEditSkills(
         Array.isArray(cfgSkills)
-          ? cfgSkills.map((s: SkillDefinition) => ({
+          ? cfgSkills.map((s: any) => ({
               name: s.name,
               description: s.description,
               body: s.body,
-              files: s.files?.map((f: SkillFile) => ({ path: f.path, content: f.content })),
+              files: s.files?.map((f: McpSkillFile) => ({ path: f.path, content: f.content })),
+              source: s.source ?? null,
+              source_hash: s.source_hash ?? null,
             }))
           : []
       );
@@ -636,6 +792,83 @@ export function SubAgentDetailPage() {
 
   const handleFieldChange = () => {
     setHasUnsavedChanges(true);
+  };
+
+  const handleImportSkillFromRegistry = async (skill: SkillSearchResult) => {
+    if (!skill.id) return;
+    setImportingSkillId(skill.id);
+    try {
+      const { data, error } = await client.get({
+        url: '/api/v1/skills/registry/detail/{skill_id}',
+        path: { skill_id: skill.id },
+      });
+      if (error || !data) {
+        toast.error('Failed to fetch skill details');
+        return;
+      }
+      const detail = data as { name?: string; description?: string; content_hash?: string; files?: Array<{ path: string; contents: string }> };
+      // Extract SKILL.md body from files
+      const skillMdFile = detail.files?.find((f) => f.path === 'SKILL.md');
+      const body = skillMdFile?.contents ?? '';
+      const otherFiles = (detail.files ?? [])
+        .filter((f) => f.path !== 'SKILL.md')
+        .map((f) => ({ path: f.path, content: f.contents }));
+      const newSkill = {
+        name: detail.name ?? skill.name,
+        description: detail.description ?? '',
+        body,
+        files: otherFiles.length > 0 ? otherFiles : undefined,
+        source: skill.id,
+        source_hash: detail.content_hash ?? null,
+      };
+      // Don't add duplicates
+      if (editSkills.some((s) => s.name === newSkill.name)) {
+        toast.error(`Skill "${newSkill.name}" is already added`);
+        return;
+      }
+      setEditSkills((prev) => [...prev, newSkill]);
+      handleFieldChange();
+      toast.success(`Imported "${newSkill.name}"`);
+      setIsSkillImportOpen(false);
+    } finally {
+      setImportingSkillId(null);
+    }
+  };
+
+  const handleUpdateImportedSkill = async (skillName: string, sourceId: string) => {
+    setUpdatingSkillName(skillName);
+    try {
+      const { data, error } = await client.get({
+        url: '/api/v1/skills/registry/detail/{skill_id}',
+        path: { skill_id: sourceId },
+      });
+      if (error || !data) {
+        toast.error('Failed to fetch latest version from registry');
+        return;
+      }
+      const detail = data as { name?: string; description?: string; content_hash?: string; files?: Array<{ path: string; contents: string }> };
+      const skillMdFile = detail.files?.find((f) => f.path === 'SKILL.md');
+      const body = skillMdFile?.contents ?? '';
+      const otherFiles = (detail.files ?? [])
+        .filter((f) => f.path !== 'SKILL.md')
+        .map((f) => ({ path: f.path, content: f.contents }));
+      setEditSkills((prev) =>
+        prev.map((s) =>
+          s.name === skillName
+            ? { ...s, description: detail.description ?? s.description, body, files: otherFiles.length > 0 ? otherFiles : undefined, source_hash: detail.content_hash ?? s.source_hash }
+            : s
+        )
+      );
+      setSkillsWithUpdates((prev) => {
+        const next = new Set(prev);
+        next.delete(skillName);
+        return next;
+      });
+      handleFieldChange();
+      toast.success(`Updated "${skillName}" to latest version`);
+    } finally {
+      setUpdatingSkillName(null);
+    }
   };
 
   const handleNewConversation = () => {
@@ -800,6 +1033,7 @@ export function SubAgentDetailPage() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="__none__">No system role</SelectItem>
+                      <SelectItem value="assessor">Assessor</SelectItem>
                       <SelectItem value="debug">Debug</SelectItem>
                     </SelectContent>
                   </Select>
@@ -874,19 +1108,27 @@ export function SubAgentDetailPage() {
             configPanelWidth === 'compact' ? 'w-[400px]' : configPanelWidth === 'wide' ? 'w-[800px]' : 'w-[560px]'
           }`}
         >
-          {/* Configuration Panel */}
+          {/* Main Panel with Tabs */}
+          <Tabs value={leftPanelTab} onValueChange={(v) => setLeftPanelTab(v as 'config' | 'personalize')} className="flex flex-col flex-1 min-h-0">
           <div
             className={`flex flex-col rounded-lg border overflow-hidden flex-1 min-h-0 motion-safe:transition-all motion-safe:duration-300 motion-safe:ease-in-out ${
-              isEditing ? 'border-amber-500/50 bg-amber-50/30 dark:bg-amber-950/20' : 'border-border bg-muted/30'
+              isEditing && leftPanelTab === 'config' ? 'border-amber-500/50 bg-amber-50/30 dark:bg-amber-950/20' : 'border-border bg-muted/30'
             }`}
           >
-            <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
+            <div className="flex items-center justify-between px-4 py-2 border-b border-border shrink-0">
               <div className="flex items-center gap-2">
                 <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => navigate('/app/subagents')}>
                   <ArrowLeft className="h-4 w-4" />
                 </Button>
-                <h2 className="text-sm font-semibold">Configuration</h2>
-                {isEditing && (
+                <TabsList className="h-8">
+                  <TabsTrigger value="config" className="text-xs px-3 h-6">
+                    Configuration
+                  </TabsTrigger>
+                  <TabsTrigger value="personalize" className="text-xs px-3 h-6">
+                    My Skills
+                  </TabsTrigger>
+                </TabsList>
+                {leftPanelTab === 'config' && isEditing && (
                   <Badge
                     variant="outline"
                     className="text-xs border-amber-500 text-amber-600 bg-amber-50 dark:bg-amber-950"
@@ -895,12 +1137,13 @@ export function SubAgentDetailPage() {
                     Editing
                   </Badge>
                 )}
-                {isViewingHistoricalVersion && (
+                {leftPanelTab === 'config' && isViewingHistoricalVersion && (
                   <Badge variant="outline" className="text-xs border-amber-500 text-amber-600">
                     {formatVersionLabel(viewedVersion, viewingVersionNumber)}
                   </Badge>
                 )}
               </div>
+              {leftPanelTab === 'config' && (
               <div className="flex items-center gap-1">
                 {/* Layout lock toggle */}
                 {!isViewingHistoricalVersion && (
@@ -995,8 +1238,21 @@ export function SubAgentDetailPage() {
                   </>
                 )}
               </div>
+              )}
+              {leftPanelTab === 'personalize' && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={() => setShowActivateSkillDialog(true)}
+              >
+                <Plus className="h-3 w-3 mr-1" />
+                Add Skill
+              </Button>
+              )}
             </div>
 
+            <TabsContent value="config" className="flex-1 min-h-0 flex flex-col mt-0 data-[state=inactive]:hidden">
             {/* Read-only mode indicator */}
             {isViewingHistoricalVersion && (
               <div className="px-3 py-2 bg-amber-500/10 border-b border-amber-500/20 flex items-center justify-between shrink-0">
@@ -1496,64 +1752,148 @@ export function SubAgentDetailPage() {
                       {/* Skills */}
                       <div className="space-y-2 min-w-0 w-full">
                         <div className="flex items-center justify-between">
-                          <span className="text-xs font-medium text-foreground">Standard Skills</span>
+                          <span className="text-xs font-medium text-foreground">Skills</span>
                           {isEditing && (
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="sm"
-                              className="h-6 text-[11px] px-2"
-                              onClick={() => setIsSkillModalOpen(true)}
-                            >
-                              <Pencil className="h-2.5 w-2.5 mr-1" />
-                              Edit
-                            </Button>
+                            <div className="flex gap-1">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-6 text-[11px] px-2"
+                                onClick={() => setIsSkillImportOpen(true)}
+                              >
+                                <Plus className="h-2.5 w-2.5 mr-1" />
+                                Import
+                              </Button>
+                              {editSkills.some((s) => !s.source) ? (
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-6 text-[11px] px-2"
+                                  onClick={() => setIsSkillModalOpen(true)}
+                                >
+                                  <Pencil className="h-2.5 w-2.5 mr-1" />
+                                  Edit Custom
+                                </Button>
+                              ) : (
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-6 text-[11px] px-2"
+                                  onClick={() => setIsSkillModalOpen(true)}
+                                >
+                                  <Plus className="h-2.5 w-2.5 mr-1" />
+                                  Create
+                                </Button>
+                              )}
+                            </div>
                           )}
                         </div>
                         {(() => {
                           const skillsList = isEditing ? editSkills : displayedSkills;
                           return Array.isArray(skillsList) && skillsList.length > 0 ? (
                             <div className="space-y-1">
-                              {skillsList.map((skill: { name: string; description: string; files?: { path: string }[] }) => (
+                              {skillsList.map((skill: { name: string; description: string; files?: { path: string }[]; source?: string | null }, idx: number) => (
                                 <div
                                   key={skill.name}
-                                  className="flex items-center gap-2 py-1 px-2 rounded bg-muted/40 text-[11px]"
+                                  className="flex items-center gap-2 py-1 px-2 rounded bg-muted/40 text-[11px] group/skill"
                                 >
                                   <code className="font-mono font-medium shrink-0 whitespace-nowrap">{skill.name || '(unnamed)'}</code>
+                                  {skill.source && (
+                                    <span className="text-[10px] text-muted-foreground bg-muted px-1 rounded shrink-0">imported</span>
+                                  )}
+                                  {!isEditing && skill.source && (skill as any).update_available && (
+                                    <span className="text-[10px] text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950 px-1 rounded shrink-0">update available</span>
+                                  )}
+                                  {(skill.files?.length ?? 0) > 0 && (
+                                    <span className="text-[10px] text-muted-foreground shrink-0">
+                                      {skill.files!.length} files
+                                    </span>
+                                  )}
                                   {skill.description && (
-                                    <span className="text-muted-foreground whitespace-nowrap">
+                                    <span className="text-muted-foreground truncate flex-1">
                                       — {skill.description.length > 50 ? skill.description.slice(0, 50) + '…' : skill.description}
                                     </span>
+                                  )}
+                                  {isEditing && skill.source && (
+                                    <div className="flex items-center gap-1 opacity-0 group-hover/skill:opacity-100 transition-opacity ml-auto shrink-0">
+                                      {skillsWithUpdates.has(skill.name) && (
+                                        <button
+                                          type="button"
+                                          className="text-primary hover:text-primary/80 text-[10px] font-medium"
+                                          disabled={updatingSkillName === skill.name}
+                                          onClick={() => handleUpdateImportedSkill(skill.name, skill.source!)}
+                                        >
+                                          {updatingSkillName === skill.name ? (
+                                            <Loader2 className="h-3 w-3 animate-spin" />
+                                          ) : (
+                                            'Update'
+                                          )}
+                                        </button>
+                                      )}
+                                      <button
+                                        type="button"
+                                        className="text-destructive hover:text-destructive/80"
+                                        onClick={() => {
+                                          setEditSkills((prev) => prev.filter((_, i) => i !== idx));
+                                          handleFieldChange();
+                                        }}
+                                      >
+                                        <Trash2 className="h-3 w-3" />
+                                      </button>
+                                    </div>
+                                  )}
+                                  {isEditing && !skill.source && (
+                                    <button
+                                      type="button"
+                                      className="opacity-0 group-hover/skill:opacity-100 text-destructive hover:text-destructive/80 transition-opacity ml-auto shrink-0"
+                                      onClick={() => {
+                                        setEditSkills((prev) => prev.filter((_, i) => i !== idx));
+                                        handleFieldChange();
+                                      }}
+                                    >
+                                      <Trash2 className="h-3 w-3" />
+                                    </button>
                                   )}
                                 </div>
                               ))}
                             </div>
                           ) : (
-                            <p className="text-[11px] text-muted-foreground">No standard skills defined.</p>
+                            <p className="text-[11px] text-muted-foreground">No skills defined.</p>
                           );
                         })()}
-                        {subAgent?.type === 'local' && !isEditing && (
-                          <a
-                            href={`/app/skills?agent=${encodeURIComponent(subAgent.name)}`}
-                            className="text-[11px] text-primary hover:underline"
-                          >
-                            Manage personal & group skills →
-                          </a>
-                        )}
                       </div>
 
+                      {/* Skill import from registry dialog */}
+                      {isEditing && (
+                        <SkillRegistryBrowseDialog
+                          open={isSkillImportOpen}
+                          onOpenChange={setIsSkillImportOpen}
+                          title="Add skill from registry"
+                          description="Search for a skill to import into this agent's configuration."
+                          actionLabel="Import"
+                          onAction={(skill) => handleImportSkillFromRegistry(skill)}
+                          actionPending={!!importingSkillId}
+                        />
+                      )}
+
+                      {/* Skill inline editor modal (for editing body/files - custom skills only) */}
                       {isEditing && (
                         <SkillEditorModal
                           open={isSkillModalOpen}
                           onOpenChange={setIsSkillModalOpen}
-                          skills={editSkills as SkillDefinition[]}
+                          skills={editSkills.filter((s) => !s.source) as SkillDefinitionInput[]}
                           onChange={(updated) => {
-                            setEditSkills(updated.map(s => ({
+                            const importedSkills = editSkills.filter((s) => s.source);
+                            const customSkills = updated.map(s => ({
                               name: s.name,
                               description: s.description,
-                              body: s.body,
-                              files: s.files?.map(f => ({ path: f.path, content: f.content })),
-                            })));
+                              body: s.body ?? '',
+                              files: s.files?.map((f: { path: string; content: string }) => ({ path: f.path, content: f.content })),
+                            }));
+                            setEditSkills([...importedSkills, ...customSkills]);
                             handleFieldChange();
                           }}
                         />
@@ -1574,6 +1914,7 @@ export function SubAgentDetailPage() {
                             checked={editSandboxEnabled}
                             onCheckedChange={(checked) => {
                               setEditSandboxEnabled(checked);
+                              if (!checked) setEditSandboxAutoEnabled(false);
                               handleFieldChange();
                             }}
                           />
@@ -1583,6 +1924,11 @@ export function SubAgentDetailPage() {
                           </Badge>
                         )}
                       </div>
+                      {isEditing && editSandboxAutoEnabled && (
+                        <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                          Auto-enabled because one or more skills contain executable files (.py, .sh, etc.)
+                        </p>
+                      )}
                     </ConfigSection>
 
                     {/* Section: System Prompt */}
@@ -1654,7 +2000,89 @@ export function SubAgentDetailPage() {
                 )}
               </div>
             </ScrollArea>
+            </TabsContent>
+
+            <TabsContent value="personalize" className="flex-1 min-h-0 flex flex-col mt-0 data-[state=inactive]:hidden">
+            <ScrollArea className="flex-1 min-h-0">
+              <div className="p-4 space-y-4">
+                <div className="space-y-2">
+                  <p className="text-sm text-muted-foreground">
+                    Skills you activate here extend this agent for your conversations (personal) or for everyone in a group.
+                  </p>
+                  <p className="text-xs text-muted-foreground/70">
+                    Resolution: personal skills override group skills, which override the agent&apos;s built-in skills (by name).
+                  </p>
+                  <a
+                    href="/app/skill-registry"
+                    className="inline-flex items-center gap-1.5 text-xs text-primary hover:underline"
+                  >
+                    <ExternalLink className="h-3 w-3" />
+                    Browse skill registry
+                  </a>
+                </div>
+                <div className="space-y-1.5">
+              {myActivations.length > 0 ? (
+                myActivations.map((activation) => (
+                  <div
+                    key={activation.id}
+                    className="flex items-center gap-2 py-1.5 px-2 rounded bg-background/60 text-[11px] group/activation"
+                  >
+                    <Blocks className="h-3 w-3 text-muted-foreground shrink-0" />
+                    <a
+                      href={`/app/skill-registry?skill=${activation.registry_id}`}
+                      className="font-mono font-medium shrink-0 whitespace-nowrap text-primary hover:underline"
+                    >
+                      {activation.skill_name}
+                    </a>
+                    <Badge variant="outline" className="text-[9px] px-1 py-0 gap-0.5 shrink-0">
+                      {activation.scope === 'group' ? <Users className="h-2 w-2" /> : <Lock className="h-2 w-2" />}
+                      {activation.scope === 'group' ? (activation.group_name ?? 'Group') : 'Personal'}
+                    </Badge>
+                    {activation.update_available && (
+                      <Badge variant="default" className="text-[9px] px-1 py-0 bg-amber-500 hover:bg-amber-600 shrink-0">
+                        <ArrowUpCircle className="h-2 w-2 mr-0.5" />
+                        update
+                      </Badge>
+                    )}
+                    {activation.skill_description && (
+                      <span className="text-muted-foreground truncate flex-1">
+                        — {activation.skill_description.length > 40 ? activation.skill_description.slice(0, 40) + '…' : activation.skill_description}
+                      </span>
+                    )}
+                    <div className="flex items-center gap-0.5 opacity-0 group-hover/activation:opacity-100 transition-opacity ml-auto shrink-0">
+                      {activation.update_available && (
+                        <button
+                          type="button"
+                          className="text-primary hover:text-primary/80 p-0.5"
+                          title="Update to latest"
+                          onClick={() => updateActivationMutation.mutate({ path: { activation_id: activation.id } })}
+                          disabled={updateActivationMutation.isPending}
+                        >
+                          <RefreshCw className="h-3 w-3" />
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="text-destructive hover:text-destructive/80 p-0.5"
+                        title="Deactivate"
+                        onClick={() => setDeactivatingActivation(activation)}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-[11px] text-muted-foreground text-center py-6">
+                  No skills activated. Click &quot;Add Skill&quot; to add from registry.
+                </p>
+              )}
+                </div>
+              </div>
+            </ScrollArea>
+            </TabsContent>
           </div>
+          </Tabs>
 
           {/* Group Access Panel */}
           {(isOwner || (isAdministrator && adminMode)) && (
@@ -2085,6 +2513,99 @@ export function SubAgentDetailPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Activate Skill Dialog */}
+      <SkillRegistryBrowseDialog
+        open={showActivateSkillDialog}
+        onOpenChange={setShowActivateSkillDialog}
+        title="Activate skill from registry"
+        description="Search for a skill to activate on this agent for yourself or a group."
+        actionLabel="Activate"
+        actionPending={activateSkillMutation.isPending}
+        onAction={(skill) => {
+          if (!id || !skill.id) return;
+          if (activateScope === 'group' && !activateGroupId) {
+            toast.error('Please select a group');
+            return;
+          }
+          activateSkillMutation.mutate({
+            body: {
+              registry_id: skill.id,
+              sub_agent_id: parseInt(id, 10),
+              scope: activateScope,
+              group_id: activateScope === 'group' ? activateGroupId : undefined,
+            },
+          });
+        }}
+        headerContent={
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">Scope:</span>
+            <Select
+              value={activateScope}
+              onValueChange={(v) => {
+                setActivateScope(v as 'personal' | 'group');
+                if (v === 'personal') setActivateGroupId(null);
+                else if (myGroups.length > 0) setActivateGroupId(myGroups[0].id);
+              }}
+            >
+              <SelectTrigger className="w-28 h-7 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="personal">Personal</SelectItem>
+                <SelectItem value="group">Group</SelectItem>
+              </SelectContent>
+            </Select>
+            {activateScope === 'group' && (
+              <Select
+                value={activateGroupId ? String(activateGroupId) : ''}
+                onValueChange={(v) => setActivateGroupId(Number(v))}
+              >
+                <SelectTrigger className="flex-1 h-7 text-xs">
+                  <SelectValue placeholder="Select group" />
+                </SelectTrigger>
+                <SelectContent>
+                  {myGroups.map((g) => (
+                    <SelectItem key={g.id} value={String(g.id)}>
+                      {g.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+        }
+      />
+
+      {/* Deactivate Skill Confirmation */}
+      {deactivatingActivation && (
+        <Dialog open={!!deactivatingActivation} onOpenChange={() => setDeactivatingActivation(null)}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Deactivate skill?</DialogTitle>
+              <DialogDescription>
+                This will remove <strong>{deactivatingActivation.skill_name}</strong> from this agent.
+                The skill remains in the registry and can be re-activated later.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setDeactivatingActivation(null)}>Cancel</Button>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  deactivateSkillMutation.mutate({
+                    path: { activation_id: deactivatingActivation.id },
+                  });
+                }}
+                disabled={deactivateSkillMutation.isPending}
+              >
+                {deactivateSkillMutation.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />}
+                Deactivate
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   );
 }

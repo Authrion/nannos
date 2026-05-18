@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from base64 import b64decode
 from typing import TYPE_CHECKING, Any
 
 from langchain.agents.middleware import AgentMiddleware
@@ -79,8 +80,12 @@ class SkillSandboxSyncMiddleware(AgentMiddleware):
             result = await self._skills_backend.aread(path)
             if result.file_data:
                 content = result.file_data["content"]
-                # SandboxBackendProtocol.upload_files expects bytes
-                raw = content.encode() if isinstance(content, str) else content
+                encoding = result.file_data.get("encoding", "utf-8")
+                # Decode base64 binary files, encode text as UTF-8
+                if encoding == "base64":
+                    raw = b64decode(content)
+                else:
+                    raw = content.encode() if isinstance(content, str) else content
                 # Remap /skills/... → upload dir
                 sandbox_path = self._skills_upload_dir + path[len("/skills") :]
                 files.append((sandbox_path, raw))
