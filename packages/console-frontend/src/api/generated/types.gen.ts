@@ -3420,6 +3420,15 @@ export type ScimUserCreate = {
      * Active
      */
     active?: boolean;
+    /**
+     * Phonenumbers
+     */
+    phoneNumbers?: Array<{
+        [key: string]: unknown;
+    }> | null;
+    [key: string]: unknown | Array<string> | string | null | string | ScimName | null | string | null | Array<ScimEmail> | null | boolean | Array<{
+        [key: string]: unknown;
+    }> | null | undefined;
 };
 
 /**
@@ -4900,6 +4909,22 @@ export type SubAgentGroupPermissionResponse = {
 };
 
 /**
+ * SubAgentListFullResponse
+ *
+ * Response model for listing sub-agents with full details.
+ */
+export type SubAgentListFullResponse = {
+    /**
+     * Items
+     */
+    items: Array<SubAgent>;
+    /**
+     * Total
+     */
+    total: number;
+};
+
+/**
  * SubAgentListItem
  *
  * Lightweight sub-agent for list responses (skills without body/files).
@@ -5964,6 +5989,12 @@ export type UserWithGroups = {
      */
     phone_number_idp?: string | null;
     /**
+     * Scim Attributes
+     */
+    scim_attributes?: {
+        [key: string]: unknown;
+    } | null;
+    /**
      * Deleted At
      */
     deleted_at?: string | null;
@@ -6642,6 +6673,38 @@ export type ServeLocalFileApiV1FilesLocalFilePathGetResponses = {
     200: unknown;
 };
 
+export type DownloadStorageFileApiV1FilesDownloadBucketFilePathGetData = {
+    body?: never;
+    path: {
+        /**
+         * Bucket
+         */
+        bucket: string;
+        /**
+         * File Path
+         */
+        file_path: string;
+    };
+    query?: never;
+    url: '/api/v1/files/download/{bucket}/{file_path}';
+};
+
+export type DownloadStorageFileApiV1FilesDownloadBucketFilePathGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DownloadStorageFileApiV1FilesDownloadBucketFilePathGetError = DownloadStorageFileApiV1FilesDownloadBucketFilePathGetErrors[keyof DownloadStorageFileApiV1FilesDownloadBucketFilePathGetErrors];
+
+export type DownloadStorageFileApiV1FilesDownloadBucketFilePathGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
 export type ConsoleGrepMcpToolsData = {
     body?: never;
     path?: never;
@@ -6928,7 +6991,7 @@ export type ConsoleListSubAgentsResponses = {
     /**
      * Successful Response
      */
-    200: SubAgentListResponse;
+    200: SubAgentListFullResponse;
 };
 
 export type ConsoleListSubAgentsResponse = ConsoleListSubAgentsResponses[keyof ConsoleListSubAgentsResponses];

@@ -2,7 +2,6 @@ import _ from 'lodash';
 import { Logger } from './logger.js';
 import { GoogleChatService } from '../services/googleChatService.js';
 import { Artifact, DataPart, FileWithBytes, FileWithUri, Task } from '@a2a-js/sdk';
-import type { chat_v1 } from 'googleapis';
 
 const logger = Logger.getLogger('taskResponseHandler');
 
@@ -39,8 +38,6 @@ export interface HandleTaskResponseParams {
   task: Task;
   chatService: GoogleChatService;
   messageContext: ChatMessageContext;
-  /** When true, append 👍/👎 feedback buttons to the response message. */
-  includeFeedbackButtons?: boolean;
 }
 
 /**
@@ -54,8 +51,6 @@ export async function postOrUpdateMessage(
   threadId: string,
   text: string,
   existingMessageId?: string,
-  accessoryWidgets?: chat_v1.Schema$AccessoryWidget[],
-  cardsV2?: chat_v1.Schema$CardWithId[],
 ): Promise<string | undefined> {
   try {
     if (existingMessageId) {
@@ -64,8 +59,6 @@ export async function postOrUpdateMessage(
         projectId,
         messageName: existingMessageId,
         text,
-        accessoryWidgets,
-        cardsV2,
       });
       return existingMessageId;
     } else {
@@ -75,8 +68,6 @@ export async function postOrUpdateMessage(
         spaceId,
         text,
         threadId,
-        accessoryWidgets,
-        cardsV2,
         messageReplyOption: threadId ? 'REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD' : undefined,
       });
       return result.name || undefined;
@@ -130,7 +121,7 @@ export function processArtifacts(artifacts?: Artifact[]): {
  * Main entry point for handling any A2A response uniformly
  */
 export async function handleTask(params: HandleTaskResponseParams): Promise<{ messageId: string | undefined }> {
-  const { task, chatService, messageContext, includeFeedbackButtons } = params;
+  const { task, chatService, messageContext } = params;
 
   const { projectId, spaceId, threadId, messageId, statusMessageId } = messageContext;
 
@@ -177,49 +168,6 @@ export async function handleTask(params: HandleTaskResponseParams): Promise<{ me
 
   message = message.trim();
 
-  // Build feedback accessory widgets for completed responses
-  let accessoryWidgets: chat_v1.Schema$AccessoryWidget[] | undefined;
-  let cardsV2: chat_v1.Schema$CardWithId[] | undefined;
-  if (includeFeedbackButtons && task.status.state === 'completed' && message) {
-    cardsV2 = [
-      {
-        cardId: 'feedback_card',
-        card: {
-          sections: [
-            {
-              widgets: [
-                {
-                  buttonList: {
-                    buttons: [
-                      {
-                        text: '👍',
-                        onClick: {
-                          action: {
-                            function: 'feedback_positive',
-                            parameters: [],
-                          },
-                        },
-                      },
-                      {
-                        text: '👎',
-                        onClick: {
-                          action: {
-                            function: 'feedback_negative',
-                            parameters: [],
-                          },
-                        },
-                      },
-                    ],
-                  },
-                },
-              ],
-            },
-          ],
-        },
-      },
-    ];
-  }
-
   // Update or post the message
   let postedMessageId: string | undefined;
   if (message) {
@@ -230,8 +178,6 @@ export async function handleTask(params: HandleTaskResponseParams): Promise<{ me
       threadId,
       message,
       statusMessageId,
-      accessoryWidgets,
-      cardsV2,
     );
   }
 
@@ -256,101 +202,4 @@ export async function handleError(
   } catch (err) {
     logger.error(`Failed to send error message: ${err}`);
   }
-}
-
-/**
- * Build a generic HITL interrupt card for Google Chat.
- * Works for any tool that triggers a human-in-the-loop interrupt.
- */
-export interface HitlInterruptCardData {
-  taskId: string;
-  contextId: string;
-  toolName: string;
-  reason: string;
-}
-
-export function buildHitlInterruptCard(data: HitlInterruptCardData): chat_v1.Schema$CardWithId {
-  const toolLabel = (data.toolName || 'unknown').replace(/_/g, ' ');
-
-  return {
-    cardId: 'hitl_interrupt_card',
-    card: {
-      header: {
-        title: '⚠️ Approval Required',
-        subtitle: toolLabel,
-        imageType: 'CIRCLE',
-      },
-      sections: [
-        {
-          widgets: [
-            {
-              textParagraph: {
-                text: `<b>Reason:</b>\n${data.reason}`,
-              },
-            } as any,
-            {
-              divider: {},
-            },
-            {
-              textParagraph: {
-                text: '<b>Would you like to approve this action?</b>',
-              },
-            } as any,
-            {
-              buttonList: {
-                buttons: [
-                  {
-                    text: '✅ Approve',
-                    onClick: {
-                      action: {
-                        function: 'hitl_approve',
-                        parameters: [
-                          {
-                            key: 'taskId',
-                            value: data.taskId,
-                          },
-                          {
-                            key: 'contextId',
-                            value: data.contextId,
-                          },
-                          {
-                            key: 'toolName',
-                            value: data.toolName,
-                          },
-                          {
-                            key: 'reason',
-                            value: data.reason,
-                          },
-                        ],
-                      },
-                    },
-                    color: {
-                      red: 0.0,
-                      green: 0.54,
-                      blue: 0.86,
-                      alpha: 1,
-                    },
-                  },
-                  {
-                    text: '❌ Reject',
-                    onClick: {
-                      action: {
-                        function: 'hitl_reject',
-                        parameters: [
-                          {
-                            key: 'taskId',
-                            value: data.taskId,
-                          },
-                        ],
-                      },
-                    },
-                  },
-                ],
-              },
-            } as any,
-          ],
-        },
-      ],
-    },
-  };
 }

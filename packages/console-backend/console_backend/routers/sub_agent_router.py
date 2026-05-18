@@ -19,6 +19,7 @@ from ..models.sub_agent import (
     SubAgentConfigVersion,
     SubAgentCreate,
     SubAgentGroupPermissionResponse,
+    SubAgentListFullResponse,
     SubAgentListItem,
     SubAgentListResponse,
     SubAgentPermissionsUpdate,
@@ -41,7 +42,7 @@ def get_sub_agent_service(request: Request) -> SubAgentService:
     return request.app.state.sub_agent_service
 
 
-@router.get("", response_model=SubAgentListResponse, tags=["MCP"], operation_id="console_list_sub_agents")
+@router.get("", response_model=SubAgentListFullResponse, tags=["MCP"], operation_id="console_list_sub_agents")
 async def list_sub_agents(
     request: Request,
     db: DbSession,
@@ -49,7 +50,7 @@ async def list_sub_agents(
     status: SubAgentStatus | None = Query(None, description="Filter by status"),
     owned_only: bool = Query(False, description="Only show owned sub-agents"),
     activated_only: bool = Query(False, description="Only show activated sub-agents"),
-) -> SubAgentListResponse:
+) -> SubAgentListFullResponse:
     """List sub-agents accessible to the current user.
 
     Supports both user session authentication and Bearer token authentication.
@@ -83,9 +84,8 @@ async def list_sub_agents(
             )
 
         # Convert to lightweight list items (skills without body/files content)
-        items = [SubAgentListItem.from_sub_agent(sa) for sa in sub_agents]
 
-        return SubAgentListResponse(items=items, total=len(items))
+        return SubAgentListFullResponse(items=sub_agents, total=len(sub_agents))
     except Exception as e:
         logger.error(f"Failed to list sub-agents: {e}")
         raise HTTPException(status_code=500, detail="Failed to list sub-agents")
