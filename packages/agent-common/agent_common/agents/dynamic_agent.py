@@ -24,6 +24,8 @@ Users can configure personal sub-agents via console backend with custom prompts 
 tool whitelists, enabling specialized assistants without deploying separate A2A services.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from collections.abc import AsyncIterable, Callable
