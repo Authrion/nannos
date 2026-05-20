@@ -255,7 +255,7 @@ def build_common_middleware_stack(
         middleware.append(HumanInTheLoopMiddleware(interrupt_on=hitl_guarded_tools))
 
     middleware += [
-        RepeatedToolCallMiddleware(max_repeats=5, window_size=10),
+        RepeatedToolCallMiddleware(max_repeats=5, max_tool_repeats=10, window_size=10),
         ToolSchemaCleaningMiddleware(),
     ]
     return middleware

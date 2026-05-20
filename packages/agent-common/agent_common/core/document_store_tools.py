@@ -16,14 +16,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from langchain.agents.middleware.types import AgentState
-from langchain_core.tools import BaseTool, StructuredTool
+from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from langgraph.config import get_config
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.types import interrupt
 from langsmith import traceable
-from typing_extensions import NotRequired
-
 from object_storage import IObjectStorageService
+from typing_extensions import NotRequired
 
 
 class DocumentStoreState(AgentState):
@@ -156,7 +155,11 @@ async def _read_personal_file_impl(
     """
     # Check if this is cross-namespace access
     if not _is_cross_namespace_access():
-        return "Error: read_personal_file is only for accessing personal files from channel context."
+        raise ToolException(
+            "read_personal_file is only available in Slack channel context. "
+            "You are NOT in a channel. Do NOT call this tool again. "
+            "Use docstore_search or read_file instead to access files."
+        )
 
     # Get personal namespace
     personal_namespace = _get_personal_namespace(target_user_id)
@@ -641,6 +644,7 @@ def create_document_store_tools(
         StructuredTool.from_function(
             coroutine=read_personal_file,
             name="read_personal_file",
+            handle_tool_error=True,
             description=(
                 "Read a file from user's personal workspace (Slack channel context only). "
                 "Requires explicit user permission via interrupt for privacy. "
