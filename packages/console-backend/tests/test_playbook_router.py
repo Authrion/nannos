@@ -453,6 +453,7 @@ class TestGetSkill:
         service = MagicMock()
         service.is_available = True
         service.get_skill = AsyncMock(return_value="# Personal skill content")
+        service.list_skill_files = AsyncMock(return_value=[])
 
         request = _make_request(service=service, memberships=DEFAULT_MEMBERSHIPS)
         user = _make_user()
@@ -470,6 +471,7 @@ class TestGetSkill:
         service.is_available = True
         # personal returns None, first group returns None, second group returns content
         service.get_skill = AsyncMock(side_effect=[None, None, "# Beta skill content"])
+        service.list_skill_files = AsyncMock(return_value=[])
 
         request = _make_request(service=service, memberships=DEFAULT_MEMBERSHIPS)
         user = _make_user()
@@ -500,6 +502,7 @@ class TestGetSkill:
         service = MagicMock()
         service.is_available = True
         service.get_skill = AsyncMock(return_value="# Content")
+        service.list_skill_files = AsyncMock(return_value=[])
 
         request = _make_request(service=service, memberships=DEFAULT_MEMBERSHIPS)
         user = _make_user()
@@ -529,6 +532,7 @@ class TestGetSkill:
         service = MagicMock()
         service.is_available = True
         service.get_skill = AsyncMock(return_value="# Group skill")
+        service.list_skill_files = AsyncMock(return_value=[])
 
         request = _make_request(service=service, memberships=DEFAULT_MEMBERSHIPS)
         user = _make_user()
@@ -590,7 +594,7 @@ class TestCreateSkill:
         service = MagicMock()
         service.is_available = True
         service.get_skill = AsyncMock(return_value=None)
-        service.put_skill = AsyncMock()
+        service.put_skill_with_files = AsyncMock()
 
         request = _make_request(service=service, memberships=DEFAULT_MEMBERSHIPS)
         user = _make_user()
@@ -627,7 +631,7 @@ class TestCreateSkill:
         service = MagicMock()
         service.is_available = True
         service.get_skill = AsyncMock(return_value=None)
-        service.put_skill = AsyncMock()
+        service.put_skill_with_files = AsyncMock()
 
         request = _make_request(service=service, memberships=DEFAULT_MEMBERSHIPS)
         user = _make_user()
@@ -689,7 +693,7 @@ class TestUpdateSkill:
         service = MagicMock()
         service.is_available = True
         service.get_skill = AsyncMock(return_value="# Old content")
-        service.put_skill = AsyncMock()
+        service.put_skill_with_files = AsyncMock()
 
         request = _make_request(service=service, memberships=DEFAULT_MEMBERSHIPS)
         user = _make_user()
@@ -737,7 +741,7 @@ class TestUpdateSkill:
         service = MagicMock()
         service.is_available = True
         service.get_skill = AsyncMock(return_value="# Old")
-        service.put_skill = AsyncMock()
+        service.put_skill_with_files = AsyncMock()
 
         request = _make_request(service=service, memberships=DEFAULT_MEMBERSHIPS)
         user = _make_user()

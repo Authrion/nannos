@@ -74,9 +74,9 @@ class TestPlaybookReaderService:
 
     @pytest.mark.asyncio
     async def test_list_skills_extracts_descriptions(self, reader, mock_store):
-        # Mock search to return skill file paths
+        # Mock search to return skill file paths (folder-based: /agent/skills/name/SKILL.md)
         mock_result = MagicMock()
-        mock_result.key = "/test-agent/skills/incident_triage.md"
+        mock_result.key = "/test-agent/skills/incident_triage/SKILL.md"
         mock_store.asearch.return_value = [mock_result]
 
         # Mock aget to return skill content

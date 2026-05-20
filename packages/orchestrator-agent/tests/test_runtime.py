@@ -138,13 +138,13 @@ class TestBuildRuntimeContext:
 
         # Mock document store dependencies to trigger docstore tool addition
         mock_store = Mock()
-        mock_s3_service = Mock()
+        mock_storage = Mock()
         bucket_name = "test-bucket"
 
         context = build_runtime_context(
             user_config,
             document_store=mock_store,
-            s3_service=mock_s3_service,
+            storage=mock_storage,
             document_store_bucket=bucket_name,
         )
 
@@ -197,13 +197,13 @@ class TestBuildRuntimeContext:
 
         # Mock document store dependencies
         mock_store = Mock()
-        mock_s3_service = Mock()
+        mock_storage = Mock()
         bucket_name = "test-bucket"
 
         context = build_runtime_context(
             user_config,
             document_store=mock_store,
-            s3_service=mock_s3_service,
+            storage=mock_storage,
             document_store_bucket=bucket_name,
         )
 

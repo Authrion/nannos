@@ -219,7 +219,7 @@ async def test_bulk_deactivate_sub_agent_removes_group(pg_session: AsyncSession,
     await pg_session.execute(
         text("""
             INSERT INTO sub_agents (id, name, type, owner_user_id, current_version, default_version)
-            VALUES (4, 'Test Agent 4', 'remote', 'owner-123', 1, 1)
+            VALUES (9004, 'Test Agent 4', 'remote', 'owner-123', 1, 1)
         """)
     )
     await pg_session.execute(
@@ -238,7 +238,7 @@ async def test_bulk_deactivate_sub_agent_removes_group(pg_session: AsyncSession,
         db=pg_session,
         actor=test_user,
         user_ids=user_ids,
-        sub_agent_id=4,
+        sub_agent_id=9004,
         activated_by=ActivationSource.GROUP,
         group_id=3,
     )
@@ -248,7 +248,7 @@ async def test_bulk_deactivate_sub_agent_removes_group(pg_session: AsyncSession,
         db=pg_session,
         actor=test_user,
         user_ids=user_ids,
-        sub_agent_id=4,
+        sub_agent_id=9004,
         activated_by=ActivationSource.GROUP,
         group_id=4,
     )
@@ -259,7 +259,7 @@ async def test_bulk_deactivate_sub_agent_removes_group(pg_session: AsyncSession,
         text("""
             SELECT activated_by_groups
             FROM user_sub_agent_activations
-            WHERE user_id = 'user-1' AND sub_agent_id = 4
+            WHERE user_id = 'user-1' AND sub_agent_id = 9004
         """)
     )
     groups = result.scalar()
@@ -270,7 +270,7 @@ async def test_bulk_deactivate_sub_agent_removes_group(pg_session: AsyncSession,
         db=pg_session,
         actor=test_user,
         user_ids=user_ids,
-        sub_agent_id=4,
+        sub_agent_id=9004,
         group_id=3,
     )
     await pg_session.commit()
@@ -282,7 +282,7 @@ async def test_bulk_deactivate_sub_agent_removes_group(pg_session: AsyncSession,
         text("""
             SELECT activated_by_groups
             FROM user_sub_agent_activations
-            WHERE user_id = 'user-1' AND sub_agent_id = 4
+            WHERE user_id = 'user-1' AND sub_agent_id = 9004
         """)
     )
     groups = result.scalar()

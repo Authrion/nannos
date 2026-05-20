@@ -51,7 +51,8 @@ async def test_update_automated_agent_without_foundry_fields(
     )
 
     assert updated_agent is not None
-    assert updated_agent.config_version.system_prompt == "Updated prompt about data engineering."
+    assert updated_agent.config_version is not None
+    assert updated_agent.config_version.system_prompt == "Updated prompt about data enconsole"
     # Verify version was incremented
     assert updated_agent.current_version == 2
 

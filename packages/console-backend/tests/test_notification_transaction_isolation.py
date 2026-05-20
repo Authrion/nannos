@@ -8,12 +8,12 @@ os.environ.setdefault("ECS_CONTAINER_METADATA_URI", "true")
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from moto import mock_aws
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from console_backend.models.secret import SecretCreate, SecretType
 from console_backend.models.user import User
 from console_backend.services.secrets_service import SecretsService
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
 
 async def _create_user(
@@ -48,13 +48,13 @@ async def _create_user(
     return user_id
 
 
-@mock_aws
 @pytest.mark.asyncio
 async def test_secret_permissions_persist_when_notifications_fail(
     pg_session: AsyncSession,
     secrets_service: SecretsService,
     test_user_db: User,
     test_approver_user_db: User,
+    aws_mock,
 ):
     """Test that secret permission updates are committed even if notifications fail.
 
@@ -141,10 +141,9 @@ async def test_secret_permissions_persist_when_notifications_fail(
     assert audit[2] == "permission_update"
 
 
-@mock_aws
 @pytest.mark.asyncio
 async def test_secret_permissions_commit_before_notification_queries(
-    pg_session: AsyncSession, secrets_service: SecretsService, test_user_db: User, test_approver_user_db: User
+    pg_session: AsyncSession, secrets_service: SecretsService, test_user_db: User, test_approver_user_db: User, aws_mock
 ):
     """Test that permissions are committed before any notification queries run.
 
@@ -222,10 +221,9 @@ async def test_secret_permissions_commit_before_notification_queries(
     assert set(perms[0][1]) == {"write"}
 
 
-@mock_aws
 @pytest.mark.asyncio
 async def test_secret_permissions_multiple_groups_notification_failure(
-    pg_session: AsyncSession, secrets_service: SecretsService, test_user_db: User
+    pg_session: AsyncSession, secrets_service: SecretsService, test_user_db: User, aws_mock
 ):
     """Test permission updates with multiple groups when notifications fail partway through."""
     # Create test user

@@ -14,15 +14,14 @@ import os
 os.environ.setdefault("ECS_CONTAINER_METADATA_URI", "true")
 
 import pytest
-from aiomoto import mock_aws
-from console_backend.models.secret import Secret, SecretCreate, SecretType
-from console_backend.models.user import User, UserRole
-from console_backend.services.secrets_service import SecretsService
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from console_backend.models.secret import Secret, SecretCreate, SecretType
+from console_backend.models.user import User, UserRole
+from console_backend.services.secrets_service import SecretsService
 
-@mock_aws
+
 async def _create_secret(
     secrets_service: SecretsService,
     session: AsyncSession,
@@ -83,10 +82,9 @@ async def _create_user(
 class TestSecretCreation:
     """Test secret creation and SSM parameter generation."""
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_create_secret_generates_ssm_parameter(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User
+        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, aws_mock
     ):
         """Test that creating a secret generates unique SSM parameter name."""
         service = secrets_service
@@ -107,10 +105,9 @@ class TestSecretCreation:
         assert secret.ssm_parameter_name.startswith(service.ssm_vault_prefix)
         assert len(secret.ssm_parameter_name) > len(service.ssm_vault_prefix)
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_create_secret_unique_name_per_owner(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User
+        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, aws_mock
     ):
         """Test that secret names must be unique per owner."""
         service = secrets_service
@@ -136,10 +133,14 @@ class TestSecretCreation:
         with pytest.raises(ValueError, match="already exists"):
             await service.create_secret(pg_session, data=data2, actor=test_user)
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_different_users_can_have_same_secret_name(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, test_admin_user: User
+        self,
+        pg_session: AsyncSession,
+        secrets_service: SecretsService,
+        test_user: User,
+        test_admin_user: User,
+        aws_mock,
     ):
         """Test that different users can create secrets with the same name."""
         service = secrets_service
@@ -174,7 +175,7 @@ class TestSecretCreation:
 class TestSecretAccessControl:
     @pytest.mark.asyncio
     async def test_owner_has_access_to_own_secret(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User
+        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, aws_mock
     ):
         """Test that owner always has access to their own secrets (.own)."""
         service = secrets_service
@@ -190,7 +191,7 @@ class TestSecretAccessControl:
 
     @pytest.mark.asyncio
     async def test_member_cannot_access_other_user_secret(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User
+        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, aws_mock
     ):
         """Test that members cannot access other users' secrets."""
         service = secrets_service
@@ -207,7 +208,12 @@ class TestSecretAccessControl:
 
     @pytest.mark.asyncio
     async def test_admin_with_admin_mode_has_access_to_all_secrets(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, test_admin_user: User
+        self,
+        pg_session: AsyncSession,
+        secrets_service: SecretsService,
+        test_user: User,
+        test_admin_user: User,
+        aws_mock,
     ):
         """Test that admins with admin_mode can access all secrets (.admin)."""
         service = secrets_service
@@ -224,7 +230,12 @@ class TestSecretAccessControl:
 
     @pytest.mark.asyncio
     async def test_admin_without_admin_mode_cannot_access_others_secrets(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, test_admin_user: User
+        self,
+        pg_session: AsyncSession,
+        secrets_service: SecretsService,
+        test_user: User,
+        test_admin_user: User,
+        aws_mock,
     ):
         """Test that admins without admin_mode enabled cannot access others' secrets."""
         service = secrets_service
@@ -245,6 +256,7 @@ class TestSecretAccessControl:
         pg_session: AsyncSession,
         secrets_service: SecretsService,
         test_user: User,
+        aws_mock,
     ):
         """Test that users can access secrets granted to their groups."""
 
@@ -290,7 +302,12 @@ class TestSecretAccessControl:
 
     @pytest.mark.asyncio
     async def test_group_access_requires_admin_mode(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, test_admin_user: User
+        self,
+        pg_session: AsyncSession,
+        secrets_service: SecretsService,
+        test_user: User,
+        test_admin_user: User,
+        aws_mock,
     ):
         """Test that group-based access requires admin_mode to be enabled."""
 
@@ -341,7 +358,7 @@ class TestSecretRetrieval:
 
     @pytest.mark.asyncio
     async def test_get_secret_returns_metadata(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User
+        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, aws_mock
     ):
         """Test that get_secret returns secret metadata."""
         service = secrets_service
@@ -361,7 +378,7 @@ class TestSecretRetrieval:
 
     @pytest.mark.asyncio
     async def test_get_secret_checks_access_permission(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User
+        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, aws_mock
     ):
         """Test that get_secret validates access permissions."""
         service = secrets_service
@@ -380,10 +397,9 @@ class TestSecretRetrieval:
 class TestSecretDeletion:
     """Test secret deletion and SSM parameter cleanup."""
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_delete_secret_soft_deletes_record(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User
+        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, aws_mock
     ):
         """Test that delete_secret performs soft delete."""
         service = secrets_service
@@ -404,10 +420,9 @@ class TestSecretDeletion:
         assert row is not None
         assert row[0] is not None  # deleted_at is set
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_delete_secret_removes_ssm_parameter(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User
+        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, aws_mock
     ):
         """Test that delete_secret removes SSM parameter."""
         service = secrets_service
@@ -416,13 +431,14 @@ class TestSecretDeletion:
         secret = await _create_secret(
             secrets_service=secrets_service, session=pg_session, actor=test_user, name="Test Secret"
         )
-        # Try to get parameter - should work
+        # Verify parameter exists
         async with service.session.create_client("ssm", region_name=service.region_name) as ssm_client:
-            await ssm_client.get_parameter(Name=secret.ssm_parameter_name)
+            resp = await ssm_client.get_parameter(Name=secret.ssm_parameter_name)
+            assert resp["Parameter"]["Name"] == secret.ssm_parameter_name
 
         await service.delete_secret(pg_session, secret.id, actor=test_user, is_admin=False, admin_mode=False)
 
-        # Try to get parameter - should fail
+        # Verify parameter was removed
         async with service.session.create_client("ssm", region_name=service.region_name) as ssm_client:
             from botocore.exceptions import ClientError
 
@@ -431,7 +447,12 @@ class TestSecretDeletion:
 
     @pytest.mark.asyncio
     async def test_delete_secret_checks_permission(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, test_admin_user: User
+        self,
+        pg_session: AsyncSession,
+        secrets_service: SecretsService,
+        test_user: User,
+        test_admin_user: User,
+        aws_mock,
     ):
         """Test that only authorized users can delete secrets."""
         service = secrets_service
@@ -447,10 +468,14 @@ class TestSecretDeletion:
         with pytest.raises(PermissionError, match="permission"):
             await service.delete_secret(pg_session, secret.id, actor=test_admin_user, is_admin=False, admin_mode=False)
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_admin_can_delete_any_secret_with_admin_mode(
-        self, pg_session: AsyncSession, secrets_service: SecretsService, test_user: User, test_admin_user: User
+        self,
+        pg_session: AsyncSession,
+        secrets_service: SecretsService,
+        test_user: User,
+        test_admin_user: User,
+        aws_mock,
     ):
         """Test that admins with admin_mode can delete any secret."""
         service = secrets_service

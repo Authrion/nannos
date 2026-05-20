@@ -36,11 +36,11 @@ class TestPlaybookServicePrefixAndKeys:
 
     def test_skill_key_personal(self):
         key = self.service._skill_key("orchestrator", "personal", None, "my_skill")
-        assert key == "/orchestrator/skills/my_skill.md"
+        assert key == "/orchestrator/skills/my_skill/SKILL.md"
 
     def test_skill_key_group(self):
         key = self.service._skill_key("orchestrator", "group", "g1", "my_skill")
-        assert key == "/orchestrator/skills/my_skill.md"
+        assert key == "/orchestrator/skills/my_skill/SKILL.md"
 
     def test_skills_prefix_key_personal(self):
         key = self.service._skills_prefix_key("orchestrator", "personal", None)
@@ -264,11 +264,11 @@ class TestPlaybookServiceListSkills:
         mock_result = MagicMock()
         mock_result.all.return_value = [
             (
-                "/orchestrator/skills/incident_triage.md",
+                "/orchestrator/skills/incident_triage/SKILL.md",
                 {"content": "# Incident Triage\n\nA workflow for handling incidents."},
             ),
             (
-                "/orchestrator/skills/deploy.md",
+                "/orchestrator/skills/deploy/SKILL.md",
                 {"content": "# Deploy Process\n\nHow to deploy safely."},
             ),
         ]
@@ -294,11 +294,11 @@ class TestPlaybookServiceListSkills:
         mock_result = MagicMock()
         mock_result.all.return_value = [
             (
-                "/orchestrator/skills/empty.md",
+                "/orchestrator/skills/empty/SKILL.md",
                 {"content": ""},
             ),
             (
-                "/orchestrator/skills/none.md",
+                "/orchestrator/skills/none/SKILL.md",
                 {},
             ),
         ]
@@ -393,4 +393,4 @@ class TestPlaybookServiceSkillCRUD:
         call_args = mock_session.execute.call_args
         params = call_args[0][1]
         assert params["prefix"] == "g1.agent-data"
-        assert params["key"] == "/orchestrator/skills/my_skill.md"
+        assert params["key"] == "/orchestrator/skills/my_skill/SKILL.md"

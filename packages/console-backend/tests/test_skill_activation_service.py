@@ -183,14 +183,14 @@ class TestActivate:
         assert row["user_id"] is None
 
     @pytest.mark.asyncio
-    async def test_activate_duplicate_raises(self, pg_session: AsyncSession, activation_service):
-        """Activating the same skill twice raises ValueError."""
+    async def test_activate_duplicate_is_idempotent(self, pg_session: AsyncSession, activation_service):
+        """Activating the same skill twice returns the existing activation ID."""
         user_id = await _create_test_user(pg_session)
         agent_id = await _create_test_agent(pg_session, user_id=user_id)
         registry_id = await _create_registry_entry(pg_session, user_id=user_id)
         await pg_session.commit()
 
-        await activation_service.activate(
+        first_id = await activation_service.activate(
             db=pg_session,
             registry_id=registry_id,
             sub_agent_id=agent_id,
@@ -200,15 +200,16 @@ class TestActivate:
         )
         await pg_session.commit()
 
-        with pytest.raises(ValueError, match="already activated"):
-            await activation_service.activate(
-                db=pg_session,
-                registry_id=registry_id,
-                sub_agent_id=agent_id,
-                agent_name="test-agent",
-                scope="personal",
-                user_id=user_id,
-            )
+        second_id = await activation_service.activate(
+            db=pg_session,
+            registry_id=registry_id,
+            sub_agent_id=agent_id,
+            agent_name="test-agent",
+            scope="personal",
+            user_id=user_id,
+        )
+
+        assert first_id == second_id
 
     @pytest.mark.asyncio
     async def test_activate_missing_registry_raises(self, pg_session: AsyncSession, activation_service):

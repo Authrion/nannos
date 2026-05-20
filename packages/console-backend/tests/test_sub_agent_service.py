@@ -18,10 +18,8 @@ import os
 os.environ.setdefault("ECS_CONTAINER_METADATA_URI", "true")
 
 import pytest
-from moto import mock_aws
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from playground_backend.models.notification import NotificationType
 from console_backend.models.notification import NotificationType
 from console_backend.models.sub_agent import (
     FoundryScope,
@@ -35,7 +33,6 @@ from console_backend.models.user import User
 from console_backend.services.notification_service import NotificationService
 from console_backend.services.secrets_service import SecretsService
 from console_backend.services.sub_agent_service import SubAgentService
-from sqlalchemy.ext.asyncio import AsyncSession
 
 
 async def _create_sub_agent(
@@ -260,7 +257,6 @@ class TestSubAgentVersionCreation:
         assert agent.config_version.agent_url == "https://example.com/agent"
         assert agent.config_version.system_prompt is None
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_foundry_agent_creates_secret_in_ssm(
         self,
@@ -268,6 +264,7 @@ class TestSubAgentVersionCreation:
         sub_agent_service: SubAgentService,
         secrets_service: SecretsService,
         test_user_db: User,
+        aws_mock,
     ):
         """Test that creating a Foundry agent stores the client_secret in SSM."""
         from console_backend.models.secret import SecretCreate, SecretType
@@ -318,7 +315,6 @@ class TestSubAgentVersionCreation:
         assert agent.config_version.system_prompt is None
         assert agent.config_version.agent_url is None
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_foundry_agent_update_creates_new_secret(
         self,
@@ -326,6 +322,7 @@ class TestSubAgentVersionCreation:
         sub_agent_service: SubAgentService,
         secrets_service: SecretsService,
         test_user_db: User,
+        aws_mock,
     ):
         """Test that updating a Foundry agent's client_secret creates a new secret."""
         from console_backend.models.secret import SecretCreate, SecretType
@@ -392,7 +389,6 @@ class TestSubAgentVersionCreation:
         assert updated.config_version.foundry_client_id == "test-client-id"  # Inherited
         assert updated.config_version.foundry_hostname == "https://blumen.palantirfoundry.de"  # Inherited
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_foundry_agent_update_without_secret_keeps_existing(
         self,
@@ -400,6 +396,7 @@ class TestSubAgentVersionCreation:
         sub_agent_service: SubAgentService,
         secrets_service: SecretsService,
         test_user_db: User,
+        aws_mock,
     ):
         """Test that updating a Foundry agent without providing client_secret keeps the existing one."""
         from console_backend.models.secret import SecretCreate, SecretType
@@ -452,7 +449,6 @@ class TestSubAgentVersionCreation:
         assert updated.config_version.foundry_client_secret_ref == original_secret_ref  # Same secret
         assert updated.config_version.foundry_query_api_name == "newQueryAPI"  # Updated
 
-    @mock_aws
     @pytest.mark.asyncio
     async def test_foundry_agent_requires_foundry_fields(
         self,
@@ -460,6 +456,7 @@ class TestSubAgentVersionCreation:
         sub_agent_service: SubAgentService,
         secrets_service: SecretsService,
         test_user_db: User,
+        aws_mock,
     ):
         """Test that Foundry agents require all Foundry-specific fields including client_secret."""
         from console_backend.models.secret import SecretCreate, SecretType

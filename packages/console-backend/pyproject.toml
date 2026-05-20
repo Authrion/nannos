@@ -68,6 +68,7 @@ dev = [
     "asyncpg>=0.30.0",
     "pytest-anyio>=0.0.0",
     "debugpy>=1.8.20",
+    "aiomoto>=0.4.0",
 ]
 
 [tool.pytest.ini_options]

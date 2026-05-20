@@ -199,13 +199,15 @@ class TestSearchSkills:
             )
         ]
 
+        mock_request = MagicMock()
+
         with patch(
             "console_backend.routers.skills_registry_router.skills_registry_service.search_external",
             new_callable=AsyncMock,
             return_value=(mock_results, "fuzzy"),
         ):
             result = await search_skills(
-                q="nextjs", source="external", limit=10, user=_make_user(), db=AsyncMock()
+                request=mock_request, q="nextjs", source="external", limit=10, user=_make_user(), db=AsyncMock()
             )
 
             assert isinstance(result, SkillSearchResponse)
@@ -223,15 +225,15 @@ class TestGetSkillDetail:
         from console_backend.routers.skills_registry_router import get_skill_detail
 
         mock_db = AsyncMock()
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.get_by_id",
-            new_callable=AsyncMock,
-            return_value=None,
-        ):
-            with pytest.raises(Exception) as exc_info:
-                await get_skill_detail(skill_id="nonexistent", user=_make_user(), db=mock_db)
+        mock_srs = MagicMock()
+        mock_srs.get_by_id_or_slug = AsyncMock(return_value=None)
+        mock_request = MagicMock()
+        mock_request.app.state.skill_registry_service = mock_srs
 
-            assert exc_info.value.status_code == 404
+        with pytest.raises(Exception) as exc_info:
+            await get_skill_detail(request=mock_request, skill_id="nonexistent", user=_make_user(), db=mock_db)
+
+        assert exc_info.value.status_code == 404
 
 
 # --- Import endpoint tests ---
@@ -239,7 +241,7 @@ class TestGetSkillDetail:
 
 def _make_mock_registry_entry(**overrides):
     """Create a mock SkillRegistryEntry."""
-    from console_backend.services.skills_registry_service import SkillRegistryEntry
+    from console_backend.services.skill_registry_service import SkillRegistryEntry
     from datetime import datetime, timezone
 
     defaults = {
@@ -268,9 +270,11 @@ def _make_mock_registry_entry(**overrides):
 class TestImportSkill:
     """Tests for POST /api/v1/skills/registry/import."""
 
-    def _mock_request(self, playbook_service):
+    def _mock_request(self, playbook_service, skill_registry_service=None):
         request = MagicMock()
         request.app.state.playbook_service = playbook_service
+        request.app.state.skill_registry_service = skill_registry_service
+        request.state.access_token = None
         return request
 
     def _mock_playbook_service(self, skill_exists=False):
@@ -293,8 +297,10 @@ class TestImportSkill:
             tree_sha="abc123def",
         )
 
+        mock_srs = MagicMock()
+        mock_srs.import_from_source = AsyncMock(return_value=_make_mock_registry_entry())
         playbook_service = self._mock_playbook_service()
-        request = self._mock_request(playbook_service)
+        request = self._mock_request(playbook_service, skill_registry_service=mock_srs)
         mock_db = AsyncMock()
         mock_db.commit = AsyncMock()
 
@@ -310,10 +316,6 @@ class TestImportSkill:
             return_value=SkillSecurityVerdict(
                 verdict="safe", indicators=[], reasoning="No issues", assessed_at="2025-01-01", content_hash="h1"
             ),
-        ), patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.import_from_source",
-            new_callable=AsyncMock,
-            return_value=_make_mock_registry_entry(),
         ):
             result = await import_skill(body=body, request=request, user=_make_user(), db=mock_db)
 
@@ -354,8 +356,10 @@ class TestImportSkill:
             tree_sha="def456",
         )
 
+        mock_srs = MagicMock()
+        mock_srs.import_from_source = AsyncMock(return_value=_make_mock_registry_entry())
         playbook_service = self._mock_playbook_service()
-        request = self._mock_request(playbook_service)
+        request = self._mock_request(playbook_service, skill_registry_service=mock_srs)
         mock_db = AsyncMock()
 
         body = SkillImportRequest(repo="owner/repo", skill="broken", agent="orchestrator", scope="personal")
@@ -370,10 +374,6 @@ class TestImportSkill:
             return_value=SkillSecurityVerdict(
                 verdict="safe", indicators=[], reasoning="OK", assessed_at="2025-01-01", content_hash="h2"
             ),
-        ), patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.import_from_source",
-            new_callable=AsyncMock,
-            return_value=_make_mock_registry_entry(),
         ):
             with pytest.raises(Exception) as exc_info:
                 await import_skill(body=body, request=request, user=_make_user(), db=mock_db)
@@ -431,8 +431,10 @@ class TestImportSkill:
             tree_sha="hash1",
         )
 
+        mock_srs = MagicMock()
+        mock_srs.import_from_source = AsyncMock(return_value=_make_mock_registry_entry())
         playbook_service = self._mock_playbook_service(skill_exists=True)
-        request = self._mock_request(playbook_service)
+        request = self._mock_request(playbook_service, skill_registry_service=mock_srs)
         mock_db = AsyncMock()
 
         body = SkillImportRequest(repo="owner/repo", skill="exists", agent="orchestrator", scope="personal")
@@ -447,10 +449,6 @@ class TestImportSkill:
             return_value=SkillSecurityVerdict(
                 verdict="safe", indicators=[], reasoning="OK", assessed_at="2025-01-01", content_hash="h4"
             ),
-        ), patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.import_from_source",
-            new_callable=AsyncMock,
-            return_value=_make_mock_registry_entry(),
         ):
             with pytest.raises(Exception) as exc_info:
                 await import_skill(body=body, request=request, user=_make_user(), db=mock_db)
@@ -476,9 +474,10 @@ class TestImportSkill:
 
 
 class TestActivateSkill:
-    def _mock_request(self, playbook_service):
+    def _mock_request(self, playbook_service, skill_registry_service=None):
         request = MagicMock()
         request.app.state.playbook_service = playbook_service
+        request.app.state.skill_registry_service = skill_registry_service
         return request
 
     @pytest.mark.asyncio
@@ -490,23 +489,20 @@ class TestActivateSkill:
         playbook_service.is_available = True
         playbook_service.get_skill = AsyncMock(return_value=None)
         playbook_service.put_skill_with_files = AsyncMock(return_value=None)
-        request = self._mock_request(playbook_service)
+        mock_srs = MagicMock()
+        mock_srs.get_by_id = AsyncMock(return_value=entry)
+        request = self._mock_request(playbook_service, skill_registry_service=mock_srs)
         mock_db = AsyncMock()
 
         body = ActivateRequest(agent="my-agent", scope="personal")
 
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.get_by_id",
-            new_callable=AsyncMock,
-            return_value=entry,
-        ):
-            result = await activate_skill(
-                skill_id="11111111-2222-3333-4444-555555555555",
-                body=body,
-                request=request,
-                user=_make_user(),
-                db=mock_db,
-            )
+        result = await activate_skill(
+            skill_id="11111111-2222-3333-4444-555555555555",
+            body=body,
+            request=request,
+            user=_make_user(),
+            db=mock_db,
+        )
 
         assert result["activated"] is True
         assert result["agent"] == "my-agent"
@@ -517,21 +513,18 @@ class TestActivateSkill:
         from console_backend.routers.skills_registry_router import ActivateRequest, activate_skill
 
         playbook_service = MagicMock()
-        request = self._mock_request(playbook_service)
+        mock_srs = MagicMock()
+        mock_srs.get_by_id = AsyncMock(return_value=None)
+        request = self._mock_request(playbook_service, skill_registry_service=mock_srs)
         mock_db = AsyncMock()
 
         body = ActivateRequest(agent="my-agent", scope="personal")
 
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.get_by_id",
-            new_callable=AsyncMock,
-            return_value=None,
-        ):
-            with pytest.raises(Exception) as exc_info:
-                await activate_skill(
-                    skill_id="nonexistent", body=body, request=request, user=_make_user(), db=mock_db
-                )
-            assert exc_info.value.status_code == 404
+        with pytest.raises(Exception) as exc_info:
+            await activate_skill(
+                skill_id="nonexistent", body=body, request=request, user=_make_user(), db=mock_db
+            )
+        assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_activate_conflict(self):
@@ -541,25 +534,22 @@ class TestActivateSkill:
         playbook_service = MagicMock()
         playbook_service.is_available = True
         playbook_service.get_skill = AsyncMock(return_value="already exists")
-        request = self._mock_request(playbook_service)
+        mock_srs = MagicMock()
+        mock_srs.get_by_id = AsyncMock(return_value=entry)
+        request = self._mock_request(playbook_service, skill_registry_service=mock_srs)
         mock_db = AsyncMock()
 
         body = ActivateRequest(agent="my-agent", scope="personal")
 
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.get_by_id",
-            new_callable=AsyncMock,
-            return_value=entry,
-        ):
-            with pytest.raises(Exception) as exc_info:
-                await activate_skill(
-                    skill_id="11111111-2222-3333-4444-555555555555",
-                    body=body,
-                    request=request,
-                    user=_make_user(),
-                    db=mock_db,
-                )
-            assert exc_info.value.status_code == 409
+        with pytest.raises(Exception) as exc_info:
+            await activate_skill(
+                skill_id="11111111-2222-3333-4444-555555555555",
+                body=body,
+                request=request,
+                user=_make_user(),
+                db=mock_db,
+            )
+        assert exc_info.value.status_code == 409
 
 
 # --- Delete endpoint tests ---
@@ -573,33 +563,29 @@ class TestRemoveSkill:
         entry = _make_mock_registry_entry()
         mock_db = AsyncMock()
         mock_db.commit = AsyncMock()
+        mock_srs = MagicMock()
+        mock_srs.get_by_id = AsyncMock(return_value=entry)
+        mock_srs.remove = AsyncMock()
+        mock_request = MagicMock()
+        mock_request.app.state.skill_registry_service = mock_srs
 
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.get_by_id",
-            new_callable=AsyncMock,
-            return_value=entry,
-        ), patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.remove",
-            new_callable=AsyncMock,
-        ) as mock_remove:
-            await remove_skill(skill_id="11111111-2222-3333-4444-555555555555", user=_make_user(), db=mock_db)
-            mock_remove.assert_called_once()
-            mock_db.commit.assert_called_once()
+        await remove_skill(request=mock_request, skill_id="11111111-2222-3333-4444-555555555555", user=_make_user(), db=mock_db)
+        mock_srs.remove.assert_called_once()
+        mock_db.commit.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_remove_not_found(self):
         from console_backend.routers.skills_registry_router import remove_skill
 
         mock_db = AsyncMock()
+        mock_srs = MagicMock()
+        mock_srs.get_by_id = AsyncMock(return_value=None)
+        mock_request = MagicMock()
+        mock_request.app.state.skill_registry_service = mock_srs
 
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.get_by_id",
-            new_callable=AsyncMock,
-            return_value=None,
-        ):
-            with pytest.raises(Exception) as exc_info:
-                await remove_skill(skill_id="nonexistent", user=_make_user(), db=mock_db)
-            assert exc_info.value.status_code == 404
+        with pytest.raises(Exception) as exc_info:
+            await remove_skill(request=mock_request, skill_id="nonexistent", user=_make_user(), db=mock_db)
+        assert exc_info.value.status_code == 404
 
 
 # --- Visibility endpoint tests ---
@@ -613,20 +599,17 @@ class TestUpdateVisibility:
         entry = _make_mock_registry_entry()
         mock_db = AsyncMock()
         mock_db.commit = AsyncMock()
+        mock_srs = MagicMock()
+        mock_srs.get_by_id = AsyncMock(return_value=entry)
+        mock_srs.update_visibility = AsyncMock()
+        mock_request = MagicMock()
+        mock_request.app.state.skill_registry_service = mock_srs
 
         body = VisibilityUpdate(visibility="public")
 
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.get_by_id",
-            new_callable=AsyncMock,
-            return_value=entry,
-        ), patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.update_visibility",
-            new_callable=AsyncMock,
-        ):
-            result = await update_visibility(
-                skill_id="11111111-2222-3333-4444-555555555555", body=body, user=_make_user(), db=mock_db
-            )
+        result = await update_visibility(
+            request=mock_request, skill_id="11111111-2222-3333-4444-555555555555", body=body, user=_make_user(), db=mock_db
+        )
 
         assert result["visibility"] == "public"
         mock_db.commit.assert_called_once()
@@ -636,10 +619,11 @@ class TestUpdateVisibility:
         from console_backend.routers.skills_registry_router import VisibilityUpdate, update_visibility
 
         mock_db = AsyncMock()
+        mock_request = MagicMock()
         body = VisibilityUpdate(visibility="invalid")
 
         with pytest.raises(Exception) as exc_info:
-            await update_visibility(skill_id="any-id", body=body, user=_make_user(), db=mock_db)
+            await update_visibility(request=mock_request, skill_id="any-id", body=body, user=_make_user(), db=mock_db)
         assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
@@ -647,22 +631,26 @@ class TestUpdateVisibility:
         from console_backend.routers.skills_registry_router import VisibilityUpdate, update_visibility
 
         mock_db = AsyncMock()
+        mock_srs = MagicMock()
+        mock_srs.get_by_id = AsyncMock(return_value=None)
+        mock_request = MagicMock()
+        mock_request.app.state.skill_registry_service = mock_srs
         body = VisibilityUpdate(visibility="public")
 
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.get_by_id",
-            new_callable=AsyncMock,
-            return_value=None,
-        ):
-            with pytest.raises(Exception) as exc_info:
-                await update_visibility(skill_id="nonexistent", body=body, user=_make_user(), db=mock_db)
-            assert exc_info.value.status_code == 404
+        with pytest.raises(Exception) as exc_info:
+            await update_visibility(request=mock_request, skill_id="nonexistent", body=body, user=_make_user(), db=mock_db)
+        assert exc_info.value.status_code == 404
 
 
 # --- MCP endpoint tests ---
 
 
 class TestMcpSearchSkills:
+    def _mock_request(self, skill_registry_service=None):
+        request = MagicMock()
+        request.app.state.skill_registry_service = skill_registry_service
+        return request
+
     @pytest.mark.asyncio
     async def test_mcp_search_registry(self):
         from console_backend.routers.skills_registry_router import McpSearchSkillsInput, mcp_search_skills
@@ -672,12 +660,11 @@ class TestMcpSearchSkills:
 
         body = McpSearchSkillsInput(query="test", source="registry", limit=10)
 
-        with patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.search",
-            new_callable=AsyncMock,
-            return_value=[entry],
-        ):
-            result = await mcp_search_skills(body=body, user=_make_user(), db=mock_db)
+        mock_srs = MagicMock()
+        mock_srs.search = AsyncMock(return_value=([entry], 1))
+        request = self._mock_request(skill_registry_service=mock_srs)
+
+        result = await mcp_search_skills(body=body, request=request, user=_make_user(), db=mock_db)
 
         assert result.count == 1
         assert result.results[0].name == "Test Skill"
@@ -700,13 +687,14 @@ class TestMcpSearchSkills:
         mock_db = AsyncMock()
 
         body = McpSearchSkillsInput(query="skill", source="external", limit=5)
+        request = self._mock_request()
 
         with patch(
             "console_backend.routers.skills_registry_router.skills_registry_service.search_external",
             new_callable=AsyncMock,
             return_value=(mock_results, "fuzzy"),
         ):
-            result = await mcp_search_skills(body=body, user=_make_user(), db=mock_db)
+            result = await mcp_search_skills(body=body, request=request, user=_make_user(), db=mock_db)
 
         assert result.count == 1
         assert result.results[0].name == "Skill X"
@@ -729,13 +717,14 @@ class TestMcpSearchSkills:
         mock_db = AsyncMock()
 
         body = McpSearchSkillsInput(query="review", source="repo:anthropics/skills", limit=10)
+        request = self._mock_request()
 
         with patch(
             "console_backend.routers.skills_registry_router.skills_registry_service.browse_repo",
             new_callable=AsyncMock,
             return_value=mock_results,
         ):
-            result = await mcp_search_skills(body=body, user=_make_user(), db=mock_db)
+            result = await mcp_search_skills(body=body, request=request, user=_make_user(), db=mock_db)
 
         assert result.count == 1
         assert result.results[0].name == "Code Review"
@@ -747,16 +736,19 @@ class TestMcpSearchSkills:
 
         mock_db = AsyncMock()
         body = McpSearchSkillsInput(query="test", source="invalid")
+        request = self._mock_request()
 
         with pytest.raises(Exception) as exc_info:
-            await mcp_search_skills(body=body, user=_make_user(), db=mock_db)
+            await mcp_search_skills(body=body, request=request, user=_make_user(), db=mock_db)
         assert exc_info.value.status_code == 400
 
 
 class TestMcpImportSkill:
-    def _mock_request(self, playbook_service):
+    def _mock_request(self, playbook_service, skill_registry_service=None):
         request = MagicMock()
         request.app.state.playbook_service = playbook_service
+        request.app.state.skill_registry_service = skill_registry_service
+        request.state.access_token = None
         return request
 
     @pytest.mark.asyncio
@@ -769,9 +761,11 @@ class TestMcpImportSkill:
             tree_sha="sha1",
         )
 
+        mock_srs = MagicMock()
+        mock_srs.import_from_source = AsyncMock(return_value=_make_mock_registry_entry())
         playbook_service = MagicMock()
         playbook_service.put_skill_with_files = AsyncMock(return_value=None)
-        request = self._mock_request(playbook_service)
+        request = self._mock_request(playbook_service, skill_registry_service=mock_srs)
         mock_db = AsyncMock()
         mock_db.commit = AsyncMock()
 
@@ -787,10 +781,6 @@ class TestMcpImportSkill:
             return_value=SkillSecurityVerdict(
                 verdict="safe", indicators=[], reasoning="OK", assessed_at="2025-01-01", content_hash="h5"
             ),
-        ), patch(
-            "console_backend.routers.skills_registry_router.skills_registry_service.import_from_source",
-            new_callable=AsyncMock,
-            return_value=_make_mock_registry_entry(),
         ):
             result = await mcp_import_skill(body=body, request=request, user=_make_user(), db=mock_db)
 

@@ -9,6 +9,7 @@ Covers:
 
 import pytest
 from pydantic import ValidationError
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from console_backend.models.sub_agent import (
     SkillDefinition,
@@ -333,39 +334,40 @@ class TestPersistAndStripSkills:
 
         service = SubAgentService.__new__(SubAgentService)
 
-        with patch(
-            "console_backend.services.skill_registry_service.SkillRegistryService.upsert_agent_skill",
-            new_callable=AsyncMock,
-            return_value=("generated-uuid-123", "content-hash-abc"),
-        ) as mock_upsert:
-            skills = [
-                SkillDefinition(
-                    name="my-custom-skill",
-                    description="A custom skill",
-                    body="# Do something",
-                    files=[SkillFile(path="helper.py", content="print('hi')")],
-                ),
-            ]
+        mock_registry_service = MagicMock()
+        mock_registry_service.upsert_agent_skill = AsyncMock(
+            return_value=("generated-uuid-123", "content-hash-abc")
+        )
+        service._skill_registry_service = mock_registry_service
 
-            result = await service._persist_and_strip_skills(mock_db, mock_actor, 42, skills)
+        skills = [
+            SkillDefinition(
+                name="my-custom-skill",
+                description="A custom skill",
+                body="# Do something",
+                files=[SkillFile(path="helper.py", content="print('hi')")],
+            ),
+        ]
 
-            assert len(result) == 1
-            assert result[0]["name"] == "my-custom-skill"
-            assert result[0]["source"] == "generated-uuid-123"
-            assert result[0]["source_hash"] == "content-hash-abc"
-            assert result[0]["body"] == ""
-            assert result[0]["files"] == []
+        result = await service._persist_and_strip_skills(mock_db, mock_actor, 42, skills)
 
-            # Verify upsert was called with correct args
-            mock_upsert.assert_called_once()
-            call_kwargs = mock_upsert.call_args[1]
-            assert call_kwargs["sub_agent_id"] == 42
-            assert call_kwargs["name"] == "my-custom-skill"
-            # Should have SKILL.md + helper.py
-            assert len(call_kwargs["files"]) == 2
-            file_paths = [f.path for f in call_kwargs["files"]]
-            assert "SKILL.md" in file_paths
-            assert "helper.py" in file_paths
+        assert len(result) == 1
+        assert result[0]["name"] == "my-custom-skill"
+        assert result[0]["source"] == "generated-uuid-123"
+        assert result[0]["source_hash"] == "content-hash-abc"
+        assert result[0]["body"] == ""
+        assert result[0]["files"] == []
+
+        # Verify upsert was called with correct args
+        mock_registry_service.upsert_agent_skill.assert_called_once()
+        call_kwargs = mock_registry_service.upsert_agent_skill.call_args[1]
+        assert call_kwargs["sub_agent_id"] == 42
+        assert call_kwargs["name"] == "my-custom-skill"
+        # Should have SKILL.md + helper.py
+        assert len(call_kwargs["files"]) == 2
+        file_paths = [f.path for f in call_kwargs["files"]]
+        assert "SKILL.md" in file_paths
+        assert "helper.py" in file_paths
 
     @pytest.mark.asyncio
     async def test_imported_skill_stripped_without_registry_call(self, mock_db, mock_actor):
@@ -376,30 +378,30 @@ class TestPersistAndStripSkills:
 
         service = SubAgentService.__new__(SubAgentService)
 
-        with patch(
-            "console_backend.services.skill_registry_service.SkillRegistryService.upsert_agent_skill",
-            new_callable=AsyncMock,
-        ) as mock_upsert:
-            skills = [
-                SkillDefinition(
-                    name="imported-skill",
-                    description="From external registry",
-                    body="# Full body (will be stripped)",
-                    source="existing-registry-id",
-                    source_hash="existing-hash",
-                ),
-            ]
+        mock_registry_service = MagicMock()
+        mock_registry_service.upsert_agent_skill = AsyncMock()
+        service._skill_registry_service = mock_registry_service
 
-            result = await service._persist_and_strip_skills(mock_db, mock_actor, 42, skills)
+        skills = [
+            SkillDefinition(
+                name="imported-skill",
+                description="From external registry",
+                body="# Full body (will be stripped)",
+                source="existing-registry-id",
+                source_hash="existing-hash",
+            ),
+        ]
 
-            assert len(result) == 1
-            assert result[0]["source"] == "existing-registry-id"
-            assert result[0]["source_hash"] == "existing-hash"
-            assert result[0]["body"] == ""
-            assert result[0]["files"] == []
+        result = await service._persist_and_strip_skills(mock_db, mock_actor, 42, skills)
 
-            # Should NOT call upsert for imported skills
-            mock_upsert.assert_not_called()
+        assert len(result) == 1
+        assert result[0]["source"] == "existing-registry-id"
+        assert result[0]["source_hash"] == "existing-hash"
+        assert result[0]["body"] == ""
+        assert result[0]["files"] == []
+
+        # Should NOT call upsert for imported skills
+        mock_registry_service.upsert_agent_skill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mixed_skills_both_handled(self, mock_db, mock_actor):
@@ -410,36 +412,35 @@ class TestPersistAndStripSkills:
 
         service = SubAgentService.__new__(SubAgentService)
 
-        with patch(
-            "console_backend.services.skill_registry_service.SkillRegistryService.upsert_agent_skill",
-            new_callable=AsyncMock,
-            return_value=("new-id", "new-hash"),
-        ) as mock_upsert:
-            skills = [
-                SkillDefinition(
-                    name="imported",
-                    description="External",
-                    body="body",
-                    source="ext-id",
-                    source_hash="ext-hash",
-                ),
-                SkillDefinition(
-                    name="custom",
-                    description="Inline",
-                    body="# Custom body",
-                ),
-            ]
+        mock_registry_service = MagicMock()
+        mock_registry_service.upsert_agent_skill = AsyncMock(return_value=("new-id", "new-hash"))
+        service._skill_registry_service = mock_registry_service
 
-            result = await service._persist_and_strip_skills(mock_db, mock_actor, 7, skills)
+        skills = [
+            SkillDefinition(
+                name="imported",
+                description="External",
+                body="body",
+                source="ext-id",
+                source_hash="ext-hash",
+            ),
+            SkillDefinition(
+                name="custom",
+                description="Inline",
+                body="# Custom body",
+            ),
+        ]
 
-            assert len(result) == 2
-            # Imported: keep original source
-            assert result[0]["source"] == "ext-id"
-            assert result[0]["body"] == ""
-            # Custom: gets new registry source
-            assert result[1]["source"] == "new-id"
-            assert result[1]["source_hash"] == "new-hash"
-            assert result[1]["body"] == ""
+        result = await service._persist_and_strip_skills(mock_db, mock_actor, 7, skills)
 
-            # Only one upsert call (for the custom skill)
-            mock_upsert.assert_called_once()
+        assert len(result) == 2
+        # Imported: keep original source
+        assert result[0]["source"] == "ext-id"
+        assert result[0]["body"] == ""
+        # Custom: gets new registry source
+        assert result[1]["source"] == "new-id"
+        assert result[1]["source_hash"] == "new-hash"
+        assert result[1]["body"] == ""
+
+        # Only one upsert call (for the custom skill)
+        mock_registry_service.upsert_agent_skill.assert_called_once()
