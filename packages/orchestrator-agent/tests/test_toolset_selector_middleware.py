@@ -19,7 +19,7 @@ from app.middleware.toolset_selector import (
     ServerSelection,
     ToolSelection,
     ToolsetSelectorMiddleware,
-    _selected_tools_var,
+    _cache_var,
 )
 from app.models.config import AgentSettings
 
@@ -122,9 +122,10 @@ class TestCaching:
     async def test_cached_tools_used_on_second_call(
         self, middleware: ToolsetSelectorMiddleware, mock_handler: AsyncMock
     ):
-        """When _selected_tools_var is set, _select_tools is NOT called again."""
+        """When cache dict has 'tools' key, _select_tools is NOT called again."""
         some_tool = _make_tool("cached_tool")
-        _selected_tools_var.set([some_tool])  # pre-populated cache
+        # Simulate a pre-populated cache (as if clear_cache was called, then first model call populated it)
+        _cache_var.set({"tools": [some_tool]})
 
         tools = [_make_tool(f"tool_{i}", server="server-a") for i in range(3)]
         request = _make_request(tools=tools)
@@ -134,11 +135,12 @@ class TestCaching:
 
         mock_select.assert_not_called()
         # Clean up
-        _selected_tools_var.set(None)
+        middleware.clear_cache()
 
     @pytest.mark.asyncio
     async def test_cache_is_written_on_first_call(self, middleware: ToolsetSelectorMiddleware, mock_handler: AsyncMock):
-        """After first call, _selected_tools_var is populated."""
+        """After first call, cache dict is populated with 'tools' key."""
+        middleware.clear_cache()  # initialize fresh cache dict
         tools = [_make_tool(f"tool_{i}") for i in range(3)]
         request = _make_request(tools=tools)
 
@@ -146,16 +148,18 @@ class TestCaching:
         with patch.object(middleware, "_select_tools", new_callable=AsyncMock, return_value=selected):
             await middleware.awrap_model_call(request, mock_handler)
 
-        assert _selected_tools_var.get() == selected
+        cache = _cache_var.get({})
+        assert cache.get("tools") == selected
         # Clean up
-        _selected_tools_var.set(None)
+        middleware.clear_cache()
 
     @pytest.mark.asyncio
     async def test_clear_cache_resets_state(self, middleware: ToolsetSelectorMiddleware, mock_handler: AsyncMock):
-        """clear_cache() resets _selected_tools_var to None."""
-        _selected_tools_var.set([_make_tool("cached")])
+        """clear_cache() creates a fresh empty dict."""
+        _cache_var.set({"tools": [_make_tool("cached")]})
         middleware.clear_cache()
-        assert _selected_tools_var.get() is None
+        cache = _cache_var.get({})
+        assert cache.get("tools") is None
 
 
 class TestAlwaysInclude:

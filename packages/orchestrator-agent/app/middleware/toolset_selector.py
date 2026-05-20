@@ -14,10 +14,19 @@ middleware** (cached across model calls within the same GP invocation):
    ``TOOL_SELECTION_THRESHOLD`` (default 20), a second LLM call picks the most
    relevant individual tools.
 
-Both phases are cached per-invocation via a ``contextvars.ContextVar`` so that
-concurrent async invocations sharing the same middleware instance do not
-interfere with each other.  Call ``clear_cache()`` before each new invocation
-to reset state for the current task.
+Both phases are cached per-invocation via a mutable dict stored in a
+``contextvars.ContextVar``.  This achieves two goals simultaneously:
+
+1. **Cross-node persistence**: LangGraph copies context references for each node,
+   so all nodes within one graph invocation share the same mutable dict object.
+   Writes in the first model node are visible in subsequent model nodes.
+
+2. **Concurrent-invocation isolation**: ``asyncio.gather`` (used by ToolNode for
+   parallel tool calls) gives each task its own ContextVar binding.  Two parallel
+   GP invocations get independent cache dicts.
+
+Call ``clear_cache()`` before each new invocation to create a fresh dict in the
+current task's context.
 
 Architecture:
   - The orchestrator calls ``task(subagent_type="general-purpose", ...)``
@@ -51,11 +60,17 @@ from ..models.config import AgentSettings
 
 logger = logging.getLogger(__name__)
 
-# Per-task cache for selected tools — isolates concurrent invocations sharing
-# the same ToolsetSelectorMiddleware instance.
-_selected_tools_var: contextvars.ContextVar[list[BaseTool] | None] = contextvars.ContextVar(
-    "toolset_selector_cache", default=None
-)
+# Per-invocation cache using a mutable container in a ContextVar.
+# Why this pattern:
+# 1. asyncio.gather (used by LangGraph ToolNode for parallel tool calls) gives each
+#    task its own context copy — so concurrent GP invocations are isolated.
+# 2. LangGraph copies context for each node, but all nodes within one invocation
+#    share the SAME mutable dict object (reference is copied, not the dict).
+#    This means writes in one node (model call 1) are visible in subsequent nodes
+#    (model call 2), solving the cross-node persistence problem.
+# 3. clear_cache() creates a NEW dict in the current task's context, breaking the
+#    link with any previously shared dict.
+_cache_var: contextvars.ContextVar[dict[str, list]] = contextvars.ContextVar("toolset_selector_cache")
 
 
 class ServerSelection(BaseModel):
@@ -81,9 +96,10 @@ class ToolsetSelectorMiddleware(AgentMiddleware[AgentState, None]):
 
     Always includes static orchestrator tools (time, presigned_url, docstore).
 
-    Cache is scoped per-task via ``contextvars.ContextVar``, making it safe for
-    concurrent async invocations.  Call ``clear_cache()`` between invocations to
-    reset state for the current task.
+    Cache uses a ``ContextVar`` holding a **mutable dict** to achieve both:
+    - Cross-node persistence (LangGraph nodes share the same dict reference)
+    - Concurrent-invocation isolation (each ``asyncio.Task`` from gather has
+      its own ContextVar binding, set by ``clear_cache()`` before graph execution)
     """
 
     def __init__(self, always_include: list[str] | None = None, cost_logger: CostLogger | None = None):
@@ -99,8 +115,12 @@ class ToolsetSelectorMiddleware(AgentMiddleware[AgentState, None]):
         self._cost_logger = cost_logger
 
     def clear_cache(self) -> None:
-        """Clear cached tool selection for the current task."""
-        _selected_tools_var.set(None)
+        """Reset cache for the current invocation.
+
+        Must be called BEFORE graph execution starts (in _astream_impl) so that
+        the fresh dict is visible to all LangGraph nodes via context copy.
+        """
+        _cache_var.set({})
 
     async def awrap_model_call(
         self,
@@ -127,14 +147,15 @@ class ToolsetSelectorMiddleware(AgentMiddleware[AgentState, None]):
 
         # Use cached selection from a previous model call in this GP invocation
         # (the graph makes multiple model calls in a loop; avoid re-running LLMs)
-        cached = _selected_tools_var.get()
+        cache = _cache_var.get({})
+        cached = cache.get("tools")
         if cached is not None:
             filtered_tools = cached
             logger.debug(f"ToolsetSelector: Using cached selection ({len(filtered_tools)} tools)")
         else:
             filtered_tools = await self._select_tools(all_tools, request.messages)
-            # Cache the result for subsequent model calls in this invocation
-            _selected_tools_var.set(filtered_tools)
+            # Cache into the mutable dict — visible to subsequent nodes
+            cache["tools"] = filtered_tools
 
         # Always include essential orchestrator tools (even if not in filtered set)
         always_included = [
