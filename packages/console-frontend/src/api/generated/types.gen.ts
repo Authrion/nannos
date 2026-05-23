@@ -3810,9 +3810,9 @@ export type SkillCreate = {
  * A standard (immutable) skill bundled with a sub-agent config version.
  *
  * Two modes:
- * - Custom skills (source=None): full content stored inline (body + files)
- * - Imported skills (source set): only reference stored (name, description, source, source_hash).
- * Body and files are empty/absent — resolve from skill registry at runtime.
+ * - Custom skills (registry_id=None): full content stored inline (body + files)
+ * - Registry-backed skills (registry_id set): only reference stored.
+ * Body and files are empty/absent — resolved from skill_registry table at runtime.
  */
 export type SkillDefinitionInput = {
     /**
@@ -3830,19 +3830,25 @@ export type SkillDefinitionInput = {
     /**
      * Body
      *
-     * SKILL.md body content (markdown). Empty for imported skills (resolve from registry).
+     * SKILL.md body content (markdown). Empty for registry-backed skills.
      */
     body?: string;
     /**
      * Files
      *
-     * Optional scripts/references/assets. Empty for imported skills.
+     * Optional scripts/references/assets. Empty for registry-backed skills.
      */
     files?: Array<ConsoleBackendModelsSubAgentSkillFile>;
     /**
+     * Registry Id
+     *
+     * UUID of the skill in skill_registry table. Used for DB lookups. Null for inline custom skills.
+     */
+    registry_id?: string | null;
+    /**
      * Source
      *
-     * Registry skill ID if imported (e.g., 'vercel-labs/agent-skills/next-js-dev'). Null for custom skills.
+     * External provenance path where the skill was imported from (e.g., 'vercel-labs/agent-skills/xlsx'). Informational only.
      */
     source?: string | null;
     /**
@@ -3877,9 +3883,9 @@ export type SkillDefinitionInput = {
  * A standard (immutable) skill bundled with a sub-agent config version.
  *
  * Two modes:
- * - Custom skills (source=None): full content stored inline (body + files)
- * - Imported skills (source set): only reference stored (name, description, source, source_hash).
- * Body and files are empty/absent — resolve from skill registry at runtime.
+ * - Custom skills (registry_id=None): full content stored inline (body + files)
+ * - Registry-backed skills (registry_id set): only reference stored.
+ * Body and files are empty/absent — resolved from skill_registry table at runtime.
  */
 export type SkillDefinitionOutput = {
     /**
@@ -3897,19 +3903,25 @@ export type SkillDefinitionOutput = {
     /**
      * Body
      *
-     * SKILL.md body content (markdown). Empty for imported skills (resolve from registry).
+     * SKILL.md body content (markdown). Empty for registry-backed skills.
      */
     body?: string;
     /**
      * Files
      *
-     * Optional scripts/references/assets. Empty for imported skills.
+     * Optional scripts/references/assets. Empty for registry-backed skills.
      */
     files?: Array<SkillFileOutput>;
     /**
+     * Registry Id
+     *
+     * UUID of the skill in skill_registry table. Used for DB lookups. Null for inline custom skills.
+     */
+    registry_id?: string | null;
+    /**
      * Source
      *
-     * Registry skill ID if imported (e.g., 'vercel-labs/agent-skills/next-js-dev'). Null for custom skills.
+     * External provenance path where the skill was imported from (e.g., 'vercel-labs/agent-skills/xlsx'). Informational only.
      */
     source?: string | null;
     /**

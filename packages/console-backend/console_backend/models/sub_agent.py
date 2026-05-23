@@ -127,22 +127,24 @@ class SkillDefinition(BaseModel):
     """A standard (immutable) skill bundled with a sub-agent config version.
 
     Two modes:
-    - Custom skills (source=None): full content stored inline (body + files)
-    - Imported skills (source set): only reference stored (name, description, source, source_hash).
-      Body and files are empty/absent — resolve from skill registry at runtime.
+    - Custom skills (registry_id=None): full content stored inline (body + files)
+    - Registry-backed skills (registry_id set): only reference stored.
+      Body and files are empty/absent — resolved from skill_registry table at runtime.
     """
 
     name: str = Field(..., description="Skill identifier (lowercase, alphanumeric + hyphens)")
     description: str = Field(..., max_length=1024, description="What the skill does")
-    body: str = Field(
-        default="", description="SKILL.md body content (markdown). Empty for imported skills (resolve from registry)."
-    )
+    body: str = Field(default="", description="SKILL.md body content (markdown). Empty for registry-backed skills.")
     files: list[SkillFile] = Field(
-        default_factory=list, description="Optional scripts/references/assets. Empty for imported skills."
+        default_factory=list, description="Optional scripts/references/assets. Empty for registry-backed skills."
+    )
+    registry_id: str | None = Field(
+        default=None,
+        description="UUID of the skill in skill_registry table. Used for DB lookups. Null for inline custom skills.",
     )
     source: str | None = Field(
         default=None,
-        description="Registry skill ID if imported (e.g., 'vercel-labs/agent-skills/next-js-dev'). Null for custom skills.",
+        description="External provenance path where the skill was imported from (e.g., 'vercel-labs/agent-skills/xlsx'). Informational only.",
     )
     source_hash: str | None = Field(
         default=None,
