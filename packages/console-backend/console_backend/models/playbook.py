@@ -132,9 +132,13 @@ class McpSkillCreate(BaseModel):
     The skill is immediately usable after creation.
     """
 
-    agent_name: str | None = Field(
-        default=None,
-        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "When targeting a different agent, prefer sub_agent_id for precision since agent names "
+            "may be imprecise (missing hyphens, underscores, spelling variations)."
+        ),
     )
     scope: ActivationScope = Field(
         description="Activation scope: 'personal' (user-only), 'group' (shared with group), or 'default' (baked into sub-agent config for all users)",
@@ -160,9 +164,13 @@ class McpSkillUpdate(BaseModel):
     own activation. Other consumers' activations remain pinned.
     """
 
-    agent_name: str | None = Field(
-        default=None,
-        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "When targeting a different agent, prefer sub_agent_id for precision since agent names "
+            "may be imprecise (missing hyphens, underscores, spelling variations)."
+        ),
     )
     scope: ActivationScope = Field(
         description="Scope of the skill to update: 'personal', 'group', or 'default'",
@@ -192,9 +200,13 @@ class McpSkillRemove(BaseModel):
     for other consumers.
     """
 
-    agent_name: str | None = Field(
-        default=None,
-        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "When targeting a different agent, prefer sub_agent_id for precision since agent names "
+            "may be imprecise (missing hyphens, underscores, spelling variations)."
+        ),
     )
     scope: ActivationScope = Field(description="Scope of the skill to remove: 'personal', 'group', or 'default'")
     skill_name: str = Field(description="Skill identifier to deactivate")
@@ -211,9 +223,13 @@ class McpPlaybookUpdate(BaseModel):
     provide section_name and content. For full replacement, provide content only.
     """
 
-    agent_name: str | None = Field(
-        default=None,
-        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "When targeting a different agent, prefer sub_agent_id for precision since agent names "
+            "may be imprecise (missing hyphens, underscores, spelling variations)."
+        ),
     )
     scope: PlaybookScope = Field(description="Scope: 'personal' or 'group'")
     content: str = Field(description="Full Markdown content to write")
@@ -223,9 +239,13 @@ class McpPlaybookUpdate(BaseModel):
 class McpSkillWriteFile(BaseModel):
     """Request body for the console_write_skill_file MCP tool."""
 
-    agent_name: str | None = Field(
-        default=None,
-        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "When targeting a different agent, prefer sub_agent_id for precision since agent names "
+            "may be imprecise (missing hyphens, underscores, spelling variations)."
+        ),
     )
     scope: ActivationScope = Field(description="Scope of the skill: 'personal', 'group', or 'default'")
     skill_name: str = Field(description="Skill identifier that the file belongs to")
@@ -240,9 +260,13 @@ class McpSkillWriteFile(BaseModel):
 class McpSkillDeleteFile(BaseModel):
     """Request body for the console_delete_skill_file MCP tool."""
 
-    agent_name: str | None = Field(
-        default=None,
-        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "When targeting a different agent, prefer sub_agent_id for precision since agent names "
+            "may be imprecise (missing hyphens, underscores, spelling variations)."
+        ),
     )
     scope: ActivationScope = Field(description="Scope of the skill: 'personal', 'group', or 'default'")
     skill_name: str = Field(description="Skill identifier that the file belongs to")
@@ -270,9 +294,13 @@ class McpSkillActivate(BaseModel):
     Use this to adopt a skill created by someone else.
     """
 
-    agent_name: str | None = Field(
-        default=None,
-        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "When targeting a different agent, prefer sub_agent_id for precision since agent names "
+            "may be imprecise (missing hyphens, underscores, spelling variations)."
+        ),
     )
     registry_id: str | None = Field(default=None, description="Registry entry UUID to activate")
     skill_name: str | None = Field(

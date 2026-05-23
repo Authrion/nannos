@@ -927,9 +927,13 @@ async def apply_skill_update(
 class McpActivateSkillInput(BaseModel):
     """Input for console_activate_skill MCP tool."""
 
-    agent_name: str | None = Field(
-        default=None,
-        description="Name of the sub-agent. Auto-injected when called by a sub-agent — omit unless targeting a different agent.",
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "When targeting a different agent, prefer sub_agent_id for precision since agent names "
+            "may be imprecise (missing hyphens, underscores, spelling variations)."
+        ),
     )
     registry_id: str | None = Field(default=None, description="Registry entry UUID to activate")
     skill_name: str | None = Field(
@@ -1341,7 +1345,13 @@ class McpImportSkillInput(BaseModel):
     skill: str = Field(
         description="Skill name/directory within the repo (e.g. 'next-js-development'). If the repo IS the skill, use the repo name."
     )
-    agent_name: str = Field(description="Target sub-agent name to activate the skill for")
+    agent_name: str = Field(
+        default="self",
+        description=(
+            "Target sub-agent name. Defaults to 'self' (the calling agent). "
+            "Prefer using the exact name — agent names may have hyphens, underscores, or unexpected spelling."
+        ),
+    )
     scope: str = Field(default="personal", description="Scope: 'personal' (immediate, no approval) or 'group'")
     ref: str = Field(default="main", description="Git branch/tag/commit to fetch from")
     group_id: str | None = Field(default=None, description="Group ID (required when scope='group')")

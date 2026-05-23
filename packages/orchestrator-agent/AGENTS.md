@@ -84,9 +84,9 @@ HITL_GUARDED_TOOLS = {
 
 **Pattern**: Import and activate don't allow "edit" because there's nothing to edit (they take a registry ID, not content). Create/update/remove do allow edit because the user may want to modify what the LLM proposed.
 
-### `agent_name` Auto-Injection for Skill Tools
+### `agent_name` Default-Injection for Skill Tools
 
-Skill management tools discovered from MCP include an `agent_name` parameter. The orchestrator wraps these tools to auto-inject `"orchestrator"` as the agent name, removing it from the LLM-visible schema. This prevents the LLM from guessing/hallucinating agent names.
+Skill management tools discovered from MCP include an `agent_name` parameter. The orchestrator wraps these tools via `_wrap_tool_with_agent_name()` to **default** `agent_name` to `"orchestrator"` when the LLM omits it. Unlike sub-agents (which hard-override and hide `agent_name`), the orchestrator keeps `agent_name` visible in the schema so the LLM can specify a different target sub-agent (e.g., for `console_activate_skill`).
 
 ```python
 _SKILL_TOOLS_NEEDING_AGENT_NAME = {
@@ -96,7 +96,7 @@ _SKILL_TOOLS_NEEDING_AGENT_NAME = {
 }
 ```
 
-Sub-agents do the same wrapping with their own name (via `_wrap_with_agent_name()` in `dynamic_agent.py`).
+Sub-agents use a hard-override + schema-stripping pattern (via `_wrap_with_agent_name()` in `dynamic_agent.py`) because they always operate on themselves.
 
 ### Sandbox Integration
 

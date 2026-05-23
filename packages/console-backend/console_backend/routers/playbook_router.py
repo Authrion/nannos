@@ -842,7 +842,7 @@ _AGENT_NAME_ALIASES: dict[str, str] = {"orchestrator": "general-purpose"}
 
 def _require_agent_name(agent_name: str | None) -> str:
     """Validate that agent_name was provided (either by caller or auto-injected)."""
-    if not agent_name:
+    if not agent_name or agent_name == "self":
         raise HTTPException(
             status_code=400,
             detail="agent_name is required. Sub-agents auto-inject this; if calling directly, provide it explicitly.",

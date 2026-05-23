@@ -20,10 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 def _wrap_tool_with_agent_name(tool: Any, agent_name: str) -> Any:
-    """Wrap an MCP tool to auto-inject agent_name, hiding it from the LLM schema."""
+    """Wrap an MCP tool to default agent_name if not provided by the LLM.
+
+    The agent_name field stays visible in the schema so the orchestrator can
+    target a specific sub-agent. If the LLM omits it, it defaults to the
+    orchestrator's own name.
+    """
     from langchain_core.tools import BaseTool, StructuredTool
-    from pydantic import Field as PydanticField
-    from pydantic import create_model
 
     if not isinstance(tool, BaseTool):
         return tool
@@ -33,30 +36,14 @@ def _wrap_tool_with_agent_name(tool: Any, agent_name: str) -> Any:
         return tool
 
     async def wrapped_coroutine(**kwargs: Any) -> Any:
-        kwargs["agent_name"] = agent_name
+        if kwargs.get("agent_name") in (None, "self"):
+            kwargs["agent_name"] = agent_name
         return await original_coroutine(**kwargs)
-
-    # Rebuild schema without agent_name so the LLM doesn't see it
-    new_schema: Any = tool.args_schema
-    original_schema = tool.args_schema
-    if original_schema and isinstance(original_schema, type) and hasattr(original_schema, "model_fields"):
-        from pydantic_core import PydanticUndefined
-
-        new_fields = {}
-        for field_name, field_info in original_schema.model_fields.items():
-            if field_name == "agent_name":
-                continue
-            default = field_info.default if field_info.default is not PydanticUndefined else ...
-            new_fields[field_name] = (
-                field_info.annotation,
-                PydanticField(default=default, description=field_info.description),
-            )
-        new_schema = create_model(f"{original_schema.__name__}Wrapped", **new_fields)
 
     return StructuredTool(
         name=tool.name,
         description=tool.description,
-        args_schema=new_schema,
+        args_schema=tool.args_schema,
         coroutine=wrapped_coroutine,
         metadata=tool.metadata,
     )
@@ -276,8 +263,9 @@ def build_runtime_context(
         f"Whitelisted tools for orchestrator: {len(whitelisted_tool_names)} tools (including {len(orchestrator_auto_tools)} auto-included scheduler/console tools)"
     )
 
-    # Auto-inject agent_name="orchestrator" into skill management tools so the LLM
-    # doesn't need to guess the correct agent name.
+    # Default agent_name="orchestrator" for skill management tools so the LLM
+    # doesn't need to provide it when operating on itself. The LLM can still
+    # override agent_name to target a specific sub-agent.
     _SKILL_TOOLS_NEEDING_AGENT_NAME = {
         "console_create_skill",
         "console_update_skill",
