@@ -457,7 +457,7 @@ export class Storage {
 
   async cleanupExpiredRecords(): Promise<void> {
     await this.pool.query(SQL`SELECT cleanup_expired_records()`);
-    this.logger.debug('Cleaned up expired records');
+    this.logger.trace('Cleaned up expired records');
   }
 
   async getAllInFlightTasks(minAgeMs: number = 2 * 60 * 1000): Promise<InFlightTask[]> {

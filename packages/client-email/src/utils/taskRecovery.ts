@@ -10,6 +10,13 @@ const logger = Logger.getLogger('taskRecovery');
 
 /**
  * Recover a single orphaned task by polling A2A for its status.
+ *
+ * With streaming A2A communication, orphaned tasks only occur when:
+ * 1. The app crashes mid-stream (after task event but before stream completes)
+ * 2. A network error interrupts the stream
+ *
+ * This function polls the A2A server for the task's current status and
+ * delivers the response to the user if the task has completed.
  */
 async function recoverTask(
   task: { taskId: string; senderEmail: string; subject?: string; originalMessageId?: string; contextKey: string },
@@ -101,8 +108,10 @@ async function recoverTask(
       return true;
     }
 
-    // Still in progress — leave for webhook
-    logger.info(`Task ${taskId} still in progress (${response.state}), leaving for webhook`);
+    // Still in progress — task is actively being processed
+    // This can happen if the stream was interrupted but the task is still running.
+    // Leave it in the DB; recovery will poll again on next startup.
+    logger.info(`Task ${taskId} still in progress (${response.state}), will retry on next recovery`);
     return false;
   } catch (error) {
     logger.error(error, `Error recovering task ${taskId}`);
@@ -111,8 +120,16 @@ async function recoverTask(
 }
 
 /**
- * Recover orphaned tasks — run on startup and periodically.
- * Scans for in-flight tasks older than minAgeMs and polls A2A for status.
+ * Recover orphaned tasks — run on startup.
+ *
+ * With streaming A2A communication, tasks complete synchronously within the
+ * streaming loop. Orphaned tasks only occur when the app crashes mid-stream.
+ * This function should be called once on startup to recover any such tasks.
+ *
+ * Unlike the previous webhook-based approach, periodic polling is no longer
+ * needed since responses are delivered immediately via streaming.
+ *
+ * @param minAgeMs - Minimum age of tasks to consider orphaned (default: 2 min)
  */
 export async function recoverOrphanedTasks(
   storage: Storage,
@@ -121,18 +138,18 @@ export async function recoverOrphanedTasks(
   emailOutboundService: EmailOutboundService,
   minAgeMs: number = 2 * 60 * 1000
 ): Promise<{ recovered: number; failed: number; inProgress: number }> {
-  logger.info('Starting orphaned task recovery...');
+  logger.trace('Starting orphaned task recovery...');
   const stats = { recovered: 0, failed: 0, inProgress: 0 };
 
   try {
     const orphanedTasks = await storage.getAllInFlightTasks(minAgeMs);
 
     if (orphanedTasks.length === 0) {
-      logger.info('No orphaned tasks found');
+      logger.trace('No orphaned tasks found');
       return stats;
     }
 
-    logger.info(`Found ${orphanedTasks.length} orphaned tasks to recover`);
+    logger.debug(`Found ${orphanedTasks.length} orphaned tasks to recover`);
 
     for (const task of orphanedTasks) {
       try {

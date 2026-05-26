@@ -9,6 +9,10 @@ const logger = Logger.getLogger('a2aWebhookHandler');
 /**
  * A2A webhook callback payload structure.
  * Sent by the A2A server when a task completes.
+ *
+ * @deprecated With streaming A2A communication, webhooks are no longer the primary
+ * response mechanism. This handler is kept for backward compatibility and edge cases
+ * where streaming may fail or for tasks that exceed streaming timeout.
  */
 export interface A2AWebhookPayload {
   taskId: string;
@@ -97,6 +101,10 @@ function convertArtifacts(artifacts?: A2AWebhookPayload['artifacts']): A2AArtifa
 /**
  * Handle an A2A webhook callback.
  * Called from POST /api/v1/a2a/callback.
+ *
+ * @deprecated With streaming A2A communication, this handler is rarely needed.
+ * It's kept as a fallback for edge cases (e.g., streaming timeout, server restarts).
+ * The primary response flow now uses streaming in emailInboundService.processInboundEmail().
  */
 export async function handleA2AWebhook(
   payload: A2AWebhookPayload,

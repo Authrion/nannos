@@ -97,13 +97,16 @@ export type A2AStreamEvent =
 export type A2AStreamCallback = (event: A2AStreamEvent) => Promise<void> | void;
 
 /**
- * Create a fetch implementation that injects Bearer token authentication
+ * Create a fetch implementation that injects Bearer token authentication and A2A extensions
  */
 function createAuthenticatedFetch(accessToken: string): typeof fetch {
   return async (input, init) => {
     const headers = new Headers(init?.headers);
     headers.set('Authorization', `Bearer ${accessToken}`);
-
+    headers.set(
+      'X-A2A-Extensions',
+      'urn:nannos:a2a:activity-log:1.0, urn:nannos:a2a:work-plan:1.0, urn:nannos:a2a:feedback-request:1.0, urn:nannos:a2a:human-in-the-loop:1.0'
+    );
     return fetch(input, {
       ...init,
       headers,
@@ -232,9 +235,79 @@ export class A2AClientService {
     }
   }
 
+  private extractTextPreview(event: Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent): string | null {
+    let parts: Part[] | undefined;
+    if (event.kind === 'status-update' && event.status?.message?.parts) {
+      parts = event.status.message.parts;
+    } else if (event.kind === 'artifact-update' && event.artifact?.parts) {
+      parts = event.artifact.parts;
+    } else if (event.kind === 'message' && event.parts) {
+      parts = event.parts;
+    }
+    if (!parts) return null;
+    const text = parts.find((p): p is TextPart => p.kind === 'text')?.text;
+    return text ? text.slice(0, 100) : null;
+  }
+
+  /**
+   * Send message to A2A agent with streaming, yielding raw SDK events.
+   * The consumer is responsible for interpreting events and building the final response.
+   * This is the preferred streaming method (matches client-slack pattern).
+   */
+  async *sendMessageStreamRaw(
+    request: A2ARequest,
+    accessToken: string
+  ): AsyncGenerator<Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent> {
+    this.logger.info(`Sending streaming message to A2A server for user ${request.senderEmail}`);
+    this.logger.debug(
+      `A2A stream request details: subject=${request.subject}, contextId=${request.contextId}`
+    );
+
+    // Create client with authenticated fetch
+    const client = await A2AClient.fromCardUrl(this.agentCardUrl, {
+      fetchImpl: createAuthenticatedFetch(accessToken),
+    });
+
+    const messageId = randomUUID();
+
+    // Build message parts (text + optional files)
+    const messageParts = this.buildMessageParts(request);
+
+    // Build A2A message send params
+    const sendParams: MessageSendParams = {
+      message: {
+        messageId,
+        kind: 'message',
+        role: 'user',
+        parts: messageParts,
+        ...(request.contextId && { contextId: request.contextId }),
+      },
+      metadata: {
+        senderEmail: request.senderEmail,
+        emailSubject: request.subject,
+        model: MODELS.ClaudeSonnet45,
+        messageFormatting: 'markdown',
+      },
+    };
+
+    const stream = client.sendMessageStream(sendParams);
+
+    for await (const event of stream) {
+      const textPreview = this.extractTextPreview(event);
+      this.logger.debug(
+        { event },
+        `Stream event received: kind=${event.kind}${textPreview ? ` text="${textPreview}"` : ''}`
+      );
+      yield event;
+    }
+
+    this.logger.info(`Stream finished for user ${request.senderEmail}`);
+  }
+
   /**
    * Send message to A2A agent with streaming updates
    * Calls the callback for each event (status updates, artifacts, etc.)
+   * @deprecated Use sendMessageStreamRaw() instead for better control over event handling
    */
   async sendMessageStream(request: A2ARequest, accessToken: string, onEvent: A2AStreamCallback): Promise<A2AResponse> {
     try {

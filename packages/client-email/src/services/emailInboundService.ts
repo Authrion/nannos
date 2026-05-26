@@ -1,13 +1,15 @@
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { SNSClient, SubscribeCommand, ListSubscriptionsByTopicCommand } from '@aws-sdk/client-sns';
 import { simpleParser, ParsedMail, Attachment } from 'mailparser';
+import { Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent, TextPart, DataPart, FilePart, Artifact, Part } from '@a2a-js/sdk';
 import { Logger } from '../utils/logger.js';
 import { Config } from '../config/config.js';
 import { Storage } from '../storage/storage.js';
 import { UserAuthService } from '../services/userAuthService.js';
-import { A2AClientService, A2ARequest } from '../services/a2aClientService.js';
+import { A2AClientService, A2ARequest, A2AArtifact, A2APart } from '../services/a2aClientService.js';
 import { FileStorageService } from '../services/fileStorageService.js';
 import { EmailOutboundService, REPLY_MARKER } from '../services/emailOutboundService.js';
+import { isFinalState, isInterruptedState, getStateMessage } from '../utils/a2aWebhookHandler.js';
 import { isSupportedFileType, isFileSizeAllowed } from '../utils/fileUtils.js';
 import { randomUUID } from 'crypto';
 import * as oidcModule from 'openid-client';
@@ -317,6 +319,7 @@ export class EmailInboundService {
 
   /**
    * Main processing pipeline for an inbound email.
+   * Uses streaming A2A communication for immediate response delivery.
    * @param s3ObjectKey - Optional S3 key of the raw email (for diagnostics/tracking on inflight tasks)
    */
   async processInboundEmail(email: InboundEmail, s3ObjectKey?: string): Promise<void> {
@@ -348,77 +351,247 @@ export class EmailInboundService {
     // Resolve context (existing conversation or new)
     const contextKey = Storage.buildContextKey(senderEmail, subject);
     const existingContext = await this.storage.getContext(contextKey);
-    const contextId = existingContext?.contextId;
+    const existingContextId = existingContext?.contextId;
 
     // Upload attachments to S3
-    const fileUrls = await this.uploadAttachments(attachments, senderEmail, contextId || contextKey);
+    const fileUrls = await this.uploadAttachments(attachments, senderEmail, existingContextId || contextKey);
 
-    // Build A2A request
-    const webhookToken = randomUUID();
-    const webhookUrl = `${this.config.baseUrl}/api/v1/a2a/callback`;
-
+    // Build A2A request (no webhook needed — using streaming)
     const a2aRequest: A2ARequest = {
       senderEmail,
       subject,
       text: bodyText,
       fileUrls: fileUrls.length > 0 ? fileUrls : undefined,
-      contextId,
-      webhookUrl,
-      webhookToken,
+      contextId: existingContextId,
     };
 
-    // --- Persist-first: save in-flight task with a placeholder ID BEFORE dispatching ---
-    // This ensures that if the app crashes after A2A dispatch but before DB save,
-    // the task recovery system can still find and recover the task.
-    const placeholderTaskId = randomUUID();
-    await this.storage.saveInFlightTask({
-      taskId: placeholderTaskId,
-      contextKey,
-      contextId: contextId,
-      senderEmail,
-      subject,
-      originalMessageId: messageId,
-      webhookToken,
-      s3ObjectKey,
-    });
-    logger.info(`Saved placeholder in-flight task: ${placeholderTaskId}`);
+    // --- Stream A2A request and process events ---
+    logger.info(`Sending streaming A2A request for ${senderEmail}, contextId=${existingContextId || 'new'}`);
 
-    // Send async request to A2A server
-    logger.info(`Sending async A2A request for ${senderEmail}, contextId=${contextId || 'new'}`);
-    const response = await this.a2aClientService.sendMessageAsync(a2aRequest, accessToken);
+    let accumulatedTask: Task | null = null;
+    let accumulatedArtifacts: Artifact[] = [];
+    let taskSavedToDb = false;
 
-    if (!response.success) {
-      // Clean up the placeholder task since A2A dispatch failed
-      await this.storage.closeInFlightTask(placeholderTaskId);
-      logger.error(`A2A request failed: ${response.error}`);
+    try {
+      for await (const event of this.a2aClientService.sendMessageStreamRaw(a2aRequest, accessToken)) {
+        logger.debug(`Stream event: ${event.kind}`);
+
+        if (event.kind === 'task') {
+          // First event — save task to DB for crash recovery
+          accumulatedTask = event as Task;
+          logger.info(`Task created: id=${accumulatedTask.id}, contextId=${accumulatedTask.contextId}`);
+
+          // Save in-flight task with real ID (for crash recovery mid-stream)
+          await this.storage.saveInFlightTask({
+            taskId: accumulatedTask.id,
+            contextKey,
+            contextId: accumulatedTask.contextId,
+            senderEmail,
+            subject,
+            originalMessageId: messageId,
+            s3ObjectKey,
+          });
+          taskSavedToDb = true;
+
+          // Store context for conversation continuity
+          if (accumulatedTask.contextId) {
+            await this.storage.setContext(contextKey, accumulatedTask.contextId, {
+              taskId: accumulatedTask.id,
+              subject,
+              senderEmail,
+              originalMessageId: messageId,
+            });
+          }
+        } else if (event.kind === 'status-update') {
+          const statusEvent = event as TaskStatusUpdateEvent;
+          const state = statusEvent.status?.state || 'working';
+          logger.debug(`Status update: taskId=${statusEvent.taskId}, state=${state}`);
+
+          // Update accumulated task status
+          if (accumulatedTask) {
+            accumulatedTask.status = statusEvent.status;
+          }
+
+          // Check for HITL interrupt and extract context for email
+          if (state === 'input-required' && statusEvent.status?.message) {
+            const hitlInfo = this.extractHitlInfo(statusEvent);
+            if (hitlInfo) {
+              logger.info(`HITL interrupt detected: ${hitlInfo.summary}`);
+            }
+          }
+        } else if (event.kind === 'artifact-update') {
+          const artifactEvent = event as TaskArtifactUpdateEvent;
+          if (artifactEvent.artifact) {
+            accumulatedArtifacts.push(artifactEvent.artifact);
+            logger.debug(`Artifact received: ${artifactEvent.artifact.artifactId}`);
+
+            // Update accumulated task artifacts
+            if (accumulatedTask) {
+              if (!accumulatedTask.artifacts) accumulatedTask.artifacts = [];
+              accumulatedTask.artifacts.push(artifactEvent.artifact);
+            }
+          }
+        } else if (event.kind === 'message') {
+          // Direct message response (rare — most responses come as tasks)
+          logger.debug(`Direct message received, contextId=${event.contextId}`);
+        }
+      }
+    } catch (error) {
+      logger.error(error, `A2A stream error for ${senderEmail}`);
+
+      // Clean up in-flight task if we saved one
+      if (taskSavedToDb && accumulatedTask) {
+        await this.storage.closeInFlightTask(accumulatedTask.id).catch(() => {});
+      }
+
       await this.emailOutboundService.sendErrorNotification({
         to: senderEmail,
         subject,
-        errorMessage: response.error || 'Failed to process your request.',
+        errorMessage: 'An error occurred while processing your request. Please try again.',
         originalMessageId: messageId,
       });
       return;
     }
 
-    // Store context for conversation continuity
-    if (response.contextId) {
-      await this.storage.setContext(contextKey, response.contextId, {
-        taskId: response.taskId,
+    // --- Stream completed — send reply email ---
+    if (!accumulatedTask) {
+      logger.error(`No task received from A2A server for ${senderEmail}`);
+      await this.emailOutboundService.sendErrorNotification({
+        to: senderEmail,
         subject,
-        senderEmail,
+        errorMessage: 'No response received from the server. Please try again.',
         originalMessageId: messageId,
       });
+      return;
     }
 
-    // Update the placeholder in-flight task with the real A2A task ID
-    if (response.taskId) {
-      await this.storage.updateInFlightTaskId(placeholderTaskId, response.taskId);
-      logger.info(`In-flight task updated: ${placeholderTaskId} -> ${response.taskId}`);
+    const finalState = accumulatedTask.status?.state as
+      | 'completed'
+      | 'working'
+      | 'blocked'
+      | 'failed'
+      | 'submitted'
+      | 'canceled'
+      | 'rejected'
+      | 'input-required'
+      | 'auth-required'
+      | undefined;
+    logger.info(`Stream completed for task ${accumulatedTask.id}, state=${finalState}`);
+
+    // Send reply for final or interrupted states
+    if (isFinalState(finalState) || isInterruptedState(finalState)) {
+      // Build response message
+      let message = this.extractResponseMessage(accumulatedTask, accumulatedArtifacts);
+      if (!message) {
+        message = getStateMessage(finalState);
+      }
+
+      // Convert artifacts to our format for email attachments
+      const artifacts = this.convertArtifactsForEmail(accumulatedArtifacts);
+
+      await this.emailOutboundService.sendReply({
+        to: senderEmail,
+        subject: subject || 'A2A Response',
+        message,
+        artifacts,
+        originalMessageId: messageId,
+      });
+
+      // Close in-flight task tracking
+      await this.storage.closeInFlightTask(accumulatedTask.id);
+      logger.info(`Task ${accumulatedTask.id} completed, sent reply and closed tracking`);
     } else {
-      // No task ID returned — clean up placeholder
-      await this.storage.closeInFlightTask(placeholderTaskId);
-      logger.warn('A2A response had no taskId, cleaned up placeholder in-flight task');
+      // Task still in progress (shouldn't happen with streaming, but handle gracefully)
+      logger.warn(`Stream ended but task ${accumulatedTask.id} still in state ${finalState}`);
     }
+  }
+
+  /**
+   * Extract HITL (human-in-the-loop) info from a status update for email formatting.
+   */
+  private extractHitlInfo(
+    statusEvent: TaskStatusUpdateEvent
+  ): { summary: string; actionRequests?: unknown[] } | null {
+    if (!statusEvent.status?.message?.parts) return null;
+
+    let summary = '';
+    let actionRequests: unknown[] | undefined;
+
+    for (const part of statusEvent.status.message.parts) {
+      if (part.kind === 'text') {
+        summary += (part as TextPart).text;
+      } else if (part.kind === 'data') {
+        const data = (part as DataPart).data as Record<string, unknown>;
+        if (data?.action_requests) {
+          actionRequests = data.action_requests as unknown[];
+        }
+      }
+    }
+
+    return summary ? { summary, actionRequests } : null;
+  }
+
+  /**
+   * Extract response message text from task and artifacts.
+   */
+  private extractResponseMessage(task: Task, artifacts: Artifact[]): string {
+    // First try to extract from artifacts
+    const texts: string[] = [];
+    for (const artifact of artifacts) {
+      for (const part of artifact.parts) {
+        if (part.kind === 'text') {
+          texts.push((part as TextPart).text);
+        }
+      }
+    }
+    if (texts.length > 0) {
+      return texts.join('\n\n');
+    }
+
+    // Fall back to status message
+    if (task.status?.message?.parts) {
+      for (const part of task.status.message.parts) {
+        if (part.kind === 'text') {
+          return (part as TextPart).text;
+        }
+      }
+    }
+
+    return '';
+  }
+
+  /**
+   * Convert SDK Artifacts to A2AArtifact format for email service.
+   */
+  private convertArtifactsForEmail(artifacts: Artifact[]): A2AArtifact[] | undefined {
+    if (artifacts.length === 0) return undefined;
+
+    return artifacts.map((a) => ({
+      artifactId: a.artifactId,
+      name: a.name,
+      parts: a.parts.map((p: Part): A2APart => {
+        if (p.kind === 'text') {
+          return { kind: p.kind, text: (p as TextPart).text };
+        } else if (p.kind === 'file') {
+          const filePart = p as FilePart;
+          const fileData = filePart.file as { bytes?: string; mimeType?: string; name?: string; uri?: string };
+          return {
+            kind: p.kind,
+            data: fileData.bytes,
+            mimeType: fileData.mimeType,
+            name: fileData.name,
+            uri: fileData.uri,
+          };
+        } else if (p.kind === 'data') {
+          const dataPart = p as DataPart;
+          return {
+            kind: p.kind,
+            text: JSON.stringify(dataPart.data),
+          };
+        }
+        return { kind: (p as Part).kind };
+      }),
+    }));
   }
 
   /**

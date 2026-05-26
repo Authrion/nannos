@@ -144,34 +144,22 @@ async function main() {
     localSqsPoller.start();
   }
 
-  // Start task recovery interval (every 5 minutes, or every 15s locally)
-  const recoveryIntervalMs = config.isLocal() ? 15 * 1000 : 5 * 60 * 1000;
-  const recoveryMinAgeMs = config.isLocal() ? 5_000 : 2 * 60 * 1000;
-  const recoveryInterval = setInterval(async () => {
-    try {
-      const stats = await recoverOrphanedTasks(
-        storage,
-        a2aClientService,
-        userAuthService,
-        emailOutboundService,
-        recoveryMinAgeMs
-      );
-      if (stats.recovered > 0 || stats.failed > 0) {
-        logger.info(
-          `Task recovery: recovered=${stats.recovered}, failed=${stats.failed}, inProgress=${stats.inProgress}`
-        );
-      }
-      // Purge any rows that slipped past recovery (e.g. leaked before this fix)
-      await storage.cleanupExpiredRecords();
-    } catch (err) {
-      logger.error(err, 'Task recovery failed');
-    }
-  }, recoveryIntervalMs);
+  // --- Startup recovery ---
+  // With streaming A2A communication, tasks complete synchronously within the
+  // streaming loop. Recovery is only needed for crash scenarios:
+  // 1. Orphaned tasks: app crashed mid-stream
+  // 2. Stuck pending requests: app crashed after OAuth but before processing
+  // 3. Stuck processed emails: app crashed mid-email-processing
+  //
+  // Run once on startup; periodic recovery is no longer needed.
 
-  // Run initial recovery on startup
-  recoverOrphanedTasks(storage, a2aClientService, userAuthService, emailOutboundService).catch((err) => {
-    logger.error(err, 'Initial task recovery failed');
-  });
+  // Recover orphaned tasks (crash mid-stream)
+  const recoveryMinAgeMs = config.isLocal() ? 5_000 : 2 * 60 * 1000;
+  recoverOrphanedTasks(storage, a2aClientService, userAuthService, emailOutboundService, recoveryMinAgeMs).catch(
+    (err) => {
+      logger.error(err, 'Startup task recovery failed');
+    }
+  );
 
   // Recover pending requests stuck in 'processing' state (app crashed after claim, before delete)
   recoverStuckPendingRequests(storage, emailInboundService).catch((err) => {
@@ -183,10 +171,20 @@ async function main() {
     logger.error(err, 'Reset stuck processed emails failed');
   });
 
+  // Cleanup expired records periodically (context, inflight tasks)
+  const cleanupIntervalMs = config.isLocal() ? 60 * 1000 : 10 * 60 * 1000;
+  const cleanupInterval = setInterval(async () => {
+    try {
+      await storage.cleanupExpiredRecords();
+    } catch (err) {
+      logger.error(err, 'Cleanup expired records failed');
+    }
+  }, cleanupIntervalMs);
+
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down...`);
-    clearInterval(recoveryInterval);
+    clearInterval(cleanupInterval);
     localSqsPoller?.stop();
     server.close(() => {
       logger.info('HTTP server closed');
