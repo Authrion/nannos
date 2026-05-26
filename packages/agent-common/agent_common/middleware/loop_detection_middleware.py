@@ -92,6 +92,7 @@ class RepeatedToolCallMiddleware(AgentMiddleware[LoopDetectionState, ContextT]):
         max_repeats: int = 3,
         max_tool_repeats: int | None = None,
         window_size: int = 10,
+        force_stop_after: int = 3,
     ):
         """Initialize loop detection middleware.
 
@@ -100,15 +101,21 @@ class RepeatedToolCallMiddleware(AgentMiddleware[LoopDetectionState, ContextT]):
             max_repeats: Same tool+args threshold (default: 3)
             max_tool_repeats: Same tool threshold (default: 5)
             window_size: Sliding window size (default: 10)
+            force_stop_after: After blocking a tool this many consecutive times,
+                strip tool_calls from the AIMessage to force the graph to END.
+                This prevents infinite block-retry loops when the model ignores
+                error messages. (default: 3)
         """
         super().__init__()
         self.tool_name = tool_name
         self.max_repeats = max_repeats
         self.max_tool_repeats = max_tool_repeats
         self.window_size = window_size
+        self.force_stop_after = force_stop_after
         logger.info(
             f"RepeatedToolCallMiddleware initialized: tool_name={tool_name}, "
-            f"max_repeats={max_repeats}, max_tool_repeats={max_tool_repeats}, window_size={window_size}"
+            f"max_repeats={max_repeats}, max_tool_repeats={max_tool_repeats}, "
+            f"window_size={window_size}, force_stop_after={force_stop_after}"
         )
 
     @property
@@ -278,16 +285,49 @@ class RepeatedToolCallMiddleware(AgentMiddleware[LoopDetectionState, ContextT]):
             logger.debug(f"[LOOP DETECTION] Tracked {len(last_ai_message.tool_calls)} tool call(s)")
             return {"tool_call_history": history}
 
+        # Check if we should force-stop by stripping tool_calls from the AIMessage.
+        # This prevents the infinite block-retry loop where the model ignores error
+        # messages and keeps retrying the same tool call.
+        should_force_stop = any(
+            info["repeat_count"] - self.max_repeats >= self.force_stop_after
+            if info["loop_type"] == "same_args"
+            else info["repeat_count"] - (self.max_tool_repeats or self.max_repeats) >= self.force_stop_after
+            for info in blocked_calls
+        )
+
+        # Check if all tracked tool_calls are blocked
+        tracked_calls = [tc for tc in last_ai_message.tool_calls if self._matches_tool_filter(tc)]
+        all_tracked_blocked = len(blocked_calls) == len(tracked_calls)
+
+        if should_force_stop and all_tracked_blocked:
+            # Strip tool_calls from AIMessage by returning a modified copy with same ID.
+            # LangGraph's message reducer upserts by ID, so this replaces the original.
+            # With no tool_calls, the graph routes to END instead of tools node.
+            blocked_names = [info["tool_name"] for info in blocked_calls]
+            logger.warning(
+                f"[LOOP DETECTION] Force-stopping: {blocked_names} blocked "
+                f"{self.force_stop_after}+ consecutive times. Stripping tool_calls to end loop."
+            )
+
+            # Preserve any text content the model generated alongside the tool calls
+            modified_ai = AIMessage(
+                content=last_ai_message.content or "",
+                id=last_ai_message.id,
+                response_metadata=last_ai_message.response_metadata,
+            )
+            return {
+                "tool_call_history": history,
+                "messages": [modified_ai],
+            }
+
         # Build error ToolMessages for blocked calls (only blocked ones!)
-        # Use very strong, explicit language for GPT-4o-mini
+        # Frame as permanent failure (not rate-limiting) so models don't stubbornly retry
         error_messages = [
             ToolMessage(
                 content=(
-                    f"❌ BLOCKED: {info['description']}. "
-                    f"This tool has been called {info['repeat_count']} times and is NOT working. "
-                    f"STOP trying '{info['tool_name']}'. "
-                    f"You MUST use a completely different approach or give up. "
-                    f"Continuing to call this tool will fail."
+                    f"ERROR: '{info['tool_name']}' is unavailable — {info['description']}. "
+                    f"This resource cannot be accessed. Do NOT retry this tool. "
+                    f"You must proceed without it or use a different approach to accomplish your task."
                 ),
                 tool_call_id=info["tool_call"]["id"],
                 name=info["tool_name"],
