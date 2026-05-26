@@ -197,7 +197,6 @@ async function sendThinkingStatusMessage(
   projectId: string,
   spaceId: string,
   threadId: string,
-  userId: string,
 ) {
   const statusMessage = {
     thinking: `🧠 ${getSpinnerVerb() || 'Working'}...`,
@@ -207,10 +206,9 @@ async function sendThinkingStatusMessage(
   };
 
   try {
-    const immediateStatus = await chatService.sendPrivateTextMessage(
+    const immediateStatus = await chatService.sendTextMessage(
       projectId,
       spaceId,
-      userId,
       statusMessage.thinking,
       threadId,
     );
@@ -565,7 +563,7 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
     }
 
     // Post an immediate "Working..." message so the user sees responsiveness before the A2A server sends its first status-update event.
-    const statusMessage = await sendThinkingStatusMessage(logger, chatService, projectId, spaceId, threadId, userId);
+    const statusMessage = await sendThinkingStatusMessage(logger, chatService, projectId, spaceId, threadId);
 
     // Context management: get existing context ID for this thread if it exists, so we can include it in the A2A request and keep the conversation threaded on the server side. We will update the context store with the new context ID and last processed message ID as we receive updates from the A2A server.
     const contextKey = contextStore.buildKey(projectId, spaceId, threadId);
@@ -641,7 +639,6 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
 
     let accumulatedTask: Task | null = null;
     let feedbackRequestData: { sub_agents?: string[] } | null = null;
-    let interruptWidgetPosted = false;
     try {
       for await (const event of a2aClientService.sendMessageStream(a2aRequest, accessToken)) {
         logger.debug(`Stream event: ${_.get(event, 'kind')}`);
@@ -685,7 +682,7 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
             statusEvent.status.state === 'input-required' &&
             statusEvent.status.message?.extensions?.includes('urn:nannos:a2a:human-in-the-loop:1.0')
           ) {
-            interruptWidgetPosted = await processHumanInTheLoopEvent(
+            await processHumanInTheLoopEvent(
               logger,
               chatService,
               inFlightTaskStore,
@@ -767,13 +764,6 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
       logger.error(
         `No task information received from A2A server. Silently failing without sending a response to the user.`
       );
-      return;
-    }
-
-    // ---- Handle the response ----
-    // Skip if we already posted a custom interrupt widget (e.g. bug report)
-    if (interruptWidgetPosted) {
-      logger.info({ taskId: accumulatedTask?.id }, `Skipping handleTask — interrupt widget already posted`);
       return;
     }
 
