@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Save, Loader2, Settings as SettingsIcon, Shield, Bot, Wrench, Globe, Key, Phone, X } from 'lucide-react';
 import { toast } from 'sonner';
@@ -45,10 +45,28 @@ const tabs: Tab[] = [
   { id: 'permissions', label: 'Permissions', icon: Shield },
 ];
 
+const TAB_IDS = new Set<string>(tabs.map((t) => t.id));
+
+function getTabFromHash(): TabId {
+  const hash = window.location.hash.replace('#', '');
+  return TAB_IDS.has(hash) ? (hash as TabId) : 'preferences';
+}
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
   const availableModels = MODEL_OPTIONS;
-  const [activeTab, setActiveTab] = useState<TabId>('preferences');
+  const [activeTab, setActiveTab] = useState<TabId>(getTabFromHash);
+  const handleTabChange = useCallback((tab: TabId) => {
+    setActiveTab(tab);
+    window.location.hash = tab;
+  }, []);
+
+  useEffect(() => {
+    const onHashChange = () => setActiveTab(getTabFromHash());
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
   const [language, setLanguage] = useState<string>('en');
   const [timezone, setTimezone] = useState<string>('Europe/Zurich');
   const [customPrompt, setCustomPrompt] = useState<string>('');
@@ -233,7 +251,7 @@ export function SettingsPage() {
         {tabs.map((tab) => (
           <button
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => handleTabChange(tab.id)}
             className={`flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ${
               activeTab === tab.id
                 ? 'border-primary text-primary'

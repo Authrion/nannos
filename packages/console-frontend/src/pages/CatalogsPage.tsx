@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router';
 import { Plus, LibraryBig, Users } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
@@ -22,11 +22,29 @@ const tabs: Tab[] = [
   { id: 'accessible', label: 'Accessible', icon: Users },
 ];
 
+const TAB_IDS = new Set<string>(tabs.map((t) => t.id));
+
+function getTabFromHash(): TabId {
+  const hash = window.location.hash.replace('#', '');
+  return TAB_IDS.has(hash) ? (hash as TabId) : 'my';
+}
+
 export function CatalogsPage() {
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState<TabId>('my');
+  const [activeTab, setActiveTab] = useState<TabId>(getTabFromHash);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const { user } = useAuth();
+
+  const handleTabChange = useCallback((tab: TabId) => {
+    setActiveTab(tab);
+    window.location.hash = tab;
+  }, []);
+
+  useEffect(() => {
+    const onHashChange = () => setActiveTab(getTabFromHash());
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
 
   const { data: catalogsData } = useQuery({
     ...listCatalogsOptions(),
@@ -81,7 +99,7 @@ export function CatalogsPage() {
         {tabs.map((tab) => (
           <button
             key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => handleTabChange(tab.id)}
             className={`flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px ${
               activeTab === tab.id
                 ? 'border-primary text-primary'
