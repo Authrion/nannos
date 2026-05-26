@@ -35,6 +35,9 @@ from langgraph.errors import GraphBubbleUp
 if TYPE_CHECKING:
     from deepagents.backends.protocol import SandboxBackendProtocol
 
+    from agent_common.core.tool_risk_cache import ToolRiskCache
+    from agent_common.middleware.conditional_hitl import RiskScorerFn
+
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.backends.state import StateBackend
@@ -42,7 +45,7 @@ from deepagents.middleware import FilesystemMiddleware, SummarizationMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.summarization import compute_summarization_defaults
 from langchain.agents import create_agent
-from langchain.agents.middleware import AgentMiddleware, HumanInTheLoopMiddleware, ToolRetryMiddleware
+from langchain.agents.middleware import AgentMiddleware, ToolRetryMiddleware
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_aws.middleware.prompt_caching import BedrockPromptCachingMiddleware
 from langchain_core.language_models import BaseChatModel
@@ -168,6 +171,10 @@ def build_common_middleware_stack(
     hitl_guarded_tools: dict[str, dict] | None = None,
     sandbox_enabled: bool = False,
     sandbox_home: str | None = None,
+    risk_scorer: RiskScorerFn | None = None,
+    default_risk_threshold: float = 0.8,
+    tool_risk_cache: ToolRiskCache | None = None,
+    tool_server_map: dict[str, str] | None = None,
 ) -> list:
     """Build the common middleware stack shared by every LangGraph agent in this project.
 
@@ -225,12 +232,13 @@ def build_common_middleware_stack(
         summarization_defaults = compute_summarization_defaults(model)
         fs_cls = _FilesystemMiddlewareWithDocstoreHint if add_docstore_hint else FilesystemMiddleware
 
+        fs_middleware = fs_cls(backend=backend)
         middleware += [
             StoragePathsInstructionMiddleware(
                 sandbox_enabled=sandbox_enabled,
                 sandbox_home=sandbox_home,
             ),  # right before FilesytemMiddleware
-            fs_cls(backend=backend),
+            fs_middleware,
             ToolStatusMiddleware(),
             SummarizationMiddleware(
                 model=model,
@@ -249,10 +257,31 @@ def build_common_middleware_stack(
                 retry_on=_should_retry_tool_error,
             ),
         ]
+    else:
+        fs_middleware = None
 
-    # Add HITL middleware if guarded tools are specified
-    if hitl_guarded_tools:
-        middleware.append(HumanInTheLoopMiddleware(interrupt_on=hitl_guarded_tools))
+    # Add HITL middleware if guarded tools are specified or risk scorer is available
+    # Use ConditionalHumanInTheLoopMiddleware which supports argument-based conditions
+    # (e.g., docstore_search only interrupts when include_personal=True)
+    # and dynamic risk scoring (LLM-based scoring for unguarded tools)
+    if hitl_guarded_tools or risk_scorer:
+        from agent_common.middleware.conditional_hitl import ConditionalHumanInTheLoopMiddleware
+
+        # Extract filesystem tool instances so the risk scorer has access to their schemas
+        platform_tools: dict[str, Any] | None = None
+        if fs_middleware is not None:
+            platform_tools = {t.name: t for t in fs_middleware.tools}
+
+        middleware.append(
+            ConditionalHumanInTheLoopMiddleware(
+                interrupt_on=hitl_guarded_tools or {},
+                risk_scorer=risk_scorer,
+                default_risk_threshold=default_risk_threshold,
+                tool_risk_cache=tool_risk_cache,
+                tool_server_map=tool_server_map,
+                platform_tools=platform_tools,
+            )
+        )
 
     middleware += [
         RepeatedToolCallMiddleware(max_repeats=5, max_tool_repeats=10, window_size=10),
@@ -505,6 +534,10 @@ def build_sub_agent_graph(
     extra_tools: list | None = None,
     sandbox_enabled: bool = False,
     sandbox_home: str | None = None,
+    risk_scorer: RiskScorerFn | None = None,
+    default_risk_threshold: float = 0.8,
+    tool_risk_cache: ToolRiskCache | None = None,
+    tool_server_map: dict[str, str] | None = None,
     **kwargs: Any,
 ) -> CompiledStateGraph:
     """Build a standard deep-agent LangGraph graph.
@@ -566,6 +599,10 @@ def build_sub_agent_graph(
         hitl_guarded_tools=hitl_guarded_tools,
         sandbox_enabled=sandbox_enabled,
         sandbox_home=sandbox_home,
+        risk_scorer=risk_scorer,
+        default_risk_threshold=default_risk_threshold,
+        tool_risk_cache=tool_risk_cache,
+        tool_server_map=tool_server_map,
     )
     if extra_middlewares:
         middleware = list(extra_middlewares) + middleware

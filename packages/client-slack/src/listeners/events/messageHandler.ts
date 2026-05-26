@@ -838,22 +838,6 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
                   logger.error(err, `Failed to update in-flight task for interrupt: ${err}`);
                 });
               }
-            } else if (statusEvent.status.message?.metadata) {
-              // Legacy non-extension interrupt handling (e.g., auth_required)
-              const interruptType = (statusEvent.status.message.metadata as any).interrupt_type;
-              if (interruptType) {
-                let interruptMessage = '';
-                if (statusEvent.status.message?.parts) {
-                  for (const part of statusEvent.status.message.parts) {
-                    if (part.kind === 'text') {
-                      interruptMessage += (part as { kind: 'text'; text: string }).text;
-                    }
-                  }
-                }
-                if (interruptMessage) {
-                  await postMessage(client, channelId, threadTs, interruptMessage);
-                }
-              }
             }
           }
 

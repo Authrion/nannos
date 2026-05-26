@@ -2323,6 +2323,30 @@ export type OutboundScimTestResult = {
 export type OwnerStatus = 'active' | 'suspended' | 'deleted';
 
 /**
+ * PaginatedRiskScoresResponse
+ *
+ * Paginated response for risk scores.
+ */
+export type PaginatedRiskScoresResponse = {
+    /**
+     * Items
+     */
+    items: Array<ToolRiskScoreResponse>;
+    /**
+     * Total
+     */
+    total: number;
+    /**
+     * Limit
+     */
+    limit: number;
+    /**
+     * Offset
+     */
+    offset: number;
+};
+
+/**
  * PaginationMeta
  *
  * Pagination metadata for list responses.
@@ -5108,6 +5132,126 @@ export type SubAgentVersionApproval = {
 export type ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
 
 /**
+ * ToolBypassRuleRequest
+ *
+ * Request to set or remove a tool bypass rule.
+ */
+export type ToolBypassRuleRequest = {
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+    /**
+     * Server Slug
+     */
+    server_slug?: string;
+    /**
+     * Bypass All
+     */
+    bypass_all?: boolean | null;
+    /**
+     * Bypass Patterns
+     */
+    bypass_patterns?: {
+        [key: string]: Array<string>;
+    } | null;
+    /**
+     * Remove
+     */
+    remove?: boolean;
+};
+
+/**
+ * ToolBypassRuleResponse
+ *
+ * Response after modifying a bypass rule.
+ */
+export type ToolBypassRuleResponse = {
+    /**
+     * Tool Bypass Rules
+     */
+    tool_bypass_rules: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * ToolRiskScoreResponse
+ *
+ * Response model for a single tool risk score.
+ */
+export type ToolRiskScoreResponse = {
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+    /**
+     * Server Slug
+     */
+    server_slug: string;
+    /**
+     * Schema Hash
+     */
+    schema_hash: string;
+    /**
+     * Base Score
+     */
+    base_score: number;
+    /**
+     * Risk Factors
+     */
+    risk_factors: {
+        [key: string]: unknown;
+    };
+    /**
+     * Allowed Actions
+     */
+    allowed_actions: Array<string>;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+};
+
+/**
+ * ToolRiskScoreUpsertRequest
+ *
+ * Request model for upserting a tool risk score.
+ */
+export type ToolRiskScoreUpsertRequest = {
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+    /**
+     * Server Slug
+     */
+    server_slug: string;
+    /**
+     * Schema Hash
+     */
+    schema_hash?: string;
+    /**
+     * Base Score
+     */
+    base_score: number;
+    /**
+     * Risk Factors
+     */
+    risk_factors?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Allowed Actions
+     */
+    allowed_actions?: Array<string>;
+};
+
+/**
  * UnreadCountResponse
  *
  * Response model for unread notification count.
@@ -5762,6 +5906,12 @@ export type UserSettings = {
      */
     phone_number_override?: string | null;
     /**
+     * Tool Bypass Rules
+     */
+    tool_bypass_rules?: {
+        [key: string]: unknown;
+    };
+    /**
      * Created At
      */
     created_at?: string;
@@ -5819,6 +5969,12 @@ export type UserSettingsUpdate = {
      * Phone Number Override
      */
     phone_number_override?: string | null;
+    /**
+     * Tool Bypass Rules
+     */
+    tool_bypass_rules?: {
+        [key: string]: unknown;
+    } | null;
 };
 
 /**
@@ -6197,6 +6353,31 @@ export type UpdateCurrentUserSettingsApiV1AuthMeSettingsPatchResponses = {
 };
 
 export type UpdateCurrentUserSettingsApiV1AuthMeSettingsPatchResponse = UpdateCurrentUserSettingsApiV1AuthMeSettingsPatchResponses[keyof UpdateCurrentUserSettingsApiV1AuthMeSettingsPatchResponses];
+
+export type UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutData = {
+    body: ToolBypassRuleRequest;
+    path?: never;
+    query?: never;
+    url: '/api/v1/auth/me/settings/tool-bypass';
+};
+
+export type UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutError = UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutErrors[keyof UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutErrors];
+
+export type UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutResponses = {
+    /**
+     * Successful Response
+     */
+    200: ToolBypassRuleResponse;
+};
+
+export type UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutResponse = UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutResponses[keyof UpsertToolBypassRuleApiV1AuthMeSettingsToolBypassPutResponses];
 
 export type SendPhoneVerificationApiV1AuthMePhoneVerifyPostData = {
     body: PhoneVerificationRequest;
@@ -12030,6 +12211,133 @@ export type BulkUpdateActivationsApiV1SkillsActivationsBulkUpdatePostResponses =
 };
 
 export type BulkUpdateActivationsApiV1SkillsActivationsBulkUpdatePostResponse = BulkUpdateActivationsApiV1SkillsActivationsBulkUpdatePostResponses[keyof BulkUpdateActivationsApiV1SkillsActivationsBulkUpdatePostResponses];
+
+export type ListRiskScoresApiMcpToolsRiskScoresGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Offset
+         */
+        offset?: number;
+    };
+    url: '/api/mcp/tools/risk-scores';
+};
+
+export type ListRiskScoresApiMcpToolsRiskScoresGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ListRiskScoresApiMcpToolsRiskScoresGetError = ListRiskScoresApiMcpToolsRiskScoresGetErrors[keyof ListRiskScoresApiMcpToolsRiskScoresGetErrors];
+
+export type ListRiskScoresApiMcpToolsRiskScoresGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: PaginatedRiskScoresResponse;
+};
+
+export type ListRiskScoresApiMcpToolsRiskScoresGetResponse = ListRiskScoresApiMcpToolsRiskScoresGetResponses[keyof ListRiskScoresApiMcpToolsRiskScoresGetResponses];
+
+export type UpsertRiskScoreApiMcpToolsRiskScoresPutData = {
+    body: ToolRiskScoreUpsertRequest;
+    path?: never;
+    query?: never;
+    url: '/api/mcp/tools/risk-scores';
+};
+
+export type UpsertRiskScoreApiMcpToolsRiskScoresPutErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type UpsertRiskScoreApiMcpToolsRiskScoresPutError = UpsertRiskScoreApiMcpToolsRiskScoresPutErrors[keyof UpsertRiskScoreApiMcpToolsRiskScoresPutErrors];
+
+export type UpsertRiskScoreApiMcpToolsRiskScoresPutResponses = {
+    /**
+     * Successful Response
+     */
+    200: ToolRiskScoreResponse;
+};
+
+export type UpsertRiskScoreApiMcpToolsRiskScoresPutResponse = UpsertRiskScoreApiMcpToolsRiskScoresPutResponses[keyof UpsertRiskScoreApiMcpToolsRiskScoresPutResponses];
+
+export type DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteData = {
+    body?: never;
+    path: {
+        /**
+         * Tool Name
+         */
+        tool_name: string;
+        /**
+         * Server Slug
+         */
+        server_slug: string;
+    };
+    query?: never;
+    url: '/api/mcp/tools/risk-scores/{tool_name}/{server_slug}';
+};
+
+export type DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteError = DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteErrors[keyof DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteErrors];
+
+export type DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteResponses = {
+    /**
+     * Successful Response
+     */
+    204: void;
+};
+
+export type DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteResponse = DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteResponses[keyof DeleteRiskScoreApiMcpToolsRiskScoresToolNameServerSlugDeleteResponses];
+
+export type GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetData = {
+    body?: never;
+    path: {
+        /**
+         * Tool Name
+         */
+        tool_name: string;
+        /**
+         * Server Slug
+         */
+        server_slug: string;
+    };
+    query?: never;
+    url: '/api/mcp/tools/risk-scores/{tool_name}/{server_slug}';
+};
+
+export type GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetError = GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetErrors[keyof GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetErrors];
+
+export type GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: ToolRiskScoreResponse;
+};
+
+export type GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetResponse = GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetResponses[keyof GetRiskScoreApiMcpToolsRiskScoresToolNameServerSlugGetResponses];
 
 export type ListScimTokensApiV1AdminScimTokensGetData = {
     body?: never;

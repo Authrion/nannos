@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from agent_common.core.sandbox_pool import SandboxPool
+    from agent_common.core.tool_risk_cache import ToolRiskCache
+    from agent_common.middleware.conditional_hitl import RiskScorerFn
 
 from agent_common.utils import (  # noqa: F401
     LANGUAGE_NAMES,
@@ -17,6 +19,13 @@ from agent_common.utils import (  # noqa: F401
 from app.models.config import AgentSettings, UserConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _get_risk_scorer() -> RiskScorerFn:
+    """Get the risk scorer function from agent-common (lazy import)."""
+    from agent_common.core.tool_risk_scorer import score_tool_risk
+
+    return score_tool_risk
 
 
 def _wrap_tool_with_agent_name(tool: Any, agent_name: str) -> Any:
@@ -63,6 +72,7 @@ def build_runtime_context(
     backend_url: str | None = None,
     task_scheduler_graph_provider: Any = None,
     sandbox_pool: SandboxPool | None = None,
+    tool_risk_cache: ToolRiskCache | None = None,
 ) -> Any:  # GraphRuntimeContext
     """Build GraphRuntimeContext from user config and orchestrator dependencies.
 
@@ -415,6 +425,10 @@ def build_runtime_context(
                         sandbox_pool=sandbox_pool if getattr(config, "sandbox_enabled", False) else None,
                         extra_middlewares=gp_extra_middlewares,
                         inject_all_tools=gp_inject_all_tools,
+                        risk_scorer=_get_risk_scorer(),
+                        tool_risk_cache=tool_risk_cache,
+                        tool_bypass_rules=user_config.tool_bypass_rules,
+                        pending_bypass_rules=user_config._pending_bypass_rules,  # will be updated during execution if user approves any bypasses
                     )
                     # Log if sandbox_enabled but no pool configured
                     if getattr(config, "sandbox_enabled", False) and not sandbox_pool:
@@ -440,6 +454,16 @@ def build_runtime_context(
 
     logger.debug(f"Tool registry contains {len(tool_registry)} total tools")
 
+    # Build tool_server_map from tool metadata (tool_name -> server_slug)
+    tool_server_map: dict[str, str] = {}
+    for tool_name, tool in tool_registry.items():
+        metadata = getattr(tool, "metadata", None)
+        if metadata and isinstance(metadata, dict):
+            server_name = metadata.get("server_name")
+            if server_name:
+                tool_server_map[tool_name] = server_name
+        # In-process tools without server_name fall back to "_self" in middleware
+
     context = GraphRuntimeContext(
         user_id=user_config.user_id,  # Database ID (stable)
         user_sub=user_config.user_sub,  # OIDC sub (current)
@@ -454,6 +478,10 @@ def build_runtime_context(
         tool_registry=tool_registry,
         subagent_registry=subagent_registry,
         whitelisted_tool_names=whitelisted_tool_names,
+        tool_risk_cache=tool_risk_cache,
+        tool_bypass_rules=user_config.tool_bypass_rules,
+        tool_server_map=tool_server_map,
+        user_system_role=user_config.user_system_role,
     )
 
     return context

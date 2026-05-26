@@ -242,6 +242,61 @@ def require_admin(request: Request) -> User:
     return user
 
 
+async def require_admin_or_orchestrator(request: Request, db: DbSession) -> User:
+    """Dependency allowing admin users OR the orchestrator service to proceed.
+
+    Accepts:
+    1. Admin user with admin mode enabled (same as require_admin)
+    2. Bearer token with azp matching the orchestrator client_id (service call)
+
+    Used for system-level write operations that are triggered by the orchestrator
+    service on behalf of the platform (e.g., persisting LLM-generated risk scores).
+
+    For orchestrator service calls, returns a synthetic User object (not persisted)
+    with the token's sub claim for audit trail purposes.
+
+    Raises HTTPException 401 if not authenticated.
+    Raises HTTPException 403 if neither admin nor orchestrator.
+    """
+    # Check if orchestrator service call (by azp claim)
+    client_id = await get_client_id_from_request(request)
+    orchestrator_client_id = config.orchestrator.client_id
+    if client_id and orchestrator_client_id and client_id == orchestrator_client_id:
+        # Orchestrator service — return synthetic user for audit (don't auto-onboard)
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.split(" ", 1)[1] if auth_header.startswith("Bearer ") else ""
+        sub = ""
+        if token:
+            try:
+                validator = JWTValidator(issuer=config.oidc.issuer)
+                payload = await validator.validate(token)
+                sub = payload.get("sub", "")
+            except JWTValidationError:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid token",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return User(
+            id=f"service:{client_id}",
+            sub=sub or f"service:{client_id}",
+            email=f"{client_id}@service.internal",
+            first_name="Orchestrator",
+            last_name="Service",
+            is_administrator=True,
+            role=UserRole.ADMIN,
+        )
+
+    # Fall back to admin check
+    user = await require_auth_or_bearer_token(request, db)
+    if not user.is_administrator:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions: requires admin or orchestrator service",
+        )
+    return user
+
+
 def is_admin_mode(request: Request, user: User) -> bool:
     """Check if effective admin mode is active for a user.
 

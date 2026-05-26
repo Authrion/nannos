@@ -22,13 +22,13 @@ if TYPE_CHECKING:
     from agent_common.core.sandbox_pool import SandboxPool
 
 from a2a.types import Part, TaskState
-from object_storage import get_object_storage_service
 from agent_common.models.base import DEFAULT_MODEL, DEFAULT_THINKING_LEVEL, ModelType, ThinkingLevel
 from langchain.messages import HumanMessage
 from langchain_core.messages import AIMessageChunk
 from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
+from object_storage import get_object_storage_service
 from ringier_a2a_sdk.oauth import OidcOAuth2Client
 from ringier_a2a_sdk.utils.streaming import (
     StreamBuffer,
@@ -191,6 +191,7 @@ class OrchestratorDeepAgent:
             backend_url=backend_url,
             task_scheduler_graph_provider=self._graph_factory.get_task_scheduler_graph,
             sandbox_pool=sandbox_pool,
+            tool_risk_cache=getattr(self, "tool_risk_cache", None),
         )
 
     async def get_or_create_graph(
@@ -510,6 +511,12 @@ class OrchestratorDeepAgent:
                     metadata={"streaming_chunk": True},
                 )
 
+            # Propagate pending bypass rules from runtime context to user_config
+            # so the executor can persist them after the turn completes.
+            pending_bypass = getattr(runtime_context, "_pending_bypass_rules", None)
+            if pending_bypass:
+                user_config._pending_bypass_rules = pending_bypass
+
             logger.debug("===== STREAM PROCESSING COMPLETE =====")
             logger.debug(f"Total chunks processed: {chunk_count}")
 
@@ -542,6 +549,7 @@ class OrchestratorDeepAgent:
 
                     # Detect HumanInTheLoopMiddleware interrupts (HITLRequest format)
                     action_requests = interrupt_value_dict.get("action_requests")
+                    review_configs = interrupt_value_dict.get("review_configs")
                     if action_requests and isinstance(action_requests, list):
                         # HITL interrupt — extract tool name and args for metadata
                         tool_names = [ar.get("name") for ar in action_requests if isinstance(ar, dict)]
@@ -558,11 +566,8 @@ class OrchestratorDeepAgent:
                                 content=content or "Bug report requires your confirmation.",
                                 interrupt_reason=reason,
                                 pending_nodes=list(final_state.next) if hasattr(final_state, "next") else None,
-                                metadata={
-                                    "interrupt_type": "bug_report",
-                                    "interrupt_reason": reason,
-                                    "action_requests": action_requests,
-                                },
+                                action_requests=action_requests,
+                                review_configs=review_configs,
                             )
                         else:
                             # Generic HITL interrupt for other tools
@@ -571,10 +576,8 @@ class OrchestratorDeepAgent:
                                 state=TaskState.input_required,
                                 content=description or "Tool execution requires approval.",
                                 pending_nodes=list(final_state.next) if hasattr(final_state, "next") else None,
-                                metadata={
-                                    "interrupt_type": "hitl_approval",
-                                    "action_requests": action_requests,
-                                },
+                                action_requests=action_requests,
+                                review_configs=review_configs,
                             )
                     else:
                         # Standard interrupt (file permissions, custom interrupts, etc.)
@@ -585,15 +588,6 @@ class OrchestratorDeepAgent:
                             ),
                             interrupt_reason=interrupt_value_dict.get("reason", "graph_interrupted"),
                             pending_nodes=list(final_state.next) if hasattr(final_state, "next") else None,
-                            metadata={
-                                k: v
-                                for k, v in {
-                                    "interrupt_type": interrupt_value_dict.get("type"),
-                                    "interrupt_reason": interrupt_value_dict.get("reason"),
-                                }.items()
-                                if v is not None
-                            }
-                            or None,
                         )
                 return
             if hasattr(final_state, "next") and final_state.next:

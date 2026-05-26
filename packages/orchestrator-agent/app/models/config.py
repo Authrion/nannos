@@ -13,13 +13,15 @@ from agent_common.a2a.models import LocalSubAgentConfig
 from agent_common.models.base import ModelType, ThinkingLevel
 from deepagents import CompiledSubAgent
 from langchain_core.messages import ContentBlock
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr
 
 logger = logging.getLogger(__name__)
 
 # Message formatting literal for type safety
 
 if TYPE_CHECKING:
+    from agent_common.core.tool_risk_cache import ToolRiskCache
+    from agent_common.middleware.conditional_hitl import BypassRule
     from langchain_core.tools import BaseTool
 
 
@@ -131,6 +133,41 @@ class GraphRuntimeContext:
     Sub-agents receive the exact original URIs without any LLM round-trip.
     """
 
+    tool_risk_cache: ToolRiskCache | None = None
+    """Shared ToolRiskCache instance for dynamic HITL risk scoring.
+
+    Process-level singleton passed to all runtime contexts. The middleware
+    reads from this cache during aafter_model to decide whether to interrupt.
+    """
+
+    tool_bypass_rules: dict[str, BypassRule] = field(default_factory=dict)
+    """User's per-tool bypass rules for HITL risk scoring.
+
+    Format: {"tool_name::server_slug": {"bypass_all": true} | {"bypass_patterns": {...}}}
+    Loaded from user_settings.tool_bypass_rules at context build time.
+    """
+
+    tool_server_map: dict[str, str] = field(default_factory=dict)
+    """Mapping of tool_name -> server_slug for MCP tools.
+
+    Built during tool discovery. Used by the HITL middleware to resolve
+    which MCP server a tool belongs to for cache key construction.
+    """
+
+    user_system_role: str = "member"
+    """User's system role (member, approver, admin).
+
+    Used for role-based risk threshold adjustment. Admins get a higher
+    threshold (fewer interrupts) since they have elevated trust.
+    """
+
+    risk_threshold: float | None = None
+    """Per-user risk threshold override (0.0-1.0).
+
+    If set, overrides the default threshold from the middleware.
+    Allows admins to set a higher threshold for experienced users.
+    """
+
     @property
     def tools(self) -> list["BaseTool"]:
         """Get list of all tools available to this user."""
@@ -221,6 +258,17 @@ class UserConfig(BaseModel):
         default=None,
         description="Catalog IDs the user has read access to (for catalog_search tool)",
     )
+    user_system_role: str = Field(
+        default="member",
+        description="User's system role (member, approver, admin) for role-based risk threshold",
+    )
+    tool_bypass_rules: dict[str, Any] = Field(
+        default_factory=dict,
+        description="User's per-tool HITL bypass rules from settings",
+    )
+
+    # Private attribute for pending bypass rules accumulated during a turn
+    _pending_bypass_rules: list[dict[str, Any]] = PrivateAttr(default_factory=list)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

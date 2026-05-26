@@ -7,6 +7,7 @@ providing a clean interface for agent-client communication.
 from typing import Any, List, Optional
 
 from a2a.types import TaskState
+from langchain.agents.middleware.human_in_the_loop import ActionRequest, ReviewConfig
 from pydantic import Field
 from ringier_a2a_sdk import BaseAgentStreamResponse
 
@@ -20,6 +21,8 @@ class AgentStreamResponse(BaseAgentStreamResponse):
     Additional Attributes:
         interrupt_reason: Reason for interruption (e.g., 'graph_interrupted', 'auth_required')
         pending_nodes: List of pending graph nodes (for graph interruptions)
+        action_requests: HITL action requests from ConditionalHumanInTheLoopMiddleware
+        review_configs: HITL review configs specifying allowed decisions per action
     """
 
     interrupt_reason: Optional[str] = Field(
@@ -27,6 +30,12 @@ class AgentStreamResponse(BaseAgentStreamResponse):
     )
     pending_nodes: Optional[List[str]] = Field(
         default=None, description="List of pending graph nodes (for graph interruptions)"
+    )
+    action_requests: Optional[List[ActionRequest]] = Field(
+        default=None, description="HITL action requests requiring human review"
+    )
+    review_configs: Optional[List[ReviewConfig]] = Field(
+        default=None, description="Review policies specifying allowed decisions per action"
     )
 
     @classmethod

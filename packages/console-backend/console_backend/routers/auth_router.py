@@ -261,6 +261,9 @@ async def update_current_user_settings(
         phone_number_override=update_request.phone_number_override
         if "phone_number_override" in update_request.model_fields_set
         else _UNSET,
+        tool_bypass_rules=update_request.tool_bypass_rules
+        if "tool_bypass_rules" in update_request.model_fields_set
+        else _UNSET,
     )
     await db.commit()
 
@@ -273,6 +276,63 @@ async def update_current_user_settings(
             # Non-blocking: log but don't fail the request
 
     return UserSettingsResponse(data=settings)
+
+
+class ToolBypassRuleRequest(BaseModel):
+    """Request to set or remove a tool bypass rule."""
+
+    tool_name: str
+    server_slug: str = "_self"
+    bypass_all: bool | None = None
+    bypass_patterns: dict[str, list[str]] | None = None
+    remove: bool = False
+
+
+class ToolBypassRuleResponse(BaseModel):
+    """Response after modifying a bypass rule."""
+
+    tool_bypass_rules: dict
+
+
+@router.put("/me/settings/tool-bypass", response_model=ToolBypassRuleResponse)
+async def upsert_tool_bypass_rule(
+    body: ToolBypassRuleRequest,
+    request: Request,
+    db: DbSession,
+    user: User = Depends(require_auth_or_bearer_token),
+) -> ToolBypassRuleResponse:
+    """Set or remove a tool bypass rule for the current user.
+
+    Used by the orchestrator after a user approves with "don't ask again".
+    Also used by the frontend settings page to manage bypass rules.
+    """
+    user_settings_service = get_user_settings_service(request)
+    settings = await user_settings_service.get_settings(db, user.id)
+
+    rules: dict = dict(settings.tool_bypass_rules)
+    key = f"{body.tool_name}::{body.server_slug}"
+
+    if body.remove:
+        rules.pop(key, None)
+    elif body.bypass_all:
+        rules[key] = {"bypass_all": True}
+    elif body.bypass_patterns:
+        existing = rules.get(key, {})
+        existing_patterns: dict = existing.get("bypass_patterns", {}) if isinstance(existing, dict) else {}
+        # Merge new patterns into existing
+        for param, patterns in body.bypass_patterns.items():
+            current = set(existing_patterns.get(param, []))
+            current.update(patterns)
+            existing_patterns[param] = sorted(current)
+        rules[key] = {"bypass_patterns": existing_patterns}
+    else:
+        # No bypass_all and no bypass_patterns — treat as bypass_all
+        rules[key] = {"bypass_all": True}
+
+    await user_settings_service.upsert_settings(db, user.id, tool_bypass_rules=rules)
+    await db.commit()
+
+    return ToolBypassRuleResponse(tool_bypass_rules=rules)
 
 
 @router.post("/me/phone/verify")

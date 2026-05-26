@@ -140,6 +140,34 @@ def create_lifespan(agent_executor: OrchestratorDeepAgentExecutor):
         else:
             app.state.sandbox_pool = None
 
+        # Initialize tool risk cache for dynamic HITL scoring
+        tool_risk_cache: ToolRiskCache | None = None
+        try:
+            from agent_common.core.tool_risk_cache import ToolRiskCache
+
+            from app.core.risk_score_api_client import HttpRiskScoreAPIClient
+
+            backend_url_for_cache = os.getenv("CONSOLE_BACKEND_URL", "http://localhost:5001")
+            risk_api_client = HttpRiskScoreAPIClient(
+                base_url=backend_url_for_cache,
+                oauth2_client=agent_executor.agent.oauth2_client,
+                audience=os.getenv("CONSOLE_BACKEND_CLIENT_ID", "agent-console"),
+            )
+
+            tool_risk_cache = ToolRiskCache()
+            # Start cache with API client for DB persistence and periodic refresh.
+            # Initial load may return empty if no token is available yet (first request
+            # will populate via LLM scoring + write-through).
+            await tool_risk_cache.start(risk_api_client)
+
+            app.state.tool_risk_cache = tool_risk_cache
+            app.state.risk_api_client = risk_api_client
+            agent_executor.agent.tool_risk_cache = tool_risk_cache
+            logger.info("Tool risk cache initialized with API client")
+        except Exception as e:
+            logger.warning("Failed to initialize tool risk cache: %s", e)
+            app.state.tool_risk_cache = None
+
         logger.info("Application startup complete")
 
         yield  # Application runs here
@@ -152,6 +180,12 @@ def create_lifespan(agent_executor: OrchestratorDeepAgentExecutor):
         # Shutdown sandbox pool
         if sandbox_pool:
             await sandbox_pool.shutdown()
+
+        # Shutdown tool risk cache and API client
+        if tool_risk_cache:
+            await tool_risk_cache.stop()
+        if hasattr(app.state, "risk_api_client") and app.state.risk_api_client:
+            await app.state.risk_api_client.close()
 
         # Close agent (includes cost logger and database connection pool cleanup)
         await agent_executor.agent.close()

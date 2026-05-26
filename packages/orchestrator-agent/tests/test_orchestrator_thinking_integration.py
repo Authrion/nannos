@@ -71,6 +71,8 @@ class TestOrchestratorThinkingConfig:
         mock_user.catalog_ids = []
         mock_user.enable_thinking = True
         mock_user.thinking_level = "high"
+        mock_user.system_role = "member"
+        mock_user.tool_bypass_rules = {}
 
         with patch.object(executor.registry_service, "get_user", return_value=mock_user):
             # Build user config - updated signature requires user object
@@ -118,6 +120,8 @@ class TestOrchestratorThinkingConfig:
         mock_user.catalog_ids = []
         mock_user.enable_thinking = True
         mock_user.thinking_level = "low"  # User preference is "low"
+        mock_user.system_role = "member"
+        mock_user.tool_bypass_rules = {}
 
         with patch.object(executor.registry_service, "get_user", return_value=mock_user):
             # Build user config with metadata override - updated signature
@@ -151,8 +155,9 @@ class TestGraphCreationWithThinking:
 
         agent = OrchestratorDeepAgent()
 
-        with patch("langgraph_checkpoint_aws.DynamoDBSaver"), patch(
-            "app.core.graph_factory._has_aws_credentials", return_value=True
+        with (
+            patch("langgraph_checkpoint_aws.DynamoDBSaver"),
+            patch("app.core.graph_factory._has_aws_credentials", return_value=True),
         ):
             with patch.object(agent, "_graph_factory") as mock_factory:
                 mock_graph = Mock()
@@ -191,8 +196,9 @@ class TestGraphCreationWithThinking:
         mock_config.BACKOFF_FACTOR = 2
         mock_config.get_bedrock_region.return_value = "eu-central-1"
 
-        with patch("langgraph_checkpoint_aws.DynamoDBSaver"), patch(
-            "app.core.graph_factory._has_aws_credentials", return_value=True
+        with (
+            patch("langgraph_checkpoint_aws.DynamoDBSaver"),
+            patch("app.core.graph_factory._has_aws_credentials", return_value=True),
         ):
             with patch("agent_common.core.cost_tracking_embeddings.CostTrackingBedrockEmbeddings"):
                 with patch("app.core.graph_factory.create_deep_agent") as mock_create_deep_agent:
@@ -241,6 +247,8 @@ class TestExecutorThinkingFlow:
         mock_user.enable_thinking = True
         mock_user.thinking_level = "medium"
         mock_user.preferred_model = "claude-sonnet-4.5"
+        mock_user.system_role = "member"
+        mock_user.tool_bypass_rules = {}
 
         with patch.object(executor.registry_service, "get_user", return_value=mock_user):
             with patch.object(executor.agent, "get_or_create_graph") as mock_get_graph:
