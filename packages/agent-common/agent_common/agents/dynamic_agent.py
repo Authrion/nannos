@@ -80,6 +80,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Sub-agent recursion limit — prevents runaway loops when the model ignores
+# tool errors and keeps retrying.  Mirrors the orchestrator's MAX_RECURSION_LIMIT.
+_SUB_AGENT_RECURSION_LIMIT = int(
+    os.getenv(
+        "SUB_AGENT_RECURSION_LIMIT",
+        os.getenv("MAX_RECURSION_LIMIT", "75"),
+    )
+)
+
 
 def _validate_tool_schema(tool: BaseTool) -> BaseTool:
     """Validate and fix MCP tool schema for OpenAI API compatibility.
@@ -468,10 +477,10 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             "- The user explicitly said not to remember something\n"
             "- The interaction was routine with no new insights\n\n"
             "### CRITICAL: Act, Don't Just Acknowledge\n"
-            "When the user gives you feedback like \"improve\", \"do better next time\", "
-            "\"remember this\", or corrects your behavior:\n"
+            'When the user gives you feedback like "improve", "do better next time", '
+            '"remember this", or corrects your behavior:\n'
             "- **DO** immediately use console_update_playbook or console_create_skill to persist the learning\n"
-            "- **DO NOT** merely say \"next time I'll...\" or \"I'll remember that\" — verbal promises are worthless\n"
+            '- **DO NOT** merely say "next time I\'ll..." or "I\'ll remember that" — verbal promises are worthless\n'
             "- If you don't persist the improvement with a tool call, you WILL repeat the same mistake\n"
             "- Treat any behavioral correction as a signal to update your playbook NOW\n\n"
             "### Multi-File Skills\n"
@@ -876,7 +885,8 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
                 if isinstance(s, dict):
                     files = [
                         AgentSkillFile(path=f["path"], content=f.get("content", ""), encoding=f.get("encoding"))
-                        if isinstance(f, dict) else f
+                        if isinstance(f, dict)
+                        else f
                         for f in s.get("files", [])
                     ]
                     return AgentSkillDef(
@@ -1017,7 +1027,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             extra_tools=extra_tools,
             sandbox_enabled=sandbox_enabled,
             sandbox_home=sandbox_home,
-        )
+        ).with_config({"recursion_limit": _SUB_AGENT_RECURSION_LIMIT})
 
     async def _astream_impl(self, input_data: SubAgentInput, config: Dict[str, Any]) -> AsyncIterable[StreamEvent]:
         """Stream dynamic agent execution with real-time status updates and content.
