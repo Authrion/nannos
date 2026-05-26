@@ -91,6 +91,7 @@ class TestDynamicLocalAgentRunnable:
 
         # Mock create_agent to return a mock graph
         mock_graph = AsyncMock()
+        mock_graph.with_config = MagicMock(return_value=mock_graph)
         mock_graph.ainvoke = AsyncMock(
             return_value={
                 "messages": [MagicMock(content="Test response")],
@@ -109,6 +110,7 @@ class TestDynamicLocalAgentRunnable:
         runnable = DynamicLocalAgentRunnable(config=basic_config, model=mock_model)
 
         mock_graph = AsyncMock()
+        mock_graph.with_config = MagicMock(return_value=mock_graph)
 
         async def empty_stream(*args, **kwargs):
             return
@@ -153,6 +155,7 @@ class TestDynamicLocalAgentRunnable:
         runnable = DynamicLocalAgentRunnable(config=basic_config, model=mock_model)
 
         mock_graph = AsyncMock()
+        mock_graph.with_config = MagicMock(return_value=mock_graph)
 
         async def empty_stream(*args, **kwargs):
             return
@@ -226,6 +229,7 @@ class TestDynamicLocalAgentRunnable:
         runnable = DynamicLocalAgentRunnable(config=basic_config, model=mock_model)
 
         mock_graph = AsyncMock()
+        mock_graph.with_config = MagicMock(return_value=mock_graph)
 
         async def empty_stream(*args, **kwargs):
             return
@@ -271,6 +275,7 @@ class TestDynamicLocalAgentRunnable:
         runnable = DynamicLocalAgentRunnable(config=basic_config, model=mock_model)
 
         mock_graph = AsyncMock()
+        mock_graph.with_config = MagicMock(return_value=mock_graph)
 
         async def empty_stream(*args, **kwargs):
             return

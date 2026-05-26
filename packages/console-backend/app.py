@@ -248,6 +248,20 @@ app = FastAPI(
     openapi_url="/api/v1/openapi.json",
 )
 
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Log all unhandled exceptions that would otherwise produce a silent 500."""
+    logger.error(
+        "Unhandled exception on %s %s: %s",
+        request.method,
+        request.url.path,
+        exc,
+        exc_info=exc,
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+
 # Add ProxyHeadersMiddleware to properly handle X-Forwarded-* headers from load balancers
 # This ensures request.url_for generates URLs with the correct scheme (https) when behind a proxy
 if not config.is_local():

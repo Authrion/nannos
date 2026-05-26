@@ -1,4 +1,5 @@
 {
+    "jest.enable": false,
     "search.useIgnoreFiles": false,
     "search.exclude": {
         "**/node_modules": true,

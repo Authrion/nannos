@@ -281,3 +281,73 @@ class TestEdgeCases:
 
         assert is_loop is True
         assert count == 3
+
+
+class TestForceStop:
+    """Test force-stop behavior that strips tool_calls from AIMessage."""
+
+    @pytest.mark.asyncio
+    async def test_force_stop_strips_tool_calls_after_threshold(self):
+        """After force_stop_after consecutive blocks, tool_calls are stripped from AIMessage."""
+        from langchain_core.messages import AIMessage
+
+        middleware = RepeatedToolCallMiddleware(max_repeats=3, force_stop_after=2, window_size=20)
+
+        # Simulate history where tool has been called 5 times with same args
+        # (3 allowed + 2 blocked = exceeds force_stop_after=2)
+        args_hash = middleware._hash_args({"path": "/file.txt"})
+        tool_history = [args_hash] * 5
+
+        ai_message = AIMessage(
+            content="",
+            id="msg-123",
+            tool_calls=[{"name": "read_personal_file", "args": {"path": "/file.txt"}, "id": "tc-1"}],
+        )
+
+        state = {
+            "messages": [ai_message],
+            "tool_call_history": {"read_personal_file": tool_history},
+        }
+
+        result = await middleware.aafter_model(state, MagicMock())
+
+        assert result is not None
+        # Should return a modified AIMessage (same ID, no tool_calls)
+        assert "messages" in result
+        modified_msg = result["messages"][0]
+        assert isinstance(modified_msg, AIMessage)
+        assert modified_msg.id == "msg-123"
+        assert modified_msg.tool_calls == []
+
+    @pytest.mark.asyncio
+    async def test_no_force_stop_below_threshold(self):
+        """Below force_stop_after threshold, returns error ToolMessages (not force-stop)."""
+        from langchain_core.messages import AIMessage
+
+        middleware = RepeatedToolCallMiddleware(max_repeats=3, force_stop_after=3, window_size=20)
+
+        # 4 calls = 1 block (just past max_repeats=3), not enough for force_stop_after=3
+        args_hash = middleware._hash_args({"path": "/file.txt"})
+        tool_history = [args_hash] * 3
+
+        ai_message = AIMessage(
+            content="",
+            id="msg-456",
+            tool_calls=[{"name": "read_personal_file", "args": {"path": "/file.txt"}, "id": "tc-2"}],
+        )
+
+        state = {
+            "messages": [ai_message],
+            "tool_call_history": {"read_personal_file": tool_history},
+        }
+
+        result = await middleware.aafter_model(state, MagicMock())
+
+        assert result is not None
+        # Should return error ToolMessage, NOT a modified AIMessage
+        from langchain_core.messages import ToolMessage
+
+        assert "messages" in result
+        assert len(result["messages"]) == 1
+        assert isinstance(result["messages"][0], ToolMessage)
+        assert result["messages"][0].status == "error"

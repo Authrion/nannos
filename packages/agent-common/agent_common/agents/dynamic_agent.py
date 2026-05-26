@@ -80,6 +80,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Sub-agent recursion limit — prevents runaway loops when the model ignores
+# tool errors and keeps retrying.  Mirrors the orchestrator's MAX_RECURSION_LIMIT.
+_SUB_AGENT_RECURSION_LIMIT = int(
+    os.getenv(
+        "SUB_AGENT_RECURSION_LIMIT",
+        os.getenv("MAX_RECURSION_LIMIT", "75"),
+    )
+)
+
 
 def _validate_tool_schema(tool: BaseTool) -> BaseTool:
     """Validate and fix MCP tool schema for OpenAI API compatibility.
@@ -468,10 +477,10 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             "- The user explicitly said not to remember something\n"
             "- The interaction was routine with no new insights\n\n"
             "### CRITICAL: Act, Don't Just Acknowledge\n"
-            "When the user gives you feedback like \"improve\", \"do better next time\", "
-            "\"remember this\", or corrects your behavior:\n"
+            'When the user gives you feedback like "improve", "do better next time", '
+            '"remember this", or corrects your behavior:\n'
             "- **DO** immediately use console_update_playbook or console_create_skill to persist the learning\n"
-            "- **DO NOT** merely say \"next time I'll...\" or \"I'll remember that\" — verbal promises are worthless\n"
+            '- **DO NOT** merely say "next time I\'ll..." or "I\'ll remember that" — verbal promises are worthless\n'
             "- If you don't persist the improvement with a tool call, you WILL repeat the same mistake\n"
             "- Treat any behavioral correction as a signal to update your playbook NOW\n\n"
             "### Multi-File Skills\n"
@@ -868,17 +877,29 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         if self.store and self.user_id:
             from agent_common.core.skills_resolver import resolve_skills_for_agent
             from agent_common.models.skill import SkillDefinition as AgentSkillDef
+            from agent_common.models.skill import SkillFile as AgentSkillFile
+
+            def _to_skill_def(s) -> AgentSkillDef:
+                if isinstance(s, AgentSkillDef):
+                    return s
+                if isinstance(s, dict):
+                    files = [
+                        AgentSkillFile(path=f["path"], content=f.get("content", ""), encoding=f.get("encoding"))
+                        if isinstance(f, dict)
+                        else f
+                        for f in s.get("files", [])
+                    ]
+                    return AgentSkillDef(
+                        name=s.get("name", ""),
+                        description=s.get("description", ""),
+                        body=s.get("body", ""),
+                        files=files,
+                    )
+                return AgentSkillDef(name=s.name, description=s.description, body=s.body, files=s.files)
 
             default_skills = []
             if hasattr(self.config, "skills") and self.config.skills:
-                default_skills = [
-                    s
-                    if isinstance(s, AgentSkillDef)
-                    else AgentSkillDef(
-                        **(s if isinstance(s, dict) else {"name": s.name, "description": s.description, "body": s.body})
-                    )
-                    for s in self.config.skills
-                ]
+                default_skills = [_to_skill_def(s) for s in self.config.skills]
             self._resolved_skills = await resolve_skills_for_agent(
                 store=self.store,
                 user_id=self.user_id,
@@ -1006,7 +1027,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             extra_tools=extra_tools,
             sandbox_enabled=sandbox_enabled,
             sandbox_home=sandbox_home,
-        )
+        ).with_config({"recursion_limit": _SUB_AGENT_RECURSION_LIMIT})
 
     async def _astream_impl(self, input_data: SubAgentInput, config: Dict[str, Any]) -> AsyncIterable[StreamEvent]:
         """Stream dynamic agent execution with real-time status updates and content.
