@@ -353,6 +353,7 @@ class ConditionalHumanInTheLoopMiddleware(HumanInTheLoopMiddleware[StateT, Conte
                     "threshold": threshold,
                     "matched_pattern": matched_pattern,
                     "server_slug": server_slug,
+                    "allowed_actions": allowed_actions,
                 }
             )
 
