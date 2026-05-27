@@ -105,7 +105,9 @@ class ToolRiskEntry:
         """Match tool call args against risk factors. Returns effective risk score.
 
         For each control param present in args, tests its value against compiled
-        glob patterns. Returns the highest matching score, or base_score if none match.
+        glob patterns. If a pattern matches, uses that score. If the param is present
+        but no patterns match, applies default_contribution. Returns the highest
+        score across all params, floored at base_score.
         """
         if not self._compiled_patterns:
             self.compile_patterns()
@@ -116,9 +118,15 @@ class ToolRiskEntry:
             if arg_value is None:
                 continue
             arg_str = str(arg_value)
+            matched = False
             for pattern_re, score in patterns:
                 if pattern_re.match(arg_str):
                     highest_score = max(highest_score, score)
+                    matched = True
+            if not matched:
+                profile = self.risk_factors.get(param_name)
+                if profile and profile.default_contribution:
+                    highest_score = max(highest_score, profile.default_contribution)
         return highest_score
 
     def get_matched_pattern(self, args: dict[str, Any]) -> str | None:
