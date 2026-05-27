@@ -4,6 +4,8 @@ This module contains all configuration-related models and settings,
 separated from the core agent logic for better maintainability.
 """
 
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass, field
