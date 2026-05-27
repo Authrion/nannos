@@ -69,15 +69,16 @@ class GraphRuntimeContext:
     Values:
     - 'markdown': Standard markdown formatting (default)
     - 'slack': Slack mrkdwn formatting (*bold*, _italic_, `code`, <@U123> mentions)
+    - 'google-chat': Google Chat markup (*bold*, _italic_, ~strikethrough~, `code`)
     - 'plain': Plain text with no formatting
     """
 
-    slack_user_handle: Optional[str] = None
-    """Slack user handle for the current speaker (e.g., '<@U123456>').
+    client_user_handle: Optional[str] = None
+    """Client user handle for the current speaker (e.g., Slack: '<@U123456>', Google Chat: '<users/123456>').
     
-    Used for @-mention generation in Slack conversations. Only set when
-    the client is a Slack app. The LLM can use this to tag the current user
-    in responses when needed (e.g., for input_required states).
+    Used for @-mention generation in multi-user conversations. Set when
+    the client is a Slack app or Google Chat app. The LLM can use this to tag
+    the current user in responses when needed (e.g., for input_required states).
     """
 
     custom_prompt: Optional[str] = None
@@ -215,13 +216,13 @@ class UserConfig(BaseModel):
         default=None,
         description="LLM model to use (e.g. 'gpt-4o', 'claude-sonnet-4.5', or any local model ID)",
     )
-    message_formatting: Literal["markdown", "slack", "plain"] = Field(
+    message_formatting: Literal["markdown", "slack", "google-chat", "plain"] = Field(
         default="markdown",
-        description="Message formatting style: 'markdown' (default), 'slack', or 'plain'",
+        description="Message formatting style: 'markdown' (default), 'slack', 'google-chat', or 'plain'",
     )
-    slack_user_handle: Optional[str] = Field(
+    client_user_handle: Optional[str] = Field(
         default=None,
-        description="Slack user handle for @-mentions (e.g., '<@U123456>')",
+        description="Client user handle for @-mentions (Slack: '<@U123456>', Google Chat: '<users/123456>')",
     )
     custom_prompt: Optional[str] = Field(
         default=None,
