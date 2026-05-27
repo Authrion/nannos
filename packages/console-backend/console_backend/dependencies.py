@@ -287,12 +287,27 @@ async def require_admin_or_orchestrator(request: Request, db: DbSession) -> User
             role=UserRole.ADMIN,
         )
 
-    # Fall back to admin check
-    user = await require_auth_or_bearer_token(request, db)
-    if not user.is_administrator:
+    # Fall back to admin check (same guards as require_admin)
+    # Check if currently impersonating - if so, use the original admin user
+    if hasattr(request.state, "original_user") and request.state.original_user:
+        user = request.state.original_user
+    else:
+        user = await require_auth_or_bearer_token(request, db)
+
+    admin_mode = get_admin_mode(request)
+
+    # Detect privilege escalation attempt: non-admin trying to use admin mode header
+    if admin_mode and not user.is_administrator:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Insufficient permissions: requires admin or orchestrator service",
+            detail="Privilege escalation attempt: admin mode not allowed for non-administrators",
+        )
+
+    # Must be admin AND have admin mode enabled
+    if not user.is_administrator or not admin_mode:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions: requires admin with admin mode enabled, or orchestrator service",
         )
     return user
 
