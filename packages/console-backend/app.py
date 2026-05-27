@@ -76,6 +76,7 @@ from console_backend.routers.secrets_router import router as secrets_router
 from console_backend.routers.skill_activations_router import router as skill_activations_router
 from console_backend.routers.skills_registry_router import router as skills_registry_router
 from console_backend.routers.sub_agent_router import router as sub_agent_router
+from console_backend.routers.tool_risk_router import router as tool_risk_router
 from console_backend.routers.usage_router import router as usage_router
 from console_backend.service_instances import cleanup_services, initialize_services
 from console_backend.services.conversation_service import ConversationService
@@ -323,6 +324,7 @@ app.include_router(feedback_router)
 app.include_router(playbook_router)
 app.include_router(skills_registry_router)
 app.include_router(skill_activations_router)
+app.include_router(tool_risk_router)
 # SCIM token management (always available for admins)
 app.include_router(scim_token_router)
 # SCIM 2.0 provisioning endpoints

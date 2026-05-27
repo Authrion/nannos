@@ -77,6 +77,8 @@ from agent_common.utils import get_language_display_name
 
 if TYPE_CHECKING:
     from agent_common.core.sandbox_pool import SandboxPool
+    from agent_common.core.tool_risk_cache import ToolRiskCache
+    from agent_common.middleware.conditional_hitl import RiskScorerFn
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +187,10 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         sandbox_pool: SandboxPool | None = None,
         extra_middlewares: Optional[List[Any]] = None,
         inject_all_tools: Optional[List[BaseTool]] = None,
+        risk_scorer: RiskScorerFn | None = None,
+        tool_risk_cache: ToolRiskCache | None = None,
+        tool_bypass_rules: dict[str, Any] | None = None,
+        pending_bypass_rules: list[dict[str, Any]] | None = None,
     ):
         """Initialize the dynamic local agent runnable.
 
@@ -210,6 +216,12 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             extra_middlewares: Optional list of middleware instances to prepend to the standard stack.
             inject_all_tools: Optional pre-discovered tools to use directly (bypasses MCP discovery).
                 When set, these tools are used as the agent's MCP tools without gateway discovery.
+            risk_scorer: Optional function to score tool calls for conditional HITL.
+            tool_risk_cache: Optional cache for tool risk scores to optimize conditional HITL.
+            tool_bypass_rules: Optional dict of tool bypass rules for conditional HITL.
+            pending_bypass_rules: Optional list of bypass rules that are pending user approval during the current session.
+                This object is a reference to UserConfig._pending_bypass_rules and is updated in-place when the user approves bypasses, allowing to collect
+                approved bypass rules during execution and persist them after execution finishes.
         """
         self.config = config
         self.model = model
@@ -237,6 +249,12 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         self.sandbox_pool = sandbox_pool
         self.extra_middlewares = extra_middlewares
         self.inject_all_tools = inject_all_tools
+        self._risk_scorer: RiskScorerFn | None = risk_scorer
+        self._tool_risk_cache: ToolRiskCache | None = tool_risk_cache
+        self._tool_bypass_rules: dict[str, Any] = tool_bypass_rules if tool_bypass_rules is not None else {}
+        self._pending_bypass_rules: list[dict[str, Any]] = (
+            pending_bypass_rules if pending_bypass_rules is not None else []
+        )
         self._agent: CompiledStateGraph | None = None
         self._discovered_tools: Optional[List[BaseTool]] = None
         self._resolved_skills: dict = {}
@@ -657,10 +675,10 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
     )
 
     def _wrap_with_agent_name(self, tool: BaseTool) -> BaseTool:
-        """Wrap a tool to auto-inject agent_name and sub_agent_id, hiding them from the LLM schema.
+        """Wrap a tool to auto-inject agent_name, hiding it from the LLM schema.
 
-        The sub-agent's name and ID are injected automatically so the LLM doesn't
-        need to guess or hallucinate them.
+        The sub-agent's name is injected automatically so the LLM doesn't
+        need to guess or hallucinate it.
         """
         from langchain_core.tools import StructuredTool
         from pydantic import Field as PydanticField
@@ -668,15 +686,10 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
 
         original_coroutine = tool.coroutine
         agent_name = self.name
-        sub_agent_id = self.sub_agent_id
         auto_inject_fields = {"agent_name"}
-        if sub_agent_id:
-            auto_inject_fields.add("sub_agent_id")
 
         async def wrapped_coroutine(**kwargs):
             kwargs["agent_name"] = agent_name
-            if sub_agent_id:
-                kwargs.setdefault("sub_agent_id", sub_agent_id)
             return await original_coroutine(**kwargs)
 
         # Build new schema without auto-injected fields.
@@ -938,10 +951,8 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
 
         # Build agent via the shared helper: handles backend factory selection
         # (injected vs. auto-created), middleware stack assembly, and graph creation.
-        # Include HITL for skill/playbook tools so changes require user approval.
-        from agent_common.core.hitl_config import SELF_IMPROVEMENT_HITL_GUARDS
-
-        hitl_guarded = dict(SELF_IMPROVEMENT_HITL_GUARDS)
+        # HITL guards are now managed in the tool_risk_scores DB table and enforced
+        # via dynamic risk scoring (base_score=1.0 entries always trigger interrupt).
 
         # Build the backend factory with resolved skills mounted at /skills/
         effective_backend_factory = self.backend_factory
@@ -973,7 +984,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         self._cached_tools = tools
         self._cached_system_prompt = system_prompt
         self._cached_response_format = response_format
-        self._cached_hitl_guarded = hitl_guarded
+        self._cached_hitl_guarded = None  # Static guards moved to DB (tool_risk_scores table)
         self._cached_effective_backend_factory = effective_backend_factory
 
         # Only build the default (non-sandbox) graph if sandbox is NOT active.
@@ -1014,6 +1025,16 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         """
         # Combine instance-level extra_middlewares with call-level ones
         combined_middlewares = list(self.extra_middlewares or []) + list(extra_middlewares or []) or None
+
+        # Build tool_server_map from tool metadata for server slug resolution
+        tool_server_map: dict[str, str] = {}
+        for tool in self._cached_tools or []:
+            metadata = getattr(tool, "metadata", None)
+            if metadata and isinstance(metadata, dict):
+                server_name = metadata.get("server_name")
+                if server_name:
+                    tool_server_map[tool.name] = server_name
+
         return build_sub_agent_graph(
             model=self.model,
             tools=self._cached_tools or [],
@@ -1027,6 +1048,9 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             extra_tools=extra_tools,
             sandbox_enabled=sandbox_enabled,
             sandbox_home=sandbox_home,
+            risk_scorer=self._risk_scorer,
+            tool_risk_cache=self._tool_risk_cache,
+            tool_server_map=tool_server_map or None,
         ).with_config({"recursion_limit": _SUB_AGENT_RECURSION_LIMIT})
 
     async def _astream_impl(self, input_data: SubAgentInput, config: Dict[str, Any]) -> AsyncIterable[StreamEvent]:
@@ -1164,12 +1188,24 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             response_streamer = StructuredResponseStreamer("SubAgentResponseSchema")
             stream_buffer = StreamBuffer()
 
+            # Build a lightweight runtime context for the sub-agent graph.
+            # This provides tool_bypass_rules so that ConditionalHITLMiddleware can
+            # store and check bypass decisions within the same invocation.
+            import types
+
+            subagent_context = types.SimpleNamespace(
+                tool_bypass_rules=self._tool_bypass_rules,
+                tool_risk_cache=self._tool_risk_cache,
+                _pending_bypass_rules=self._pending_bypass_rules,
+            )
+
             # Stream the agent with custom events and messages using v2 format
             # v2: every chunk is a StreamPart dict: {"type": ..., "ns": ..., "data": ...}
             async for part in agent.astream(
                 agent_input,
                 config=standalone_config,
                 stream_mode=["custom", "messages"],
+                context=subagent_context,
                 version="v2",
             ):
                 part_type = part["type"]
@@ -1331,6 +1367,10 @@ def create_dynamic_local_subagent(
     sandbox_pool: SandboxPool | None = None,
     extra_middlewares: Optional[List[Any]] = None,
     inject_all_tools: Optional[List[BaseTool]] = None,
+    risk_scorer: RiskScorerFn | None = None,
+    tool_risk_cache: ToolRiskCache | None = None,
+    tool_bypass_rules: dict[str, Any] | None = None,
+    pending_bypass_rules: list[dict[str, Any]] | None = None,
 ) -> CompiledSubAgent:
     """Create a dynamic local sub-agent from configuration.
 
@@ -1357,6 +1397,8 @@ def create_dynamic_local_subagent(
         group_ids: User's group IDs for group playbook loading (all groups)
         extra_middlewares: Optional middleware instances to prepend to the standard stack.
         inject_all_tools: Optional pre-discovered tools (bypasses MCP discovery).
+        tool_bypass_rules: User's persisted HITL bypass rules keyed by tool/server.
+        pending_bypass_rules: Per-turn pending bypass rules list shared with executor persistence.
 
     Returns:
         CompiledSubAgent that can be registered with the orchestrator
@@ -1393,6 +1435,10 @@ def create_dynamic_local_subagent(
         sandbox_pool=sandbox_pool,
         extra_middlewares=extra_middlewares,
         inject_all_tools=inject_all_tools,
+        risk_scorer=risk_scorer,
+        tool_risk_cache=tool_risk_cache,
+        tool_bypass_rules=tool_bypass_rules,
+        pending_bypass_rules=pending_bypass_rules,
     )
 
     return CompiledSubAgent(

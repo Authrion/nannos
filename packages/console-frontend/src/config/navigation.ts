@@ -13,6 +13,7 @@ import {
   Bug,
   KeyRound,
   Globe,
+  ShieldAlert,
   BookOpen,
   Package,
 } from 'lucide-react';
@@ -115,5 +116,10 @@ export const adminNavItems: NavItem[] = [
     title: 'Outbound SCIM',
     url: '/app/admin/outbound-scim',
     icon: Globe,
+  },
+  {
+    title: 'Tool Risk Scores',
+    url: '/app/admin/tool-risk-scores',
+    icon: ShieldAlert,
   },
 ];

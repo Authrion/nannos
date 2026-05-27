@@ -4,9 +4,15 @@ These tools integrate with the IndexingStoreBackend to provide semantic search
 capabilities. Files written to long-term storage (/memories/*) are automatically
 indexed by the IndexingStoreBackend.
 
-Provides two tools:
+Provides tools:
 1. docstore_search: Search indexed files using semantic similarity
-2. docstore_export: Export files (ephemeral or persisted) to S3 with presigned URLs
+2. read_personal_file: Read files from a user's personal workspace (HITL-guarded)
+3. docstore_export: Export files (ephemeral or persisted) to S3 with presigned URLs
+
+Privacy controls:
+- read_personal_file is guarded by HumanInTheLoopMiddleware (always requires approval)
+- docstore_search with include_personal=True is conditionally guarded by
+  ConditionalHumanInTheLoopMiddleware (requires approval only when the flag is set)
 
 All tools use AsyncPostgresStore with pgvector for semantic search.
 """
@@ -15,44 +21,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from langchain.agents.middleware.types import AgentState
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
 from langgraph.config import get_config
 from langgraph.store.postgres.aio import AsyncPostgresStore
-from langgraph.types import interrupt
 from langsmith import traceable
 from object_storage import IObjectStorageService
-from typing_extensions import NotRequired
-
-
-class DocumentStoreState(AgentState):
-    """Extended agent state with cross-namespace permission tracking.
-
-    Tracks granular, conversation-scoped permissions for privacy-first
-    cross-namespace access (e.g., Slack channel accessing personal files).
-
-    Permission Design:
-    - File-level: Set of approved file paths for read_personal_file tool
-    - Search-level: Boolean flag for search_documents_rag with include_personal=True
-    - Conversation-scoped: Permissions reset per thread_id (Slack thread)
-    - Interrupt-based: Uses LangGraph interrupt() for explicit user consent
-    """
-
-    personal_file_read_permissions: NotRequired[set[str]]
-    """Set of approved personal file paths for current conversation.
-    
-    Granted via read_personal_file tool interrupt → user approval.
-    Format: {"path/to/file.py", "path/to/other.md", ...}
-    Resets per conversation (thread_id isolation).
-    """
-
-    personal_search_permission: NotRequired[bool]
-    """Permission to search personal documents in current conversation.
-    
-    Granted via search_documents_rag(include_personal=True) interrupt → user approval.
-    When True, semantic search includes (user_id, "documents") namespace.
-    Defaults to False, resets per conversation.
-    """
 
 
 class FilesystemState(dict):
@@ -117,8 +90,6 @@ def _is_cross_namespace_access() -> bool:
     - User is in a Slack channel (scope="channel")
     - And they want to access their personal files (different namespace)
 
-    This requires explicit permission via interrupt() for privacy.
-
     Returns:
         True if accessing personal files from channel context, False otherwise.
     """
@@ -137,18 +108,17 @@ async def _read_personal_file_impl(
     file_path: str,
     target_user_id: str,
     store: AsyncPostgresStore,
-    state: DocumentStoreState,
 ) -> str:
-    """Implementation of reading a personal file with permission checking.
+    """Implementation of reading a personal file.
 
-    Checks if cross-namespace access is needed, verifies permissions in state,
-    requests permission via interrupt if not granted, then reads the file.
+    Permission is handled by HumanInTheLoopMiddleware (HITL guards) before
+    this tool is executed. By the time we reach here, the user has already
+    approved the file access.
 
     Args:
         file_path: Path to the personal file
         target_user_id: User ID whose personal file to read
         store: AsyncPostgresStore instance
-        state: Graph state with permission tracking
 
     Returns:
         File content or error message
@@ -166,31 +136,7 @@ async def _read_personal_file_impl(
     if not personal_namespace:
         return f"Error: Could not determine personal namespace for user {target_user_id}"
 
-    # Check if permission already granted for this file
-    granted_files = state.get("personal_file_read_permissions", set())
-    if file_path not in granted_files:
-        # Request permission via interrupt
-        config = get_config()
-        user_name = config.get("metadata", {}).get("user_name") if config else None
-        mention = f"@{user_name}" if user_name else "the user"
-
-        permission_request = {
-            "type": "file_permission_request",
-            "message": f"Allow access to {mention}'s personal file: {file_path}?",
-            "file_path": file_path,
-            "user_id": target_user_id,
-        }
-
-        response = interrupt(permission_request)
-
-        if response != "approve":
-            return f"Access denied to personal file: {file_path}"
-
-        # Permission granted, update state
-        granted_files.add(file_path)
-        state["personal_file_read_permissions"] = granted_files
-
-    # Read the file
+    # Read the file (permission already granted via HITL middleware)
     try:
         item = await store.aget(namespace=personal_namespace, key=file_path)
         if not item:
@@ -216,13 +162,16 @@ async def _search_documents_rag_impl(
     user_id: str,
     store: AsyncPostgresStore,
     include_personal: bool = False,
-    state: DocumentStoreState | None = None,
 ) -> list[dict[str, Any]]:
     """Implementation of semantic search over indexed filesystem files.
 
     Searches files that have been indexed by IndexingStoreBackend when
     written to long-term storage (/memories/* or /channel_memories/*). Searches user-scoped
     or channel-scoped namespace depending on context.
+
+    Permission for include_personal=True in channel context is handled by
+    ConditionalHumanInTheLoopMiddleware (HITL guards) before this tool is
+    executed. By the time we reach here, the user has already approved.
 
     Returns documents in LangChain retriever format for proper LangSmith tracing.
 
@@ -232,40 +181,10 @@ async def _search_documents_rag_impl(
         user_id: User ID for namespacing
         store: AsyncPostgresStore instance
         include_personal: If True and in channel context, search personal documents too
-        state: Graph state for permission tracking (required if include_personal=True)
 
     Returns:
         List of documents in LangChain format with page_content, type, and metadata
     """
-    # Check personal search permission if requested in channel context
-    if include_personal and _is_cross_namespace_access():
-        if state is None:
-            logger.error("State required for personal search permission checking")
-            return []
-
-        # Check if permission already granted
-        has_permission = state.get("personal_search_permission", False)
-        if not has_permission:
-            # Request permission via interrupt
-            config = get_config()
-            user_name = config.get("metadata", {}).get("user_name") if config else None
-            mention = f"@{user_name}" if user_name else "the user"
-
-            permission_request = {
-                "type": "search_permission_request",
-                "message": f"Allow semantic search across {mention}'s personal documents?",
-                "user_id": user_id,
-            }
-
-            response = interrupt(permission_request)
-
-            if response != "approve":
-                logger.info("Access denied to personal documents")
-                return []
-
-            # Permission granted, update state
-            state["personal_search_permission"] = True
-
     logger.info(
         f"Semantic search for indexed files, user {user_id}: '{query}' (top_k={top_k}, include_personal={include_personal})"
     )
@@ -485,7 +404,6 @@ def create_document_store_tools(
         query: str,
         top_k: int = 5,
         include_personal: bool = False,
-        state: DocumentStoreState | None = None,
     ) -> list[dict[str, Any]]:
         """Retriever function that returns documents in LangChain format for tracing.
 
@@ -498,7 +416,6 @@ def create_document_store_tools(
             user_id=user_id,
             store=store,
             include_personal=include_personal,
-            state=state,
         )
 
     def _format_documents_for_llm(documents: list[dict[str, Any]]) -> str:
@@ -528,7 +445,6 @@ def create_document_store_tools(
         query: str,
         top_k: int = 5,
         include_personal: bool = False,
-        runtime=None,
     ) -> str:
         """Search files you've written to long-term storage using semantic similarity.
 
@@ -541,58 +457,48 @@ def create_document_store_tools(
         - Get context from past work for answering questions
 
         In Slack channels, set include_personal=True to search the user's personal documents
-        (requires explicit permission via interrupt).
+        (requires approval via HITL middleware).
 
         Returns formatted context chunks that you can use to synthesize answers.
 
         Args:
             query: Natural language search query describing what you're looking for
             top_k: Number of relevant chunks to retrieve (default 5)
-            include_personal: Search personal documents (channel context only, requires permission)
-            runtime: Tool runtime (automatically injected, required if include_personal=True)
+            include_personal: Search personal documents (channel context only, requires approval)
 
         Returns:
             Formatted context with relevant content from indexed files
         """
-        state = runtime.state if runtime else None
         documents = await _search_documents_retriever(
             query=query,
             top_k=top_k,
             include_personal=include_personal,
-            state=state,
         )
         return _format_documents_for_llm(documents)
 
     async def read_personal_file(
         file_path: str,
-        runtime,
     ) -> str:
-        """Read a file from a user's personal workspace with permission.
+        """Read a file from a user's personal workspace.
 
-        Only available in Slack channel context. Requires explicit user permission
-        via interrupt before accessing personal files for privacy.
+        Only available in Slack channel context. Approval is handled by
+        HumanInTheLoopMiddleware before this tool executes.
 
         Use this when:
         - User mentions their personal files/notes in a channel
         - You need to reference user's private work in channel discussion
         - User explicitly asks to share their personal file content
 
-        Permission is conversation-scoped (per Slack thread) for privacy.
-
         Args:
             file_path: Path to the personal file (e.g., "/my-notes.md")
-            runtime: Tool runtime (automatically injected) for state access and permission tracking
 
         Returns:
-            File content if permission granted, error message if denied
+            File content or error message
         """
-        # Get state with type safety
-        state: DocumentStoreState = runtime.state if runtime.state is not None else {}  # type: ignore[assignment]
         return await _read_personal_file_impl(
             file_path=file_path,
             target_user_id=user_id,
             store=store,
-            state=state,
         )
 
     async def docstore_export(
@@ -647,8 +553,7 @@ def create_document_store_tools(
             handle_tool_error=True,
             description=(
                 "Read a file from user's personal workspace (Slack channel context only). "
-                "Requires explicit user permission via interrupt for privacy. "
-                "Permission is conversation-scoped (per Slack thread). "
+                "Requires user approval (HITL-guarded). "
                 "Use when: user mentions their personal files in a channel, "
                 "you need to reference user's private work in discussion, "
                 "or user explicitly asks to share personal file content."

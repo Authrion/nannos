@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Save, Loader2, Settings as SettingsIcon, Shield, Bot, Wrench, Globe, Key, Phone, X } from 'lucide-react';
+import { Save, Loader2, Settings as SettingsIcon, Shield, Bot, Wrench, Globe, Key, Phone, X, ShieldCheck } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   getCurrentUserApiV1AuthMeGetOptions,
@@ -21,6 +21,7 @@ import { MCPToolToggleList } from '@/components/settings/MCPToolToggleList';
 import { SecretsVaultList } from '@/components/settings/SecretsVaultList';
 import { ExtendedThinkingConfig } from '@/components/settings/ExtendedThinkingConfig';
 import { PhoneVerificationDialog } from '@/components/settings/PhoneVerificationDialog';
+import { ToolBypassRulesList } from '@/components/settings/ToolBypassRulesList';
 import { MODEL_OPTIONS, modelSupportsThinking, getAvailableThinkingLevels } from '@/config/models';
 
 const LANGUAGE_OPTIONS = [
@@ -29,7 +30,7 @@ const LANGUAGE_OPTIONS = [
   { value: 'fr', label: 'Français' },
 ];
 
-type TabId = 'preferences' | 'vault' | 'permissions' | 'subagents' | 'tools';
+type TabId = 'preferences' | 'vault' | 'permissions' | 'subagents' | 'tools' | 'approvals';
 
 interface Tab {
   id: TabId;
@@ -41,6 +42,7 @@ const tabs: Tab[] = [
   { id: 'preferences', label: 'Preferences', icon: SettingsIcon },
   { id: 'subagents', label: 'Sub-Agents', icon: Bot },
   { id: 'tools', label: 'MCP Tools', icon: Wrench },
+  { id: 'approvals', label: 'Tool Approvals', icon: ShieldCheck },
   { id: 'vault', label: 'Secrets Vault', icon: Key },
   { id: 'permissions', label: 'Permissions', icon: Shield },
 ];
@@ -468,6 +470,20 @@ export function SettingsPage() {
               )}
               Save Changes
             </Button>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'approvals' && (
+        <div className="flex flex-col gap-6 max-h-[calc(100vh-16rem)] overflow-hidden">
+          <div>
+            <h2 className="text-lg font-semibold">Tool Approval Bypass Rules</h2>
+            <p className="text-sm text-muted-foreground mt-1">
+              Tools you&apos;ve chosen to always allow without approval prompts. Remove a rule to re-enable the confirmation dialog.
+            </p>
+          </div>
+          <div className="flex-1 overflow-y-auto min-h-0">
+            <ToolBypassRulesList />
           </div>
         </div>
       )}

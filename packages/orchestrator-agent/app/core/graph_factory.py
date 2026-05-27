@@ -26,15 +26,16 @@ from agent_common.a2a.structured_response import A2A_PROTOCOL_ADDENDUM as SUB_AG
 from agent_common.a2a.structured_response import get_response_format as get_sub_agent_response_format
 from agent_common.core.copy_file_tool import create_copy_file_tool
 from agent_common.core.graph_utils import build_common_middleware_stack, create_indexing_backend_factory
-from agent_common.core.hitl_config import SELF_IMPROVEMENT_HITL_GUARDS
 from agent_common.core.model_factory import _has_aws_credentials, create_model
+from agent_common.core.tool_risk_scorer import score_tool_risk
+from agent_common.middleware.conditional_hitl import ConditionalHumanInTheLoopMiddleware
 from agent_common.middleware.steering_middleware import SteeringMiddleware
 from agent_common.middleware.storage_paths_middleware import StoragePathsInstructionMiddleware
 from agent_common.middleware.tool_status import ToolStatusMiddleware
 from agent_common.models.base import DEFAULT_MODEL, ModelType, ThinkingLevel
 from deepagents import create_deep_agent
 from langchain.agents import create_agent
-from langchain.agents.middleware import HumanInTheLoopMiddleware, ToolRetryMiddleware
+from langchain.agents.middleware import ToolRetryMiddleware
 from langchain.agents.structured_output import AutoStrategy, ToolStrategy
 from langchain_aws.middleware.prompt_caching import BedrockPromptCachingMiddleware
 from langchain_core.language_models import BaseChatModel
@@ -62,20 +63,20 @@ from .time_tools import create_time_tool
 
 logger = logging.getLogger(__name__)
 
-# Tools that require user confirmation before execution (HITL interrupt)
-# Extends the shared self-improvement guards with orchestrator-specific tools.
-HITL_GUARDED_TOOLS = {
-    **SELF_IMPROVEMENT_HITL_GUARDS,
-    "console_create_bug_report": {
-        "allowed_decisions": ["approve", "edit", "reject"],
-        "description": "Bug report requires your confirmation before submission.",
-    },
-}
 
+def _create_hitl_middleware() -> ConditionalHumanInTheLoopMiddleware:
+    """Create a ConditionalHumanInTheLoopMiddleware instance for dynamic risk scoring.
 
-def _create_hitl_middleware() -> HumanInTheLoopMiddleware:
-    """Create a HumanInTheLoopMiddleware instance for guarded tools."""
-    return HumanInTheLoopMiddleware(interrupt_on=HITL_GUARDED_TOOLS)
+    All tool guarding is now handled by the dynamic risk scoring system:
+    - Static guards (self-improvement, privacy, bug reports) are stored in the
+      tool_risk_scores DB table with base_score=1.0 (always interrupt).
+    - Other tools are scored by LLM at runtime and interrupt if score >= threshold.
+    """
+    return ConditionalHumanInTheLoopMiddleware(
+        interrupt_on=None,
+        risk_scorer=score_tool_risk,
+        default_risk_threshold=0.8,
+    )
 
 
 class GraphFactory:
@@ -507,8 +508,9 @@ class GraphFactory:
             on_messages_received=_forward_to_active_subagents,
         )
 
-        # HumanInTheLoopMiddleware: uses interrupt() to pause and ask for user
-        # confirmation before executing guarded tools (e.g. console_create_bug_report).
+        # ConditionalHumanInTheLoopMiddleware: uses interrupt() to pause and ask for user
+        # confirmation before executing guarded tools (self-improvement, privacy, bug reports).
+        # Supports argument-based conditions (e.g., docstore_search only when include_personal=True).
         hitl_middleware = _create_hitl_middleware()
 
         return [

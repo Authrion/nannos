@@ -389,7 +389,24 @@ export function buildHitlInterruptWidget(data: HitlInterruptWidgetData): any[] {
   const reviewConfig = data.reviewConfigs?.find(rc => rc.action_name === data.toolName);
   const allowedDecisions = reviewConfig?.allowed_decisions ?? ['approve', 'reject'];
 
-  // Button payload only needs routing info — proposed content is shown in the message blocks
+  const toolLabel = data.toolName.replace(/_/g, ' ');
+
+  // Extract proposed args for display
+  const CONTENT_KEYS = ['content', 'body', 'description'];
+  const HIDDEN_KEYS = ['reason', '_risk_metadata'];
+  const firstAction = data.actionRequests?.[0];
+  const toolArgs = firstAction?.args || {};
+  const contentKey = CONTENT_KEYS.find((k) => k in toolArgs);
+  const proposedContent = contentKey ? String(toolArgs[contentKey] || '') : '';
+  const metaEntries = Object.entries(toolArgs).filter(
+    ([k]) => !CONTENT_KEYS.includes(k) && !HIDDEN_KEYS.includes(k)
+  );
+
+  // Extract risk metadata for bypass buttons
+  const riskMeta = toolArgs._risk_metadata as { source?: string; score?: number; threshold?: number; matched_pattern?: string | null } | undefined;
+  const isRiskScored = riskMeta?.source === 'risk_score';
+
+  // Button payload includes routing info + matched pattern for bypass
   const payload = {
     taskId: data.taskId,
     contextId: data.contextId,
@@ -397,25 +414,17 @@ export function buildHitlInterruptWidget(data: HitlInterruptWidgetData): any[] {
     channelId: data.channelId,
     threadTs: data.threadTs,
     allowedDecisions,
+    ...(isRiskScored && riskMeta?.matched_pattern ? { matchedPattern: riskMeta.matched_pattern } : {}),
   };
   const encodedData = Buffer.from(JSON.stringify(payload)).toString('base64');
 
-  const toolLabel = data.toolName.replace(/_/g, ' ');
-
-  // Extract proposed args for display
-  const CONTENT_KEYS = ['content', 'body', 'description'];
-  const firstAction = data.actionRequests?.[0];
-  const toolArgs = firstAction?.args || {};
-  const contentKey = CONTENT_KEYS.find((k) => k in toolArgs);
-  const proposedContent = contentKey ? String(toolArgs[contentKey] || '') : '';
-  const metaEntries = Object.entries(toolArgs).filter(
-    ([k]) => !CONTENT_KEYS.includes(k) && k !== 'reason'
-  );
-
-  // Build action buttons: always Approve + Reject, optionally Request Changes
+  // Build action buttons: always Approve + Reject, optionally Request Changes and bypass buttons
   const editAllowed = allowedDecisions.includes('edit');
-  const actionElements: any[] = [
-    {
+  const approveAllowed = allowedDecisions.includes('approve');
+  const actionElements: any[] = [];
+
+  if (approveAllowed) {
+    actionElements.push({
       type: 'button',
       text: {
         type: 'plain_text',
@@ -425,8 +434,8 @@ export function buildHitlInterruptWidget(data: HitlInterruptWidgetData): any[] {
       action_id: 'hitl_approve',
       value: encodedData,
       style: 'primary',
-    },
-  ];
+    });
+  }
 
   if (editAllowed) {
     actionElements.push({
@@ -437,6 +446,32 @@ export function buildHitlInterruptWidget(data: HitlInterruptWidgetData): any[] {
         emoji: true,
       },
       action_id: 'hitl_request_changes',
+      value: encodedData,
+    });
+  }
+
+  // Bypass buttons — only for risk-scored tools
+  if (isRiskScored && approveAllowed) {
+    if (riskMeta!.matched_pattern) {
+      actionElements.push({
+        type: 'button',
+        text: {
+          type: 'plain_text',
+          text: '🔓 Allow Pattern',
+          emoji: true,
+        },
+        action_id: 'hitl_approve_bypass_pattern',
+        value: encodedData,
+      });
+    }
+    actionElements.push({
+      type: 'button',
+      text: {
+        type: 'plain_text',
+        text: '🔓 Always Allow',
+        emoji: true,
+      },
+      action_id: 'hitl_approve_bypass_tool',
       value: encodedData,
     });
   }
@@ -461,6 +496,20 @@ export function buildHitlInterruptWidget(data: HitlInterruptWidgetData): any[] {
       },
     },
   ];
+
+  // Show risk score indicator for risk-scored tools
+  if (isRiskScored && riskMeta) {
+    const pct = Math.round((riskMeta.score ?? 0) * 100);
+    const riskLabel = pct >= 90 ? 'Critical' : pct >= 80 ? 'High' : pct >= 60 ? 'Medium' : 'Low';
+    let riskText = `🛡️ *Risk:* ${riskLabel} (${pct}%)`;
+    if (riskMeta.matched_pattern) {
+      riskText += ` — matched: \`${riskMeta.matched_pattern}\``;
+    }
+    blocks.push({
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: riskText }],
+    });
+  }
 
   // Show metadata fields (name, skill_name, visibility, etc.)
   if (metaEntries.length > 0) {

@@ -124,6 +124,108 @@ export function registerHitlActions(app: App, makeDeps: () => HandlerDependencie
   });
 
   /**
+   * Handle "Always Allow" button — approve and bypass this tool for future invocations.
+   */
+  app.action('hitl_approve_bypass_tool', async ({ ack, body, client }) => {
+    await ack();
+    const logger = Logger.getLogger('hitlButton');
+
+    const userId = body.user?.id;
+    const action = (body as any).actions?.[0];
+    const actionValue = action?.value || '';
+    const channelId = (body as any).channel?.id;
+    const messageTs = (body as any).message?.ts;
+    const threadTs = (body as any).message?.thread_ts || messageTs;
+
+    if (!actionValue || !userId || !channelId || !messageTs) {
+      logger.warn(`Missing required values in hitl_approve_bypass_tool action`);
+      return;
+    }
+
+    try {
+      const decodedValue = JSON.parse(Buffer.from(actionValue, 'base64').toString());
+      const { taskId, toolName } = decodedValue;
+
+      logger.info(`HITL approve+bypass_tool by user ${userId} for task ${taskId} tool ${toolName}`);
+
+      await client.chat.delete({
+        channel: channelId,
+        ts: messageTs,
+      });
+
+      const decisions = { decisions: [{ type: 'approve', bypass: true, bypass_all: true }] };
+      const syntheticMessage: NormalizedMessage = {
+        userId,
+        teamId: (body as any).team?.id || '',
+        channelId,
+        messageTs: messageTs || Date.now().toString(),
+        threadTs,
+        rawText: '',
+        dataParts: [decisions],
+        source: 'direct_message',
+        client,
+      };
+
+      handleIncomingMessage(syntheticMessage, makeDeps()).catch((err) => {
+        logger.error(err, `Failed to send HITL approve+bypass_tool to orchestrator: ${err}`);
+      });
+    } catch (error) {
+      logger.error(error, `Failed to process hitl_approve_bypass_tool: ${error}`);
+    }
+  });
+
+  /**
+   * Handle "Allow Pattern" button — approve and bypass this specific pattern for future invocations.
+   */
+  app.action('hitl_approve_bypass_pattern', async ({ ack, body, client }) => {
+    await ack();
+    const logger = Logger.getLogger('hitlButton');
+
+    const userId = body.user?.id;
+    const action = (body as any).actions?.[0];
+    const actionValue = action?.value || '';
+    const channelId = (body as any).channel?.id;
+    const messageTs = (body as any).message?.ts;
+    const threadTs = (body as any).message?.thread_ts || messageTs;
+
+    if (!actionValue || !userId || !channelId || !messageTs) {
+      logger.warn(`Missing required values in hitl_approve_bypass_pattern action`);
+      return;
+    }
+
+    try {
+      const decodedValue = JSON.parse(Buffer.from(actionValue, 'base64').toString());
+      const { taskId, toolName } = decodedValue;
+
+      logger.info(`HITL approve+bypass_pattern by user ${userId} for task ${taskId} tool ${toolName}`);
+
+      await client.chat.delete({
+        channel: channelId,
+        ts: messageTs,
+      });
+
+      const decisions = { decisions: [{ type: 'approve', bypass: true, bypass_pattern: decodedValue.matchedPattern }] };
+      const syntheticMessage: NormalizedMessage = {
+        userId,
+        teamId: (body as any).team?.id || '',
+        channelId,
+        messageTs: messageTs || Date.now().toString(),
+        threadTs,
+        rawText: '',
+        dataParts: [decisions],
+        source: 'direct_message',
+        client,
+      };
+
+      handleIncomingMessage(syntheticMessage, makeDeps()).catch((err) => {
+        logger.error(err, `Failed to send HITL approve+bypass_pattern to orchestrator: ${err}`);
+      });
+    } catch (error) {
+      logger.error(error, `Failed to process hitl_approve_bypass_pattern: ${error}`);
+    }
+  });
+
+  /**
    * Handle "Request Changes" button - open modal showing proposed content
    * with a text area for the user to describe what should be different.
    * Sends a reject with the user's feedback so the LLM re-proposes.

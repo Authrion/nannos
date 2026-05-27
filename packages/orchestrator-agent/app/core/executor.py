@@ -174,6 +174,8 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             accessible_catalog_ids=user.catalog_ids or None,
             enable_thinking=enable_thinking,
             thinking_level=thinking_level,
+            user_system_role=user.system_role,
+            tool_bypass_rules=user.tool_bypass_rules,
         )
 
         # Discover capabilities (tools and sub-agents)
@@ -386,6 +388,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             )
             return
 
+        user_config = None
         try:
             # Extract slack user handle - support both naming conventions
             # Client may send 'slackUserId' (camelCase) or 'slack_user_id' (snake_case)
@@ -479,70 +482,14 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             # Check if the graph is currently interrupted and this might be a resume request
             resume_value = None  # Initialize resume_value
             if hasattr(current_state, "interrupts") and current_state.interrupts:
-                # Parse interrupt type and handle permission grants
+                # Parse interrupt type and handle accordingly
                 last_interrupt = current_state.interrupts[-1]
                 interrupt_value = getattr(last_interrupt, "value", last_interrupt)
-                interrupt_type = interrupt_value.get("type") if isinstance(interrupt_value, dict) else None
 
-                if interrupt_type in (
-                    "file_permission_request",
-                    "search_permission_request",
-                    "bulk_file_permission_request",
-                ):
-                    # Permission-related interrupt - handle approval/denial
-                    logger.info(f"Resuming from permission interrupt: {interrupt_type}")
-
-                    # Parse user response
-                    response = query.lower().strip() if query else ""
-
-                    if interrupt_type == "file_permission_request":
-                        # TODO: this logic is too basic, improve with NLP parsing if needed
-                        # Single file permission
-                        file_path = interrupt_value.get("file_path") if isinstance(interrupt_value, dict) else None
-                        if response in ("yes", "approve", "allow", "grant"):
-                            resume_value = "approve"
-                            # Update state to grant permission
-                            state_update = current_state.values.copy() if hasattr(current_state, "values") else {}
-                            granted_files = state_update.get("personal_file_read_permissions", set())
-                            if not isinstance(granted_files, set):
-                                granted_files = set(granted_files) if granted_files else set()
-                            granted_files.add(file_path)
-                            state_update["personal_file_read_permissions"] = granted_files
-                            # State will be updated by the graph when resumed
-                            logger.info(f"Granted permission for file: {file_path}")
-                        else:
-                            resume_value = "deny"
-                            logger.info(f"Denied permission for file: {file_path}")
-
-                    elif interrupt_type == "search_permission_request":
-                        # Personal search permission
-                        if response in ("yes", "approve", "allow", "grant"):
-                            resume_value = "approve"
-                            # Update state to grant search permission
-                            state_update = current_state.values.copy() if hasattr(current_state, "values") else {}
-                            state_update["personal_search_permission"] = True
-                            logger.info("Granted personal search permission")
-                        else:
-                            resume_value = "deny"
-                            logger.info("Denied personal search permission")
-
-                    elif interrupt_type == "bulk_file_permission_request":
-                        # Bulk file permission
-                        if response in ("approve all", "approve_all", "yes all", "grant all"):
-                            resume_value = "approve_all"
-                            logger.info("Bulk approval: approve all files")
-                        elif response in ("deny all", "deny_all", "no all"):
-                            resume_value = "deny_all"
-                            logger.info("Bulk approval: deny all files")
-                        elif response in ("review", "individual", "one by one"):
-                            resume_value = "review"
-                            logger.info("Bulk approval: review individually")
-                        else:
-                            # Default to deny for safety
-                            resume_value = "deny_all"
-                            logger.info(f"Unknown bulk response '{response}', defaulting to deny_all")
-                elif isinstance(interrupt_value, dict) and "action_requests" in interrupt_value:
+                if isinstance(interrupt_value, dict) and "action_requests" in interrupt_value:
                     # HumanInTheLoopMiddleware interrupt (HITLRequest format)
+                    # This handles ALL HITL guards: self-improvement tools, privacy tools,
+                    # and orchestrator-specific tools (bug reports).
                     # Per LangChain docs, resume with Command(resume={"decisions": [...]})
                     # Clients should send decisions as a DataPart (structured JSON, no XML wrapping).
                     action_requests = interrupt_value.get("action_requests", [])
@@ -568,7 +515,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                 else:
                     # Other interrupt types (auth, etc.)
                     resume_value = query
-                    logger.info(f"Resuming from interrupt: {interrupt_type or 'unknown'}")
+                    logger.info("Resuming from non-HITL interrupt")
 
             if resume_value is None:
                 logger.info("Normal execution (not resuming from interrupt)")
@@ -738,6 +685,19 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             logger.error(f"An error occurred while streaming the response: {e.__class__.__name__}: {e}", exc_info=True)
             raise ServerError(error=InternalError()) from e
         finally:
+            # Persist any bypass rules that were approved during this turn.
+            # Best-effort: failures are logged but don't affect the response.
+            if user_config is not None:
+                pending_bypass = getattr(user_config, "_pending_bypass_rules", None)
+                if pending_bypass:
+                    try:
+                        await self.registry_service.persist_bypass_rules(
+                            access_token=user_token,
+                            pending_rules=pending_bypass,
+                        )
+                    except Exception:
+                        logger.warning("Failed to persist bypass rules", exc_info=True)
+
             # Log unconsumed steering messages before cleanup.
             # These arrive between the last abefore_model call and stream
             # completion — they will be handled as the next conversation turn.
@@ -912,22 +872,14 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
 
         elif state == TaskState.input_required:
             # User input required - leave task in input_required state
-            action_requests = metadata.get("action_requests")
+            action_requests = item.action_requests
             if action_requests and _ext_active(HUMAN_IN_THE_LOOP_EXTENSION):
                 # Structured HITL interrupt via extension — any A2A client can respond
-                # Build review_configs from HITL_GUARDED_TOOLS metadata
-                from app.core.graph_factory import HITL_GUARDED_TOOLS
-
-                review_configs = []
-                for ar in action_requests:
-                    tool_name = ar.get("name", "")
-                    guarded = HITL_GUARDED_TOOLS.get(tool_name, {})
-                    review_configs.append(
-                        {
-                            "action_name": tool_name,
-                            "allowed_decisions": guarded.get("allowed_decisions", ["approve", "reject"]),
-                        }
-                    )
+                # review_configs are provided by the ConditionalHumanInTheLoopMiddleware
+                review_configs = item.review_configs or [
+                    {"action_name": ar.get("name", ""), "allowed_decisions": ["approve", "reject"]}
+                    for ar in action_requests
+                ]
                 msg = new_hitl_interrupt_message(
                     description=content,
                     action_requests=action_requests,
@@ -942,11 +894,8 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                     task.context_id,
                     task.id,
                 )
-                interrupt_metadata = {
-                    k: v for k, v in metadata.items() if k in ("interrupt_type", "interrupt_reason", "action_requests")
-                } or None
-                if interrupt_metadata:
-                    msg.metadata = interrupt_metadata
+                if item.interrupt_reason:
+                    msg.metadata = {"interrupt_reason": item.interrupt_reason}
             await updater.update_status(
                 TaskState.input_required,
                 msg,

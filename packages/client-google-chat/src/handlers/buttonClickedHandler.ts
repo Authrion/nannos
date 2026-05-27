@@ -28,6 +28,7 @@ interface ButtonFeedbackCardClickedParameters {
 interface ButtonHitlCardClickedParameters {
   taskId: string;
   toolName?: string;
+  matchedPattern?: string;
 }
 
 async function handleFeedbackCardClick(
@@ -102,20 +103,31 @@ async function handleHitlCardClick(payload: ButtonClickedPayload, deps: HandlerD
     return;
   }
 
+  // Determine confirmation text and decisions payload
+  let confirmText: string;
+  let decisions: Record<string, unknown>;
+
+  if (payload.action === 'approve') {
+    confirmText = '✅ Approved';
+    decisions = { decisions: [{ type: 'approve' }] };
+  } else if (payload.action === 'approve_bypass_tool') {
+    confirmText = '✅ Approved (always allow this tool)';
+    decisions = { decisions: [{ type: 'approve', bypass: true, bypass_all: true }] };
+  } else if (payload.action === 'approve_bypass_pattern') {
+    const matchedPattern = (actionParameters as any).matchedPattern;
+    confirmText = `✅ Approved (pattern allowed: ${matchedPattern || 'unknown'})`;
+    decisions = { decisions: [{ type: 'approve', bypass: true, bypass_pattern: matchedPattern }] };
+  } else {
+    confirmText = '❌ Rejected';
+    decisions = { decisions: [{ type: 'reject', message: 'The user explicitly rejected this tool call via the human-in-the-loop approval. The tool was NOT executed. Do not retry or attempt workarounds unless the user explicitly asks.' }] };
+  }
+
   await deps.chatService.updateMessage({
     projectId: payload.projectId,
     messageName: payload.messageId,
-    text: payload.action === 'approve' ? '✅ Approved' : '❌ Rejected',
+    text: confirmText,
     cardsV2: [],
   });
-
-  // Build decisions payload as structured data (DataPart)
-  let decisions: Record<string, unknown>;
-  if (payload.action === 'approve') {
-    decisions = { decisions: [{ type: 'approve' }] };
-  } else {
-    decisions = { decisions: [{ type: 'reject', message: 'The user explicitly rejected this tool call via the human-in-the-loop approval. The tool was NOT executed. Do not retry or attempt workarounds unless the user explicitly asks.' }] };
-  }
 
   // Send as a synthetic message via handleIncomingMessage (no visible chat message)
   const syntheticMessage: NormalizedMessage = {

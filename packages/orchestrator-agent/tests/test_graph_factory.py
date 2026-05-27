@@ -132,8 +132,8 @@ class TestMiddlewareStack:
         assert isinstance(stack[7], RepeatedToolCallMiddleware)
         assert isinstance(stack[8], AuthErrorDetectionMiddleware)
         assert stack[9].__class__.__name__ == "ErrorClassificationMiddleware"
-        # stack[10] = HumanInTheLoopMiddleware
-        assert stack[10].__class__.__name__ == "HumanInTheLoopMiddleware"
+        # stack[10] = ConditionalHumanInTheLoopMiddleware
+        assert stack[10].__class__.__name__ == "ConditionalHumanInTheLoopMiddleware"
         assert isinstance(stack[11], ToolRetryMiddleware)
         assert isinstance(stack[12], A2ATaskTrackingMiddleware)
         assert isinstance(stack[13], TodoStatusMiddleware)

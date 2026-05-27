@@ -26,6 +26,7 @@ import { RateCardsPage } from './pages/admin/RateCardsPage';
 import { BugReportsPage } from './pages/admin/BugReportsPage';
 import { ScimTokensPage } from './pages/admin/ScimTokensPage';
 import { OutboundScimPage } from './pages/admin/OutboundScimPage';
+import { ToolRiskScoresPage } from './pages/admin/ToolRiskScoresPage';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth();
@@ -157,6 +158,14 @@ function App() {
           element={
             <AdminRoute>
               <OutboundScimPage />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="admin/tool-risk-scores"
+          element={
+            <AdminRoute>
+              <ToolRiskScoresPage />
             </AdminRoute>
           }
         />

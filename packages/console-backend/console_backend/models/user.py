@@ -166,6 +166,7 @@ class UserSettings(BaseModel):
     enable_thinking: bool | None = None
     thinking_level: OrchestratorThinkingLevel | None = None
     phone_number_override: str | None = None
+    tool_bypass_rules: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -189,6 +190,7 @@ class UserSettingsUpdate(BaseModel):
     enable_thinking: bool | None = None
     thinking_level: OrchestratorThinkingLevel | None = None
     phone_number_override: str | None = None
+    tool_bypass_rules: dict[str, Any] | None = None
 
 
 class UserSettingsResponse(BaseModel):

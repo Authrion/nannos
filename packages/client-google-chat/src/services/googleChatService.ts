@@ -459,7 +459,8 @@ export class GoogleChatService {
   /**
    * Build a generic HITL (Human-in-the-Loop) approval card for any tool interrupt.
    * Shows Approve + Reject buttons, and optionally a "Request Changes" button
-   * when "edit" is in the tool's allowed_decisions.
+   * when "edit" is in the tool's allowed_decisions. Risk-scored tools also get
+   * "Always Allow" and "Allow Pattern" bypass buttons.
    */
   buildHitlCard(
     config: Config,
@@ -472,16 +473,22 @@ export class GoogleChatService {
     const toolLabel = toolName.replace(/_/g, ' ');
     const buttonClickHandlerUrl = new URL(`/api/v1/chat/events`, config.baseUrl).toString();
     const editAllowed = allowedDecisions.includes('edit');
+    const approveAllowed = allowedDecisions.includes('approve');
 
     // Extract proposed args for display
     const CONTENT_KEYS = ['content', 'body', 'description'];
+    const HIDDEN_KEYS = ['reason', '_risk_metadata'];
     const firstAction = actionRequests?.[0];
     const toolArgs = firstAction?.args || {};
     const contentKey = CONTENT_KEYS.find((k: string) => k in toolArgs);
     const proposedContent = contentKey ? String(toolArgs[contentKey] || '') : '';
     const metaEntries = Object.entries(toolArgs).filter(
-      ([k]) => !CONTENT_KEYS.includes(k) && k !== 'reason'
+      ([k]) => !CONTENT_KEYS.includes(k) && !HIDDEN_KEYS.includes(k)
     );
+
+    // Extract risk metadata for bypass buttons
+    const riskMeta = toolArgs._risk_metadata as { source?: string; score?: number; threshold?: number; matched_pattern?: string | null } | undefined;
+    const isRiskScored = riskMeta?.source === 'risk_score';
 
     const buttons: any[] = [
       {
@@ -521,6 +528,38 @@ export class GoogleChatService {
       });
     }
 
+    // Bypass buttons — only for risk-scored tools
+    if (isRiskScored && approveAllowed) {
+      if (riskMeta!.matched_pattern) {
+        buttons.push({
+          text: '🔓 Allow Pattern',
+          onClick: {
+            action: {
+              function: buttonClickHandlerUrl,
+              parameters: [
+                { key: 'cardId', value: 'hitl_card' },
+                { key: 'action', value: 'approve_bypass_pattern' },
+                { key: 'parameters', value: JSON.stringify({ ...parameters, matchedPattern: riskMeta!.matched_pattern }) },
+              ],
+            },
+          },
+        });
+      }
+      buttons.push({
+        text: '🔓 Always Allow',
+        onClick: {
+          action: {
+            function: buttonClickHandlerUrl,
+            parameters: [
+              { key: 'cardId', value: 'hitl_card' },
+              { key: 'action', value: 'approve_bypass_tool' },
+              { key: 'parameters', value: JSON.stringify(parameters) },
+            ],
+          },
+        },
+      });
+    }
+
     buttons.push({
       text: '❌ Reject',
       onClick: {
@@ -551,6 +590,24 @@ export class GoogleChatService {
                   text: `<b>Reason:</b>\n${reason}`,
                 },
               } as any,
+              // Show risk score indicator for risk-scored tools
+              ...(isRiskScored && riskMeta
+                ? [
+                    {
+                      textParagraph: {
+                        text: (() => {
+                          const pct = Math.round((riskMeta.score ?? 0) * 100);
+                          const riskLabel = pct >= 90 ? 'Critical' : pct >= 80 ? 'High' : pct >= 60 ? 'Medium' : 'Low';
+                          let riskText = `🛡️ <b>Risk:</b> ${riskLabel} (${pct}%)`;
+                          if (riskMeta.matched_pattern) {
+                            riskText += ` — matched: <code>${riskMeta.matched_pattern}</code>`;
+                          }
+                          return riskText;
+                        })(),
+                      },
+                    } as any,
+                  ]
+                : []),
               // Show metadata fields (name, skill_name, visibility, etc.)
               ...(metaEntries.length > 0
                 ? [

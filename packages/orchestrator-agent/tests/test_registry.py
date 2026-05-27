@@ -508,3 +508,152 @@ class TestUserModel:
         assert user.language == "de"
         assert user.custom_prompt == "Always be helpful and concise."
         assert len(user.local_subagents) == 1
+
+
+class TestPersistBypassRules:
+    """Tests for RegistryService.persist_bypass_rules."""
+
+    @pytest.mark.asyncio
+    async def test_persist_bypass_all_rule(self, registry_service):
+        """Test persisting a bypass_all rule calls the correct API."""
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client.put = AsyncMock(return_value=mock_response)
+
+        with patch.object(registry_service, "_get_client", return_value=mock_client):
+            await registry_service.persist_bypass_rules(
+                access_token="test-token",
+                pending_rules=[
+                    {"key": "read_file::github", "rule": {"bypass_all": True}},
+                ],
+            )
+
+        mock_client.put.assert_called_once_with(
+            "/api/v1/auth/me/settings/tool-bypass",
+            json={
+                "tool_name": "read_file",
+                "server_slug": "github",
+                "bypass_all": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_persist_bypass_patterns_rule(self, registry_service):
+        """Test persisting a bypass_patterns rule."""
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client.put = AsyncMock(return_value=mock_response)
+
+        with patch.object(registry_service, "_get_client", return_value=mock_client):
+            await registry_service.persist_bypass_rules(
+                access_token="test-token",
+                pending_rules=[
+                    {
+                        "key": "write_file::_self",
+                        "rule": {"bypass_patterns": {"path": ["/tmp/*"]}},
+                    },
+                ],
+            )
+
+        mock_client.put.assert_called_once_with(
+            "/api/v1/auth/me/settings/tool-bypass",
+            json={
+                "tool_name": "write_file",
+                "server_slug": "_self",
+                "bypass_patterns": {"path": ["/tmp/*"]},
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_persist_multiple_rules(self, registry_service):
+        """Test persisting multiple rules makes multiple API calls."""
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client.put = AsyncMock(return_value=mock_response)
+
+        with patch.object(registry_service, "_get_client", return_value=mock_client):
+            await registry_service.persist_bypass_rules(
+                access_token="test-token",
+                pending_rules=[
+                    {"key": "tool_a::server_a", "rule": {"bypass_all": True}},
+                    {"key": "tool_b::server_b", "rule": {"bypass_all": True}},
+                ],
+            )
+
+        assert mock_client.put.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_persist_empty_rules_is_noop(self, registry_service):
+        """Test that empty pending_rules doesn't make any API calls."""
+        mock_client = AsyncMock()
+
+        with patch.object(registry_service, "_get_client", return_value=mock_client):
+            await registry_service.persist_bypass_rules(
+                access_token="test-token",
+                pending_rules=[],
+            )
+
+        mock_client.put.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_persist_handles_api_failure_gracefully(self, registry_service):
+        """Test that API failures are logged but don't raise."""
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_client.put = AsyncMock(return_value=mock_response)
+
+        with patch.object(registry_service, "_get_client", return_value=mock_client):
+            # Should not raise
+            await registry_service.persist_bypass_rules(
+                access_token="test-token",
+                pending_rules=[
+                    {"key": "tool_a::server_a", "rule": {"bypass_all": True}},
+                ],
+            )
+
+    @pytest.mark.asyncio
+    async def test_persist_handles_network_error_gracefully(self, registry_service):
+        """Test that network errors are caught and don't propagate."""
+        mock_client = AsyncMock()
+        mock_client.put = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+
+        with patch.object(registry_service, "_get_client", return_value=mock_client):
+            # Should not raise
+            await registry_service.persist_bypass_rules(
+                access_token="test-token",
+                pending_rules=[
+                    {"key": "tool_a::server_a", "rule": {"bypass_all": True}},
+                ],
+            )
+
+    @pytest.mark.asyncio
+    async def test_persist_key_without_server_slug(self, registry_service):
+        """Test persisting a rule where key has no :: separator defaults to _self."""
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_client.put = AsyncMock(return_value=mock_response)
+
+        with patch.object(registry_service, "_get_client", return_value=mock_client):
+            await registry_service.persist_bypass_rules(
+                access_token="test-token",
+                pending_rules=[
+                    {"key": "some_tool", "rule": {"bypass_all": True}},
+                ],
+            )
+
+        mock_client.put.assert_called_once_with(
+            "/api/v1/auth/me/settings/tool-bypass",
+            json={
+                "tool_name": "some_tool",
+                "server_slug": "_self",
+                "bypass_all": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )

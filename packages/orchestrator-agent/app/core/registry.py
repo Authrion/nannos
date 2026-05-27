@@ -41,6 +41,7 @@ class UserSettings(BaseModel):
     preferred_model: str | None = None
     enable_thinking: bool | None = None
     thinking_level: ThinkingLevel | None = None
+    tool_bypass_rules: dict[str, Any] = Field(default_factory=dict)
 
     class Config:
         json_encoders = {datetime: lambda v: v.isoformat()}
@@ -131,6 +132,8 @@ class User(BaseModel):
     preferred_model: str | None = None  # User-level preferred model override
     enable_thinking: bool | None = None  # User-level thinking enable override
     thinking_level: ThinkingLevel | None = None  # User-level thinking level override
+    system_role: str = "member"  # System role (member, approver, admin)
+    tool_bypass_rules: dict[str, Any] = Field(default_factory=dict)  # HITL bypass rules
 
 
 class RegistryService:
@@ -257,14 +260,16 @@ class RegistryService:
             headers = {"Authorization": f"Bearer {access_token}"}
 
             # Fetch user various user-specific data concurrently
-            sub_agents, settings, catalog_ids = await asyncio.gather(
+            sub_agents, settings, catalog_ids, user_role = await asyncio.gather(
                 self.get_sub_agents(client, headers, user_sub, sub_agent_config_hash),
                 self._fetch_user_settings(client, headers, user_sub),
                 self._fetch_accessible_catalog_ids(client, headers, user_sub),
+                self._fetch_user_role(client, headers, user_sub),
             )
 
             # Convert to User model format with settings
             user = self._to_user(user_sub, sub_agents, settings, catalog_ids)
+            user.system_role = user_role
 
             # Add playground mode info if applicable
             if sub_agent_config_hash is not None and sub_agents:
@@ -327,6 +332,23 @@ class RegistryService:
         data = response.json()
         settings_data = data.get("data", {})
         return UserSettings.model_validate(settings_data)
+
+    async def _fetch_user_role(self, client: httpx.AsyncClient, headers: dict[str, str], user_sub: str) -> str:
+        """Fetch user's system role from /me endpoint.
+
+        Returns:
+            System role string (member, approver, admin). Defaults to 'member' on failure.
+        """
+        try:
+            response = await client.get("/api/v1/auth/me", headers=headers)
+            if response.status_code != 200:
+                logger.warning(f"Failed to fetch user role for {user_sub}: status={response.status_code}")
+                return "member"
+            data = response.json()
+            return data.get("role", "member")
+        except Exception:
+            logger.exception(f"Error fetching user role for {user_sub}")
+            return "member"
 
     def _to_user(
         self,
@@ -430,4 +452,57 @@ class RegistryService:
             preferred_model=settings.preferred_model,
             enable_thinking=settings.enable_thinking,
             thinking_level=settings.thinking_level,
+            tool_bypass_rules=settings.tool_bypass_rules,
         )
+
+    async def persist_bypass_rules(
+        self,
+        access_token: str,
+        pending_rules: list[dict[str, Any]],
+    ) -> None:
+        """Persist pending bypass rules to the console backend.
+
+        Called after a turn completes when the HITL middleware recorded
+        bypass approvals in _pending_bypass_rules.
+
+        Args:
+            access_token: User's access token for authenticated API call
+            pending_rules: List of {"key": "tool::server", "rule": {...}} dicts
+        """
+        if not pending_rules:
+            return
+
+        client = await self._get_client()
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        for entry in pending_rules:
+            key: str = entry["key"]
+            rule: dict[str, Any] = entry["rule"]
+
+            # Parse key into tool_name and server_slug
+            parts = key.split("::", 1)
+            tool_name = parts[0]
+            server_slug = parts[1] if len(parts) > 1 else "_self"
+
+            body: dict[str, Any] = {
+                "tool_name": tool_name,
+                "server_slug": server_slug,
+            }
+
+            if rule.get("bypass_all"):
+                body["bypass_all"] = True
+            elif rule.get("bypass_patterns"):
+                body["bypass_patterns"] = rule["bypass_patterns"]
+            else:
+                body["bypass_all"] = True
+
+            try:
+                response = await client.put(
+                    "/api/v1/auth/me/settings/tool-bypass",
+                    json=body,
+                    headers=headers,
+                )
+                if response.status_code != 200:
+                    logger.warning(f"Failed to persist bypass rule for '{key}': status={response.status_code}")
+            except Exception:
+                logger.exception(f"Error persisting bypass rule for '{key}'")

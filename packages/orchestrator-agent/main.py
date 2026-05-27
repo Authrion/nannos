@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import asyncio
+
 import click
 import httpx
 import uvicorn
@@ -28,6 +30,10 @@ from a2a.types import (
     SecurityScheme,
 )
 from agent_common.core.model_factory import MODEL_CONFIG, get_available_models_metadata, get_default_model
+from agent_common.core.sandbox_pool import SandboxPool
+from agent_common.core.tool_risk_cache import ToolRiskCache
+from gatana_client import GatanaClient
+from gatana_langchain import GatanaSandbox
 from rcplus_alloy_common.logging import configure_existing_logger, configure_logger
 from ringier_a2a_sdk.cost_tracking import CostLogger
 from ringier_a2a_sdk.cost_tracking.logger import get_request_access_token
@@ -46,6 +52,7 @@ from app.core.a2a_extensions import (
 from app.core.agent import OrchestratorDeepAgent
 from app.core.budget_guard import init_budget_guard
 from app.core.executor import OrchestratorDeepAgentExecutor
+from app.core.risk_score_api_client import HttpRiskScoreAPIClient
 from app.models.config import AgentSettings
 
 logger = configure_logger("main")
@@ -96,16 +103,9 @@ def create_lifespan(agent_executor: OrchestratorDeepAgentExecutor):
         sandbox_provider_name = os.environ.get("SANDBOX_PROVIDER")
         if sandbox_provider_name:
             try:
-                from agent_common.core.sandbox_pool import SandboxPool
-
                 warm_ttl = float(os.environ.get("SANDBOX_WARM_TTL", "300"))
 
                 if sandbox_provider_name == "gatana":
-                    import asyncio as _aio
-
-                    from gatana_client import GatanaClient
-                    from gatana_langchain import GatanaSandbox
-
                     if not os.environ.get("GATANA_API_KEY") or not os.environ.get("GATANA_ORG_ID"):
                         raise ValueError(
                             "GATANA_API_KEY and GATANA_ORG_ID environment variables must be set for Gatana sandbox provider"
@@ -114,7 +114,7 @@ def create_lifespan(agent_executor: OrchestratorDeepAgentExecutor):
 
                     async def _create_sandbox():
                         client = GatanaClient()
-                        return await _aio.to_thread(GatanaSandbox, client=client)
+                        return await asyncio.to_thread(GatanaSandbox, client=client)
 
                     capacity = int(os.environ.get("SANDBOX_POOL_CAPACITY") or "0") or max(1, org_capacity - 2)
                 else:
@@ -140,6 +140,30 @@ def create_lifespan(agent_executor: OrchestratorDeepAgentExecutor):
         else:
             app.state.sandbox_pool = None
 
+        # Initialize tool risk cache for dynamic HITL scoring
+        tool_risk_cache: ToolRiskCache | None = None
+        try:
+            backend_url_for_cache = os.getenv("CONSOLE_BACKEND_URL", "http://localhost:5001")
+            risk_api_client = HttpRiskScoreAPIClient(
+                base_url=backend_url_for_cache,
+                oauth2_client=agent_executor.agent.oauth2_client,
+                audience=os.getenv("CONSOLE_BACKEND_CLIENT_ID", "agent-console"),
+            )
+
+            tool_risk_cache = ToolRiskCache()
+            # Start cache with API client for DB persistence and periodic refresh.
+            # Initial load may return empty if no token is available yet (first request
+            # will populate via LLM scoring + write-through).
+            await tool_risk_cache.start(risk_api_client)
+
+            app.state.tool_risk_cache = tool_risk_cache
+            app.state.risk_api_client = risk_api_client
+            agent_executor.agent.tool_risk_cache = tool_risk_cache
+            logger.info("Tool risk cache initialized with API client")
+        except Exception as e:
+            logger.warning("Failed to initialize tool risk cache: %s", e)
+            app.state.tool_risk_cache = None
+
         logger.info("Application startup complete")
 
         yield  # Application runs here
@@ -152,6 +176,12 @@ def create_lifespan(agent_executor: OrchestratorDeepAgentExecutor):
         # Shutdown sandbox pool
         if sandbox_pool:
             await sandbox_pool.shutdown()
+
+        # Shutdown tool risk cache and API client
+        if tool_risk_cache:
+            await tool_risk_cache.stop()
+        if hasattr(app.state, "risk_api_client") and app.state.risk_api_client:
+            await app.state.risk_api_client.close()
 
         # Close agent (includes cost logger and database connection pool cleanup)
         await agent_executor.agent.close()
