@@ -141,7 +141,7 @@ export type AuditAction = 'create' | 'update' | 'delete' | 'approve' | 'reject' 
  *
  * Audit entity type enum.
  */
-export type AuditEntityType = 'user' | 'group' | 'sub_agent' | 'session' | 'secret' | 'rate_card' | 'scheduled_job' | 'delivery_channel' | 'catalog' | 'bug_report' | 'scim_token' | 'outbound_scim_endpoint' | 'skill';
+export type AuditEntityType = 'user' | 'group' | 'sub_agent' | 'session' | 'secret' | 'rate_card' | 'scheduled_job' | 'delivery_channel' | 'catalog' | 'bug_report' | 'scim_token' | 'outbound_scim_endpoint' | 'skill' | 'tool_risk_score';
 
 /**
  * AuditLog
