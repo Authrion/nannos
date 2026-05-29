@@ -56,7 +56,7 @@ class AnalyticsService:
         data = [TimeSeriesPoint(period=str(row.period), value=row.active_users) for row in rows]
 
         # Compute summary: current vs previous period
-        current, previous = await self._compute_active_users_summary(db, days, granularity)
+        current, previous = await self._compute_active_users_summary(db, days)
 
         change_percent = None
         if previous > 0:
