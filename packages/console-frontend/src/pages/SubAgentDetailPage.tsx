@@ -106,6 +106,13 @@ const statusConfig: Record<
   rejected: { label: 'Rejected', variant: 'destructive', icon: XCircle },
 };
 
+type SkillDiffInfo = {
+  registryId: string;
+  contentHash: string;
+  name: string;
+  updateTarget?: { type: 'imported-skill'; skillName: string } | { type: 'imported-skill-direct'; skillName: string } | { type: 'activation'; activationId: number };
+};
+
 export function SubAgentDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -190,7 +197,7 @@ export function SubAgentDetailPage() {
   const [skillsWithUpdates, setSkillsWithUpdates] = useState<Set<string>>(new Set());
 
   // Skill diff dialog state
-  const [skillDiffInfo, setSkillDiffInfo] = useState<{ registryId: string; contentHash: string; name: string } | null>(null);
+  const [skillDiffInfo, setSkillDiffInfo] = useState<SkillDiffInfo | null>(null);
 
   // Personal/group skill activations state
   const [showActivateSkillDialog, setShowActivateSkillDialog] = useState(false);
@@ -847,7 +854,7 @@ export function SubAgentDetailPage() {
       });
       if (error || !data) {
         toast.error('Failed to fetch latest version from registry');
-        return;
+        return false;
       }
       const detail = data as { name?: string; slug?: string; description?: string; content_hash?: string };
       setEditSkills((prev) =>
@@ -864,10 +871,101 @@ export function SubAgentDetailPage() {
       });
       handleFieldChange();
       toast.success(`Updated "${skillName}" to latest version`);
+      return true;
+    } catch (error) {
+      console.error('Failed to update skill:', error);
+      toast.error('Failed to update skill. Please try again.');
+      return false;
     } finally {
       setUpdatingSkillName(null);
     }
   };
+
+  const handleConfirmSkillDiffUpdate = async () => {
+    if (!skillDiffInfo?.updateTarget) return;
+
+    if (skillDiffInfo.updateTarget.type === 'imported-skill') {
+      const updated = await handleUpdateImportedSkill(skillDiffInfo.updateTarget.skillName, skillDiffInfo.registryId);
+      if (updated) setSkillDiffInfo(null);
+      return;
+    }
+
+    if (skillDiffInfo.updateTarget.type === 'imported-skill-direct') {
+      // Direct save without entering edit mode — fetch latest and persist immediately
+      const skillName = skillDiffInfo.updateTarget.skillName;
+      setUpdatingSkillName(skillName);
+      try {
+        const { data, error } = await client.get({
+          url: '/api/v1/skills/registry/detail/{skill_id}',
+          path: { skill_id: skillDiffInfo.registryId },
+        });
+        if (error || !data) {
+          toast.error('Failed to fetch latest version from registry');
+          return;
+        }
+        const detail = data as { description?: string; content_hash?: string };
+        const currentSkills: SkillDefinition[] = Array.isArray(subAgent?.config_version?.skills)
+          ? subAgent!.config_version!.skills.map((s: any) => ({
+              name: s.name,
+              description: s.description,
+              body: s.body,
+              files: s.files?.map((f: any) => ({ path: f.path, content: f.content })),
+              registry_id: s.registry_id ?? null,
+              source: s.source ?? null,
+              content_hash: s.content_hash ?? null,
+              scope: s.scope ?? null,
+            }))
+          : [];
+        const updatedSkills = currentSkills.map((s) =>
+          s.name === skillName
+            ? { ...s, description: detail.description ?? s.description, content_hash: detail.content_hash ?? s.content_hash }
+            : s
+        );
+        updateMutation.mutate({
+          path: { sub_agent_id: parseInt(id!, 10) },
+          body: {
+            name: subAgent!.name,
+            is_public: subAgent!.is_public ?? false,
+            description: subAgent!.config_version?.description || '',
+            model: (subAgent!.config_version?.model as any) || undefined,
+            system_prompt: subAgent!.config_version?.system_prompt ?? '',
+            mcp_tools: (subAgent!.config_version?.mcp_tools as string[] | undefined)?.length ? subAgent!.config_version!.mcp_tools as string[] : undefined,
+            enable_thinking: subAgent!.config_version?.enable_thinking ?? false,
+            thinking_level: (subAgent!.config_version?.thinking_level as any) ?? undefined,
+            skills: updatedSkills,
+            sandbox_enabled: subAgent!.config_version?.sandbox_enabled ?? false,
+            change_summary: `Updated skill "${skillName}" to latest version`,
+          },
+        });
+        setSkillDiffInfo(null);
+      } catch (err) {
+        console.error('Failed to directly update skill:', err);
+        toast.error('Failed to update skill. Please try again.');
+      } finally {
+        setUpdatingSkillName(null);
+      }
+      return;
+    }
+
+    try {
+      await updateActivationMutation.mutateAsync({ path: { activation_id: skillDiffInfo.updateTarget.activationId } });
+      setSkillDiffInfo(null);
+    } catch (error) {
+      // mutation onError handles user-facing toast
+      console.error('Failed to update activation from diff dialog', error);
+    }
+  };
+
+  const isSkillDiffUpdatePending = useMemo(() => {
+    if (!skillDiffInfo?.updateTarget) return false;
+    if (skillDiffInfo.updateTarget.type === 'imported-skill') {
+      return updatingSkillName === skillDiffInfo.updateTarget.skillName;
+    }
+    if (skillDiffInfo.updateTarget.type === 'imported-skill-direct') {
+      return updatingSkillName === skillDiffInfo.updateTarget.skillName || updateMutation.isPending;
+    }
+    return updateActivationMutation.isPending;
+  }, [skillDiffInfo, updatingSkillName, updateActivationMutation.isPending, updateMutation.isPending]);
 
   const handleNewConversation = () => {
     createNewConversation(currentVersion || 1);
@@ -1820,9 +1918,33 @@ export function SubAgentDetailPage() {
                                     <button
                                       type="button"
                                       className="text-[10px] text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950 px-1 rounded shrink-0 hover:bg-amber-100 dark:hover:bg-amber-900 cursor-pointer"
-                                      onClick={() => setSkillDiffInfo({ registryId: skill.registry_id!, contentHash: skill.content_hash!, name: skill.name || 'Skill' })}
+                                      onClick={() => setSkillDiffInfo({
+                                        registryId: skill.registry_id!,
+                                        contentHash: skill.content_hash!,
+                                        name: skill.name || 'Skill',
+                                        ...(canEdit && { updateTarget: { type: 'imported-skill-direct' as const, skillName: skill.name! } }),
+                                      })}
                                     >
                                       update available
+                                    </button>
+                                  )}
+                                  {isEditing && skill.scope && skill.scope !== 'sub-agent' && skill.name && skillsWithUpdates.has(skill.name) && skill.registry_id && skill.content_hash && (
+                                    <button
+                                      type="button"
+                                      className="text-[10px] text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950 px-1 rounded shrink-0 hover:bg-amber-100 dark:hover:bg-amber-900 cursor-pointer"
+                                      disabled={updatingSkillName === skill.name}
+                                      onClick={() => setSkillDiffInfo({
+                                        registryId: skill.registry_id!,
+                                        contentHash: skill.content_hash!,
+                                        name: skill.name || 'Skill',
+                                        updateTarget: { type: 'imported-skill', skillName: skill.name! },
+                                      })}
+                                    >
+                                      {updatingSkillName === skill.name ? (
+                                        <Loader2 className="h-3 w-3 animate-spin inline" />
+                                      ) : (
+                                        'update available'
+                                      )}
                                     </button>
                                   )}
                                   {(skill.files?.length ?? 0) > 0 && (
@@ -1837,20 +1959,6 @@ export function SubAgentDetailPage() {
                                   )}
                                   {isEditing && skill.scope && skill.scope !== 'sub-agent' && (
                                     <div className="flex items-center gap-1 opacity-0 group-hover/skill:opacity-100 transition-opacity ml-auto shrink-0">
-                                      {skill.name && skillsWithUpdates.has(skill.name) && (
-                                        <button
-                                          type="button"
-                                          className="text-primary hover:text-primary/80 text-[10px] font-medium"
-                                          disabled={updatingSkillName === skill.name}
-                                          onClick={() => handleUpdateImportedSkill(skill.name!, skill.registry_id!)}
-                                        >
-                                          {updatingSkillName === skill.name ? (
-                                            <Loader2 className="h-3 w-3 animate-spin" />
-                                          ) : (
-                                            'Update'
-                                          )}
-                                        </button>
-                                      )}
                                       <button
                                         type="button"
                                         className="text-destructive hover:text-destructive/80"
@@ -2070,7 +2178,12 @@ export function SubAgentDetailPage() {
                     {activation.update_available && (
                       <button
                         type="button"
-                        onClick={() => setSkillDiffInfo({ registryId: activation.registry_id, contentHash: activation.content_hash, name: activation.skill_name })}
+                        onClick={() => setSkillDiffInfo({
+                          registryId: activation.registry_id,
+                          contentHash: activation.content_hash,
+                          name: activation.skill_name,
+                          updateTarget: { type: 'activation', activationId: activation.id },
+                        })}
                       >
                         <Badge variant="default" className="text-[9px] px-1 py-0 bg-amber-500 hover:bg-amber-600 shrink-0 cursor-pointer">
                           <ArrowUpCircle className="h-2 w-2 mr-0.5" />
@@ -2089,7 +2202,12 @@ export function SubAgentDetailPage() {
                           type="button"
                           className="text-primary hover:text-primary/80 p-0.5"
                           title="Update to latest"
-                          onClick={() => updateActivationMutation.mutate({ path: { activation_id: activation.id } })}
+                          onClick={() => setSkillDiffInfo({
+                            registryId: activation.registry_id,
+                            contentHash: activation.content_hash,
+                            name: activation.skill_name,
+                            updateTarget: { type: 'activation', activationId: activation.id },
+                          })}
                           disabled={updateActivationMutation.isPending}
                         >
                           <RefreshCw className="h-3 w-3" />
@@ -2648,6 +2766,9 @@ export function SubAgentDetailPage() {
         registryId={skillDiffInfo?.registryId ?? ''}
         pinnedContentHash={skillDiffInfo?.contentHash ?? ''}
         skillName={skillDiffInfo?.name ?? ''}
+        onConfirmUpdate={skillDiffInfo?.updateTarget ? handleConfirmSkillDiffUpdate : undefined}
+        confirmPending={isSkillDiffUpdatePending}
+        confirmLabel="Update to latest"
       />
     </div>
   );
