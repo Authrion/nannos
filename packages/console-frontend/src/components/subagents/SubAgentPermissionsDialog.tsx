@@ -37,6 +37,7 @@ import {
   getSubAgentPermissionsApiV1SubAgentsSubAgentIdPermissionsGetOptions,
   updateSubAgentPermissionsApiV1SubAgentsSubAgentIdPermissionsPutMutation,
   listMyGroupsApiV1GroupsGetOptions,
+  listGroupsApiV1AdminGroupsGetOptions,
   getGroupAccessibleAgentsApiV1GroupsGroupIdAccessibleAgentsGetOptions,
   addGroupDefaultAgentApiV1GroupsGroupIdDefaultAgentsSubAgentIdPostMutation,
   removeGroupDefaultAgentApiV1GroupsGroupIdDefaultAgentsSubAgentIdDeleteMutation,
@@ -65,8 +66,10 @@ export function SubAgentPermissionsDialog({
   onOpenChange,
 }: SubAgentPermissionsDialogProps) {
   const queryClient = useQueryClient();
-  const { user } = useAuth();
-  const isAdmin = user?.is_administrator ?? false;
+  const { isAdmin, adminMode } = useAuth();
+
+  // Only use admin group API if admin mode is enabled
+  const canUseAdminGroups = isAdmin && adminMode;
   const [groupPermissions, setGroupPermissions] = useState<Map<number, GroupPermissionState>>(new Map());
   const [defaultGroups, setDefaultGroups] = useState<Set<number>>(new Set());
   const [initialDefaults, setInitialDefaults] = useState<Set<number>>(new Set());
@@ -82,14 +85,24 @@ export function SubAgentPermissionsDialog({
     retry: false,
   });
 
-  // Fetch available groups - use regular groups endpoint (shows groups where user is a member)
-  const { data: groupsData, isLoading: isLoadingGroups, error: groupsError } = useQuery({
-    ...listMyGroupsApiV1GroupsGetOptions(),
-    enabled: open,
+  // Fetch available groups - admin mode: all groups, else only own groups
+  const { data: adminGroupsData, isLoading: isLoadingAdminGroups, error: adminGroupsError } = useQuery({
+    ...listGroupsApiV1AdminGroupsGetOptions({ query: { limit: 100 } }),
+    enabled: open && canUseAdminGroups,
     retry: false,
   });
 
-  const availableGroups: UserGroupWithMembers[] = groupsData ?? [];
+  const { data: myGroupsData, isLoading: isLoadingMyGroups, error: myGroupsError } = useQuery({
+    ...listMyGroupsApiV1GroupsGetOptions(),
+    enabled: open && !canUseAdminGroups,
+    retry: false,
+  });
+
+  const isLoadingGroups = canUseAdminGroups ? isLoadingAdminGroups : isLoadingMyGroups;
+  const groupsError = canUseAdminGroups ? adminGroupsError : myGroupsError;
+  const availableGroups: UserGroupWithMembers[] = canUseAdminGroups
+    ? (adminGroupsData?.data ?? [])
+    : (myGroupsData ?? []);
 
   // Filter groups based on search
   const filteredGroups = availableGroups.filter(group => {
