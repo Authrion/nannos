@@ -169,10 +169,10 @@ class AnalyticsService:
             SELECT
                 (SELECT COUNT(*) FROM previous_week_users) AS previous_week_active_users,
                 (SELECT COUNT(*) FROM current_week_users) AS current_week_active_users,
-                (SELECT count FROM churned) AS churned_users_count,
-                (SELECT COUNT(*) FROM current_week_users) - (SELECT count FROM churned) AS new_or_reactivated,
+                (SELECT churned_count FROM churned) AS churned_users_count,
+                (SELECT COUNT(*) FROM current_week_users) - (SELECT churned_count FROM churned) AS new_or_reactivated,
                 ROUND(
-                    100.0 * (SELECT count FROM churned) /
+                    100.0 * (SELECT churned_count FROM churned) /
                     NULLIF((SELECT COUNT(*) FROM previous_week_users), 0),
                     2
                 ) AS churn_rate_percent
