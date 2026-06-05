@@ -150,7 +150,15 @@ class TestAgentExecutorStreamHandling:
         updater.update_status.assert_called_once()
 
     async def test_handle_stream_item_streaming_completion(self, dynamodb_table):
-        """Test that streaming completion sends empty last chunk and clean status (no content duplication)."""
+        """Streaming completion closes the artifact AND embeds the authoritative final answer.
+
+        Regression for the production incident on 2026-05-25 where a downstream A2A client
+        failed to parse a streamed artifact frame and the user never received the reply,
+        because the terminal `completed` status carried no message body. The terminal
+        status must now always carry the validated FinalResponseSchema.message text as a
+        fallback / source-of-truth, tagged with `final_answer_source: "fallback"` so
+        well-behaved clients that already rendered the streamed artifact can dedupe.
+        """
         from app.models.responses import AgentStreamResponse
 
         executor = OrchestratorDeepAgentExecutor()
@@ -178,6 +186,7 @@ class TestAgentExecutorStreamHandling:
             is_final=True,
             streaming_artifact_id="artifact-1",
             first_chunk_sent=True,
+            streamed_bytes=45,
         )
 
         # Last artifact chunk should be empty (just stream close signal)
@@ -189,15 +198,174 @@ class TestAgentExecutorStreamHandling:
         parts = artifact_call[0][0]
         assert parts[0].root.text == ""
 
-        # Completion status should have NO content message (backend handles persistence)
+        # Completion status MUST carry the authoritative final answer as a fallback
         updater.update_status.assert_called_once()
         status_call = updater.update_status.call_args
         assert status_call[0][0] == TaskState.completed
-        # Second positional arg (message) should not be provided — defaults to None
-        assert len(status_call[0]) == 1
+        # Second positional arg is the message carrying the final answer text
+        assert len(status_call[0]) == 2
+        final_msg = status_call[0][1]
+        text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
+        assert "Full response content" in "".join(text_parts)
+        # Metadata flag signals well-behaved clients to dedupe against the artifact stream
+        assert status_call[1]["metadata"]["final_answer_source"] == "fallback"
 
-        # first_chunk_sent should still be True
-        assert result is True
+        # _handle_stream_item now returns (first_chunk_sent, first_intermediate_chunk_sent)
+        assert result == (True, False)
+
+    async def test_handle_stream_item_streaming_completion_empty_content_fallback(self, dynamodb_table):
+        """If the agent yields an empty final content (edge case), the terminal status
+        still carries a non-empty message body so the client never gets a blank reply.
+        """
+        from app.models.responses import AgentStreamResponse
+
+        executor = OrchestratorDeepAgentExecutor()
+
+        updater = Mock()
+        updater.add_artifact = AsyncMock()
+        updater.update_status = AsyncMock()
+
+        task = Mock()
+        task.context_id = "ctx-123"
+        task.id = "task-456"
+
+        item = AgentStreamResponse(state=TaskState.completed, content="")
+
+        await executor._handle_stream_item(
+            item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-1",
+            first_chunk_sent=True,
+        )
+
+        status_call = updater.update_status.call_args
+        assert status_call[0][0] == TaskState.completed
+        final_msg = status_call[0][1]
+        text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
+        assert "".join(text_parts).strip() != ""
+
+    async def test_handle_stream_item_streaming_first_chunk_creates_artifact(self, dynamodb_table):
+        """Regression: the FIRST streaming chunk for an artifact_id must be a create (append=False).
+
+        Production bug: the orchestrator always passed append=True, which made the A2A SDK
+        drop the bytes with `Received append=True for nonexistent artifact index ... Ignoring chunk.`
+        and the final short reply (e.g. "Hello! How can I help you today?") never reached the client.
+        Subsequent chunks for the same artifact must use append=True.
+        """
+        from app.models.responses import AgentStreamResponse
+
+        executor = OrchestratorDeepAgentExecutor()
+
+        updater = Mock()
+        updater.add_artifact = AsyncMock()
+
+        task = Mock()
+        task.context_id = "ctx-123"
+        task.id = "task-456"
+
+        # First chunk: nothing sent yet → must create (append=False)
+        first_item = AgentStreamResponse(
+            state=TaskState.working,
+            content="Hello! ",
+            metadata={"streaming_chunk": True},
+        )
+        result = await executor._handle_stream_item(
+            first_item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-X",
+            first_chunk_sent=False,
+            first_intermediate_chunk_sent=False,
+        )
+        first_call = updater.add_artifact.call_args
+        assert first_call[1]["append"] is False, "First chunk must create the artifact (append=False)"
+        assert first_call[1]["artifact_id"] == "artifact-X"
+        assert result == (True, False)
+
+        # Subsequent chunk: artifact already exists → append=True
+        second_item = AgentStreamResponse(
+            state=TaskState.working,
+            content="How can I help?",
+            metadata={"streaming_chunk": True},
+        )
+        result = await executor._handle_stream_item(
+            second_item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-X",
+            first_chunk_sent=result[0],
+            first_intermediate_chunk_sent=result[1],
+        )
+        second_call = updater.add_artifact.call_args
+        assert second_call[1]["append"] is True, "Subsequent chunks must append=True"
+        assert result == (True, False)
+
+    async def test_handle_stream_item_intermediate_artifact_tracked_separately(self, dynamodb_table):
+        """Intermediate (sub-agent thought) artifact creation is tracked independently
+        from the main artifact, since they use distinct artifact IDs.
+        """
+        from app.core.a2a_extensions import INTERMEDIATE_OUTPUT_EXTENSION
+        from app.models.responses import AgentStreamResponse
+
+        executor = OrchestratorDeepAgentExecutor()
+
+        updater = Mock()
+        updater.add_artifact = AsyncMock()
+
+        task = Mock()
+        task.context_id = "ctx-123"
+        task.id = "task-456"
+
+        # Intermediate-output extension must be active for the chunk to be emitted
+        active = {INTERMEDIATE_OUTPUT_EXTENSION}
+
+        # First intermediate chunk → create (append=False) on "-thought" artifact;
+        # main first_chunk_sent must NOT be flipped (only intermediate flag flips).
+        intermediate_item = AgentStreamResponse(
+            state=TaskState.working,
+            content="thinking...",
+            metadata={"streaming_chunk": True, "intermediate_output": True},
+        )
+        result = await executor._handle_stream_item(
+            intermediate_item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-X",
+            first_chunk_sent=False,
+            first_intermediate_chunk_sent=False,
+            active_extensions=active,
+        )
+        call = updater.add_artifact.call_args
+        assert call[1]["append"] is False, "First intermediate chunk must create the thought artifact"
+        assert call[1]["artifact_id"] == "artifact-X-thought"
+        # Main flag stays False so include_subagent_output / final answer still works
+        assert result == (False, True)
+
+        # First MAIN chunk afterwards → must still be a create on the main artifact
+        main_item = AgentStreamResponse(
+            state=TaskState.working,
+            content="The answer",
+            metadata={"streaming_chunk": True},
+        )
+        result = await executor._handle_stream_item(
+            main_item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-X",
+            first_chunk_sent=result[0],
+            first_intermediate_chunk_sent=result[1],
+            active_extensions=active,
+        )
+        call = updater.add_artifact.call_args
+        assert call[1]["append"] is False, "First main chunk must create the main artifact"
+        assert call[1]["artifact_id"] == "artifact-X"
+        assert result == (True, True)
 
     async def test_handle_stream_item_failed_state(self, dynamodb_table):
         """Test handling failed state stream items."""
@@ -255,6 +423,234 @@ class TestAgentExecutorStreamHandling:
         updater.update_status.assert_called_once()
         call_args = updater.update_status.call_args
         assert call_args[0][0] == TaskState.auth_required
+
+    async def test_handle_stream_item_input_required_carries_final_message(self, dynamodb_table):
+        """Generic (non-HITL) input_required terminal status MUST carry the
+        FinalResponseSchema.message text in its message body so clients receive
+        the orchestrator's reply even if intermediate SSE artifact frames were
+        dropped. Mirrors the `completed` contract introduced in Task #20.
+        """
+        from app.models.responses import AgentStreamResponse
+
+        executor = OrchestratorDeepAgentExecutor()
+
+        updater = Mock()
+        updater.update_status = AsyncMock()
+        updater.add_artifact = AsyncMock()
+
+        task = Mock()
+        task.context_id = "ctx-123"
+        task.id = "task-456"
+
+        item = AgentStreamResponse(
+            state=TaskState.input_required,
+            content="Hi — I'm here. What would you like to do?",
+        )
+
+        await executor._handle_stream_item(
+            item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-1",
+        )
+
+        # No streaming this turn → no artifact close, just the terminal status
+        updater.add_artifact.assert_not_called()
+        updater.update_status.assert_called_once()
+        status_call = updater.update_status.call_args
+        assert status_call[0][0] == TaskState.input_required
+        final_msg = status_call[0][1]
+        text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
+        assert "Hi — I'm here. What would you like to do?" in "".join(text_parts)
+        # Terminal frame must be flushed deterministically.
+        assert status_call[1].get("final") is True
+
+    async def test_handle_stream_item_streaming_input_required_closes_artifact_with_fallback(self, dynamodb_table):
+        """When orchestrator streamed token chunks this turn and then resolves to
+        input_required, the streaming artifact is closed cleanly and the terminal
+        status carries the authoritative final answer tagged
+        `final_answer_source: "fallback"` for client-side deduping.
+        """
+        from app.models.responses import AgentStreamResponse
+
+        executor = OrchestratorDeepAgentExecutor()
+
+        updater = Mock()
+        updater.add_artifact = AsyncMock()
+        updater.update_status = AsyncMock()
+
+        task = Mock()
+        task.context_id = "ctx-123"
+        task.id = "task-456"
+
+        item = AgentStreamResponse(
+            state=TaskState.input_required,
+            content="Which project should I file the ticket under?",
+        )
+
+        await executor._handle_stream_item(
+            item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-IR",
+            first_chunk_sent=True,
+            streamed_bytes=120,
+        )
+
+        # Artifact stream closed with an empty append+last_chunk frame
+        updater.add_artifact.assert_called_once()
+        artifact_call = updater.add_artifact.call_args
+        assert artifact_call[1]["last_chunk"] is True
+        assert artifact_call[1]["append"] is True
+        assert artifact_call[1]["artifact_id"] == "artifact-IR"
+        parts = artifact_call[0][0]
+        assert parts[0].root.text == ""
+
+        # Terminal status carries the final message + fallback metadata + final=True
+        updater.update_status.assert_called_once()
+        status_call = updater.update_status.call_args
+        assert status_call[0][0] == TaskState.input_required
+        final_msg = status_call[0][1]
+        text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
+        assert "Which project should I file the ticket under?" in "".join(text_parts)
+        assert status_call[1]["metadata"]["final_answer_source"] == "fallback"
+        assert status_call[1]["final"] is True
+
+    async def test_handle_stream_item_auth_required_carries_final_message(self, dynamodb_table):
+        """auth_required terminal status MUST carry the FinalResponseSchema.message
+        text in its message body so clients receive the orchestrator's reply even
+        if intermediate SSE artifact frames were dropped. Mirrors `completed`.
+        """
+        from app.models.responses import AgentStreamResponse
+
+        executor = OrchestratorDeepAgentExecutor()
+
+        updater = Mock()
+        updater.update_status = AsyncMock()
+        updater.add_artifact = AsyncMock()
+
+        task = Mock()
+        task.context_id = "ctx-123"
+        task.id = "task-456"
+
+        item = AgentStreamResponse(
+            state=TaskState.auth_required,
+            content="Please sign in to Jira to continue.",
+        )
+
+        await executor._handle_stream_item(
+            item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-1",
+        )
+
+        updater.add_artifact.assert_not_called()
+        updater.update_status.assert_called_once()
+        status_call = updater.update_status.call_args
+        assert status_call[0][0] == TaskState.auth_required
+        final_msg = status_call[0][1]
+        text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
+        assert "Please sign in to Jira to continue." in "".join(text_parts)
+        assert status_call[1].get("final") is True
+
+    async def test_handle_stream_item_streaming_auth_required_closes_artifact_with_fallback(self, dynamodb_table):
+        """When orchestrator streamed token chunks and then resolves to
+        auth_required, the streaming artifact is closed cleanly and the terminal
+        status carries the authoritative final answer tagged
+        `final_answer_source: "fallback"`.
+        """
+        from app.models.responses import AgentStreamResponse
+
+        executor = OrchestratorDeepAgentExecutor()
+
+        updater = Mock()
+        updater.add_artifact = AsyncMock()
+        updater.update_status = AsyncMock()
+
+        task = Mock()
+        task.context_id = "ctx-123"
+        task.id = "task-456"
+
+        item = AgentStreamResponse(
+            state=TaskState.auth_required,
+            content="Please re-authenticate with Google to continue.",
+        )
+
+        await executor._handle_stream_item(
+            item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-AR",
+            first_chunk_sent=True,
+            streamed_bytes=80,
+        )
+
+        updater.add_artifact.assert_called_once()
+        artifact_call = updater.add_artifact.call_args
+        assert artifact_call[1]["last_chunk"] is True
+        assert artifact_call[1]["append"] is True
+        assert artifact_call[1]["artifact_id"] == "artifact-AR"
+        parts = artifact_call[0][0]
+        assert parts[0].root.text == ""
+
+        updater.update_status.assert_called_once()
+        status_call = updater.update_status.call_args
+        assert status_call[0][0] == TaskState.auth_required
+        final_msg = status_call[0][1]
+        text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
+        assert "Please re-authenticate with Google to continue." in "".join(text_parts)
+        assert status_call[1]["metadata"]["final_answer_source"] == "fallback"
+        assert status_call[1]["final"] is True
+
+    async def test_handle_stream_item_input_required_hitl_path_unchanged(self, dynamodb_table):
+        """HITL action_requests interrupts still emit the structured HITL message
+        via new_hitl_interrupt_message (no artifact-fallback, no final_answer_source).
+        """
+        from app.core.a2a_extensions import HUMAN_IN_THE_LOOP_EXTENSION
+        from app.models.responses import AgentStreamResponse
+
+        executor = OrchestratorDeepAgentExecutor()
+
+        updater = Mock()
+        updater.update_status = AsyncMock()
+        updater.add_artifact = AsyncMock()
+
+        task = Mock()
+        task.context_id = "ctx-123"
+        task.id = "task-456"
+
+        item = AgentStreamResponse(
+            state=TaskState.input_required,
+            content="Approve creating Jira ticket?",
+            metadata={
+                "action_requests": [
+                    {"name": "create_jira_ticket", "args": {"summary": "x"}, "id": "call_1"}
+                ],
+            },
+        )
+
+        await executor._handle_stream_item(
+            item,
+            updater,
+            task,
+            is_final=True,
+            streaming_artifact_id="artifact-1",
+            active_extensions={HUMAN_IN_THE_LOOP_EXTENSION},
+        )
+
+        # HITL path: no artifact close, no final_answer_source metadata, no final=True override
+        updater.add_artifact.assert_not_called()
+        updater.update_status.assert_called_once()
+        status_call = updater.update_status.call_args
+        assert status_call[0][0] == TaskState.input_required
+        # HITL branch passes only (state, msg) positionally and no metadata kwarg
+        assert "metadata" not in status_call[1] or status_call[1].get("metadata") is None
+        assert "final" not in status_call[1] or status_call[1].get("final") is not True
 
 
 class TestZeroTrustUserIdExtraction:
