@@ -26,10 +26,11 @@ build_sub_agent_graph
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import logging
 import os
 import threading
-from typing import TYPE_CHECKING, Any, Iterator, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Iterator, Optional
 
 import httpx
 from langchain_core.tools import BaseTool, ToolException
@@ -49,17 +50,20 @@ from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.summarization import compute_summarization_defaults
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, ToolRetryMiddleware
+from langchain.agents.middleware.types import PrivateStateAttr
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_aws.middleware.prompt_caching import BedrockPromptCachingMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
 from langchain_quickjs import CodeInterpreterMiddleware
+from langchain_quickjs.middleware import REPLState
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.config import get_config
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.types import interrupt
 from ringier_a2a_sdk.cost_tracking import CostLogger
+from typing_extensions import NotRequired
 from ringier_a2a_sdk.middleware.tool_schema_cleaning import ToolSchemaCleaningMiddleware
 
 from agent_common.backends.attachments_store import ContextScopedAttachmentsBackend
@@ -293,6 +297,37 @@ _PTC_EXCLUDED_TOOL_NAMES: frozenset[str] = frozenset(
 )
 
 
+# Checkpointed state key holding the exact set of tool *names* exposed inside the
+# PTC ``eval`` bridge on the most recent model call. Persisted by
+# ``_PTCToleranceCodeInterpreterMiddleware.aafter_model`` so that on an interrupt
+# *resume* — where the model-call hook does not run and ``request.tools`` is empty
+# — the eval REPL re-exposes exactly the (ToolsetSelector-filtered) set the
+# original call used, instead of falling back to the full build-time baseline.
+# Must equal the field name on ``_PTCExposureState``.
+PTC_EXPOSED_TOOL_NAMES_STATE_KEY = "ptc_exposed_tool_names"
+
+
+# Per-invocation relay of the names exposed inside ``eval`` on the current model
+# call, carrying them from ``awrap_model_call`` (where the set is computed) to
+# ``aafter_model`` (the only hook that can write a checkpointed state update).
+# A ContextVar keeps concurrent agent invocations isolated; it is best-effort —
+# if unset on a given turn the resume path simply falls back to the full baseline.
+_ptc_exposed_names_var: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "ptc_exposed_names", default=None
+)
+
+
+class _PTCExposureState(REPLState):
+    """``REPLState`` extended with the checkpointed PTC exposure set.
+
+    The field name MUST match ``PTC_EXPOSED_TOOL_NAMES_STATE_KEY``. ``PrivateStateAttr``
+    keeps it out of the agent's input/output schema while still persisting it in
+    the checkpoint so it survives an interrupt/resume cycle.
+    """
+
+    ptc_exposed_tool_names: NotRequired[Annotated[list[str], PrivateStateAttr]]
+
+
 def _code_interpreter_ptc_enabled() -> bool:
     """Whether PTC (programmatic tool calling) is enabled for the code interpreter.
 
@@ -362,6 +397,11 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
     a lock guards the rare synchronous thread-pool model path.
     """
 
+    # Extend the upstream REPL state with the checkpointed PTC exposure set so the
+    # resume path can rebuild the (filtered) ``tools.*`` namespace from the
+    # checkpoint rather than the full build-time baseline.
+    state_schema = _PTCExposureState  # type: ignore[assignment]
+
     def __init__(
         self,
         *,
@@ -374,6 +414,7 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         default_risk_threshold: float = 0.8,
         tool_server_map: dict[str, str] | None = None,
         excluded_ptc_names: frozenset[str] = _PTC_EXCLUDED_TOOL_NAMES,
+        backend_supports_execution: bool = False,
         **kwargs: Any,
     ) -> None:
         # Force a fresh REPL per ``eval`` call (no cross-eval persistence).
@@ -411,6 +452,11 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         self._ptc_default_risk_threshold = default_risk_threshold
         self._ptc_tool_server_map = tool_server_map
         self._excluded_ptc_names = excluded_ptc_names
+        # Whether the graph's backend can run shell commands. Gates the sandbox
+        # ``execute`` tool: FilesystemMiddleware binds a dead ``execute`` even on
+        # non-sandbox backends, so it must be kept out of the PTC ``eval`` namespace
+        # (and stripped from the model) when execution is unsupported.
+        self._supports_execution = backend_supports_execution
         self._ptc_swap_lock = threading.Lock()
 
     @staticmethod
@@ -457,6 +503,13 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
             name = tool.name
             if name in excluded or name in seen:
                 return
+            # Never expose the sandbox ``execute`` tool when the backend cannot
+            # run commands. ``FilesystemMiddleware`` binds a dead ``execute`` even
+            # on non-sandbox backends, and it arrives here via ``request.tools``;
+            # exposing it would surface a non-functional ``tools.execute`` in the
+            # PTC namespace (the static baseline already gates it out the same way).
+            if name in _PTC_SANDBOX_TOOLS and not self._supports_execution:
+                return
             seen.add(name)
             collected.append(
                 wrap_tool_for_ptc(
@@ -470,26 +523,47 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
 
         # Sub-agent / runner graphs pass their concrete tool set on
         # ``request.tools`` — exactly the sub-agent's whitelisted tools plus the
-        # injected filesystem and self-improvement tools. Exposing only these
-        # mirrors the pre-``eval`` behavior (the model reaches the same tool set,
-        # now via the ``eval`` bridge). The per-user runtime ``tool_registry`` is
-        # intentionally NOT harvested: on the orchestrator it holds hundreds of
-        # MCP tools (and the GP agent injects all 260), which would bloat the PTC
-        # prompt and over-expose tools the agent never whitelisted.
+        # injected filesystem and self-improvement tools (and, for the GP agent,
+        # the ToolsetSelector-filtered subset). This is the authoritative set on a
+        # normal model call. The per-user runtime ``tool_registry`` is never
+        # harvested directly. ``had_request_tools`` distinguishes this path from an
+        # interrupt *resume*, where a ``ToolCallRequest`` carries no ``tools`` list.
+        had_request_tools = False
         for tool in list(getattr(request, "tools", []) or []):
+            if isinstance(tool, BaseTool):
+                had_request_tools = True
             _consider(tool)
 
-        # Durable fallback for interrupt *resume*: the eval tool node replays
-        # without a preceding model call, so ``request.tools`` is empty (a
-        # ``ToolCallRequest`` carries no tool list). Re-expose the agent's own
-        # build-time tools here so the PTC ``tools.*`` bindings the original
-        # ``eval`` referenced are reinstalled on the rebuilt graph. ``_consider``
-        # de-duplicates by name, so this is a no-op on the normal model path
-        # (the live ``request.tools`` instances are already collected above).
-        for tool in self._broaden_baseline_tools:
-            _consider(tool)
+        # Interrupt *resume* only: the eval tool node replays without a preceding
+        # model call, so ``request.tools`` is empty. Rebuild from the agent's
+        # build-time baseline, but filter it to the exposure set checkpointed by
+        # ``aafter_model`` on the original call — so the REPL re-exposes exactly the
+        # (filtered) ``tools.*`` namespace the original ``eval`` referenced, not the
+        # full registry. When no checkpointed set is available (older checkpoint,
+        # or selection never ran) the full baseline is used as a safe fallback.
+        if not had_request_tools:
+            selected = self._checkpointed_exposure(request)
+            for tool in self._broaden_baseline_tools:
+                if selected is not None and tool.name not in selected:
+                    continue
+                _consider(tool)
 
         return collected
+
+    @staticmethod
+    def _checkpointed_exposure(request: Any) -> set[str] | None:
+        """Return the checkpointed PTC exposure name set, or ``None`` if absent.
+
+        Read from the request's checkpointed state on the interrupt-resume path so
+        the rebuilt ``eval`` namespace mirrors the original (filtered) call.
+        """
+        state = getattr(request, "state", None)
+        if not isinstance(state, dict):
+            return None
+        names = state.get(PTC_EXPOSED_TOOL_NAMES_STATE_KEY)
+        if not names:
+            return None
+        return set(names)
 
     def _ptc_prompt_and_hidden(self, request: Any) -> tuple[str, set[str]]:
         """Build the PTC prompt and the set of tool names exposed this turn.
@@ -504,7 +578,16 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         if not self._ptc_enabled:
             return self._prepare_for_call(base_request), set()
         exposed = self._collect_ptc_tools(request)
-        hidden = {tool.name for tool in exposed}
+        exposed_names = {tool.name for tool in exposed}
+        # Relay the exposed set to ``aafter_model`` so it can checkpoint it for the
+        # interrupt-resume path (best-effort; same-task ContextVar).
+        _ptc_exposed_names_var.set(sorted(exposed_names))
+        hidden = set(exposed_names)
+        # Also strip the dead sandbox ``execute`` from the model's bound tools on
+        # non-sandbox agents: ``FilesystemMiddleware`` binds it, but it cannot run,
+        # so it is neither PTC-exposed (above) nor left visible to the model.
+        if not self._supports_execution:
+            hidden |= _PTC_SANDBOX_TOOLS
         # _prepare_for_call reads self._ptc synchronously (no awaits) and installs
         # the exposed tools onto the thread-local REPL. Swap in this turn's set,
         # then restore so the shared instance never retains per-user tools.
@@ -560,6 +643,26 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         return await handler(
             request.override(system_message=self._extend(request.system_message, prompt)),
         )
+
+    @staticmethod
+    def _exposure_state_update() -> dict[str, Any] | None:
+        """Checkpoint the PTC exposure set computed during the model call.
+
+        Reads the names relayed by ``_ptc_prompt_and_hidden`` (set on a same-task
+        ContextVar) and persists them so the interrupt-resume path can rebuild the
+        same filtered ``tools.*`` namespace. Returns ``None`` (no state write) when
+        PTC exposure did not run this turn.
+        """
+        names = _ptc_exposed_names_var.get()
+        if not names:
+            return None
+        return {PTC_EXPOSED_TOOL_NAMES_STATE_KEY: list(names)}
+
+    def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        return self._exposure_state_update()
+
+    async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        return self._exposure_state_update()
 
     async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
         """Drive PTC HITL approvals for the ``eval`` tool from the main graph loop.
@@ -741,9 +844,12 @@ def build_code_interpreter_middlewares(
         broaden_baseline_tools: The agent's own build-time tool instances (a
             sub-agent's whitelisted tools plus injected filesystem and
             self-improvement tools). Used only when ``broaden_exposure`` is
-            ``True`` to re-expose the broadened PTC set on an interrupt *resume*,
-            where the model-call hook does not run and ``request.tools`` is
-            unavailable.
+            ``True`` to rebuild the PTC set on an interrupt *resume*, where the
+            model-call hook does not run and ``request.tools`` is unavailable. On
+            resume it is filtered to the exposure set checkpointed by
+            ``aafter_model`` (``PTC_EXPOSED_TOOL_NAMES_STATE_KEY``) so the rebuilt
+            ``tools.*`` namespace mirrors the original (filtered) call; absent a
+            checkpointed set, the full baseline is used as a safe fallback.
         risk_scorer: The dynamic risk scorer (``score_tool_risk``). When
             ``None``, PTC tools run unguarded.
         tool_risk_cache: Shared risk cache fallback when the runtime context
@@ -756,14 +862,17 @@ def build_code_interpreter_middlewares(
     """
     ptc_enabled = _code_interpreter_ptc_enabled()
     static_ptc_tools: list[Any] = []
+    exec_supported = False
     if ptc_enabled:
         from deepagents.middleware.filesystem import supports_execution
 
         # ``execute`` is only meaningful (and only safe to advertise) when the
         # backend can run commands; gate it so non-sandbox agents never expose a
-        # dead ``tools.execute``.
+        # dead ``tools.execute`` — both in the static baseline below and, via
+        # ``backend_supports_execution``, in the per-turn ``request.tools`` harvest.
+        exec_supported = supports_execution(backend)
         baseline_names = _PTC_READONLY_FS_TOOLS | _PTC_MUTATING_FS_TOOLS
-        if supports_execution(backend):
+        if exec_supported:
             baseline_names = baseline_names | _PTC_SANDBOX_TOOLS
 
         fs_tools = FilesystemMiddleware(backend=backend).tools
@@ -789,6 +898,7 @@ def build_code_interpreter_middlewares(
             tool_risk_cache=tool_risk_cache,
             default_risk_threshold=default_risk_threshold,
             tool_server_map=tool_server_map,
+            backend_supports_execution=exec_supported,
             skills_backend=backend,
         )
     ]
