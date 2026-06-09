@@ -65,6 +65,24 @@ from typing_extensions import NotRequired
 
 logger = logging.getLogger(__name__)
 
+# Compiled once at import: `_detect_auth_error` runs on every tool result.
+# Used to pull the structured fields out of an embedded ``need-credentials`` payload.
+_AUTHORIZE_URL_RE = re.compile(r'"authorizeUrl"\s*:\s*"([^"]+)"')
+_AUTH_MESSAGE_RE = re.compile(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+# Looser free-text markers checked as a last resort when no structured payload matches.
+_AUTH_TEXT_PATTERNS = (
+    "authentication required",
+    "authorization required",
+    "secondary authorization",
+    "need credentials",
+    "need-credentials",
+    "please authorize",
+    "login required",
+    "401 unauthorized",
+    "access denied",
+)
+
 
 class AuthErrorState(AgentState):
     """Extended agent state with authentication error tracking.
@@ -564,8 +582,8 @@ class AuthErrorDetectionMiddleware(AgentMiddleware[AuthErrorState, ContextT]):
         #    Detect the marker and extract the fields directly from the text so
         #    we don't depend on the whole payload being parseable JSON.
         if "need-credentials" in content:
-            url_match = re.search(r'"authorizeUrl"\s*:\s*"([^"]+)"', content)
-            msg_match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', content)
+            url_match = _AUTHORIZE_URL_RE.search(content)
+            msg_match = _AUTH_MESSAGE_RE.search(content)
             authorize_url = url_match.group(1) if url_match else ""
             if msg_match:
                 try:
@@ -579,18 +597,7 @@ class AuthErrorDetectionMiddleware(AgentMiddleware[AuthErrorState, ContextT]):
 
         # 3. Looser free-text patterns.
         content_lower = content.lower()
-        auth_patterns = [
-            "authentication required",
-            "authorization required",
-            "secondary authorization",
-            "need credentials",
-            "need-credentials",
-            "please authorize",
-            "login required",
-            "401 unauthorized",
-            "access denied",
-        ]
-        for pattern in auth_patterns:
+        for pattern in _AUTH_TEXT_PATTERNS:
             if pattern in content_lower:
                 logger.info(f"[AUTH MIDDLEWARE] Detected text auth error pattern: {pattern}")
                 return {"auth_url": "", "auth_message": content, "error_code": "auth-required"}
