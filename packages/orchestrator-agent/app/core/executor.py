@@ -133,7 +133,39 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         return {"decisions": [{"type": "reject"}]}
 
     @staticmethod
-    def _build_interrupt_resume_map(interrupts: Any, hitl_decisions: list, query: Any) -> dict[str, Any]:
+    def _action_request_call_id(action_request: Any) -> Any:
+        """Extract the stable per-call id an action_request carries, if any.
+
+        Attached under ``args._risk_metadata.call_id`` by the outbound HITL builders
+        (PTC ``_build_ptc_hitl_request`` and ConditionalHumanInTheLoopMiddleware).
+        Returns ``None`` for action_requests that predate / don't carry it.
+        """
+        if not isinstance(action_request, dict):
+            return None
+        meta = (action_request.get("args") or {}).get("_risk_metadata") or {}
+        return meta.get("call_id") if isinstance(meta, dict) else None
+
+    @classmethod
+    def _decisions_for_interrupt(cls, action_requests: list, hitl_decisions: list, decisions_by_id: dict) -> list:
+        """Resolve the decision list for ONE interrupt, aligned to its action_requests.
+
+        - By id (new clients): when every action_request carries a ``call_id`` and the
+          client sent a decision for each, return one decision per action_request in
+          action_request order. Robust to client ordering and to model replay
+          reordering — the downstream consumers match positionally, so order matters.
+        - Blanket (legacy clients): a single decision is replicated to the
+          action_request count. Anything else passes through unchanged.
+        """
+        n = len(action_requests)
+        call_ids = [cls._action_request_call_id(ar) for ar in action_requests]
+        if n > 0 and all(cid is not None for cid in call_ids) and all(cid in decisions_by_id for cid in call_ids):
+            return [decisions_by_id[cid] for cid in call_ids]
+        if len(hitl_decisions) == 1 and n > 1:
+            return hitl_decisions * n
+        return hitl_decisions
+
+    @classmethod
+    def _build_interrupt_resume_map(cls, interrupts: Any, hitl_decisions: list, query: Any) -> dict[str, Any]:
         """Build an interrupt-id-keyed resume map for ``Command(resume=...)``.
 
         LangGraph >=1.2 requires an id-keyed map whenever more than one interrupt is
@@ -143,17 +175,20 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         (``types.Interrupt.from_ns`` <-> ``pregel/_algo._scratchpad``), so keying by
         ``intr.id`` is correct for 1 *or* N pending interrupts.
 
-        ``hitl_decisions`` is the single blanket approve/reject the UI sends; it is
-        replicated to each HITL interrupt's own ``action_requests`` count. Non-HITL
-        interrupts (auth, etc.) resume with the raw ``query``.
+        Decisions are aligned to each interrupt's ``action_requests`` by per-call id
+        when the client sends them (one decision per call), else the single blanket
+        decision is replicated. A flat by-id decision list is self-routing across both
+        levels of multiplicity — interrupts (by ``intr.id``) and action_requests within
+        an interrupt (by ``call_id``). Non-HITL interrupts (auth, etc.) resume with the
+        raw ``query``.
         """
+        decisions_by_id = {d["id"]: d for d in hitl_decisions if isinstance(d, dict) and "id" in d}
         resume_map: dict[str, Any] = {}
         for intr in interrupts:
             intr_value = getattr(intr, "value", intr)
             if isinstance(intr_value, dict) and "action_requests" in intr_value:
                 action_requests = intr_value.get("action_requests", [])
-                n = len(action_requests)
-                per = hitl_decisions * n if (len(hitl_decisions) == 1 and n > 1) else hitl_decisions
+                per = cls._decisions_for_interrupt(action_requests, hitl_decisions, decisions_by_id)
                 resume_map[intr.id] = {"decisions": per}
                 tool_names = [ar.get("name") for ar in action_requests if isinstance(ar, dict)]
                 logger.info(f"Resuming HITL interrupt {intr.id} for tools {tool_names} with {len(per)} decision(s)")

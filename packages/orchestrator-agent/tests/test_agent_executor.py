@@ -743,6 +743,14 @@ class TestExtractHitlDecisions:
         """Build a fake Interrupt-like object (has .id and .value)."""
         return Mock(id=intr_id, value=value if value is not None else {"action_requests": action_requests or []})
 
+    @staticmethod
+    def _ar(name, call_id=None):
+        """Build an action_request dict, optionally carrying a per-call id."""
+        args: dict = {}
+        if call_id is not None:
+            args["_risk_metadata"] = {"source": "risk_score", "call_id": call_id}
+        return {"name": name, "args": args}
+
     def test_single_reject_replicated_for_parallel_tool_calls(self, dynamodb_table):
         """A single reject is replicated to match N action_requests, keyed by interrupt id.
 
@@ -815,3 +823,62 @@ class TestExtractHitlDecisions:
         resume_map = OrchestratorDeepAgentExecutor._build_interrupt_resume_map([auth_intr], [{"type": "approve"}], query="auth-token")
 
         assert resume_map["e" * 32] == "auth-token"
+
+    def test_per_call_decisions_aligned_by_id(self, dynamodb_table):
+        """New client: one decision per action_request, matched by call_id (not position)."""
+        intr = self._interrupt(
+            "a" * 32,
+            action_requests=[self._ar("safe_read", "call-1"), self._ar("safe_read", "call-2")],
+        )
+        # Client sends per-call decisions, deliberately OUT OF ORDER vs action_requests.
+        decisions = [
+            {"id": "call-2", "type": "reject", "message": "no shadow"},
+            {"id": "call-1", "type": "approve"},
+        ]
+
+        resume_map = OrchestratorDeepAgentExecutor._build_interrupt_resume_map([intr], decisions, query="q")
+
+        per = resume_map["a" * 32]["decisions"]
+        # Aligned to action_request order (call-1 first, call-2 second), not client order.
+        assert [d["type"] for d in per] == ["approve", "reject"]
+        assert per[0]["id"] == "call-1"
+        assert per[1]["id"] == "call-2"
+
+    def test_flat_by_id_decisions_route_across_multiple_interrupts(self, dynamodb_table):
+        """A flat by-id decision list self-routes to the right interrupt and orders within."""
+        intr_a = self._interrupt("a" * 32, action_requests=[self._ar("t1", "ca-1"), self._ar("t2", "ca-2")])
+        intr_b = self._interrupt("b" * 32, action_requests=[self._ar("t3", "cb-1")])
+        decisions = [
+            {"id": "cb-1", "type": "reject"},
+            {"id": "ca-1", "type": "approve"},
+            {"id": "ca-2", "type": "reject"},
+        ]
+
+        resume_map = OrchestratorDeepAgentExecutor._build_interrupt_resume_map([intr_a, intr_b], decisions, query="q")
+
+        assert [d["type"] for d in resume_map["a" * 32]["decisions"]] == ["approve", "reject"]
+        assert [d["type"] for d in resume_map["b" * 32]["decisions"]] == ["reject"]
+
+    def test_falls_back_to_blanket_when_decisions_lack_ids(self, dynamodb_table):
+        """Legacy client: action_requests carry ids but the single decision has none → replicate."""
+        intr = self._interrupt(
+            "a" * 32,
+            action_requests=[self._ar("safe_read", "call-1"), self._ar("safe_read", "call-2")],
+        )
+
+        resume_map = OrchestratorDeepAgentExecutor._build_interrupt_resume_map([intr], [{"type": "approve"}], query="q")
+
+        per = resume_map["a" * 32]["decisions"]
+        assert len(per) == 2
+        assert all(d["type"] == "approve" for d in per)
+
+    def test_falls_back_to_blanket_when_action_requests_lack_ids(self, dynamodb_table):
+        """Mixed/absent ids on action_requests → no by-id alignment; blanket replication."""
+        intr = self._interrupt("a" * 32, action_requests=[self._ar("t1"), self._ar("t2", "call-2")])
+        decisions = [{"id": "call-2", "type": "approve"}]
+
+        resume_map = OrchestratorDeepAgentExecutor._build_interrupt_resume_map([intr], decisions, query="q")
+
+        # Not all action_requests have ids → fall back. Single decision, n>1 → replicate.
+        per = resume_map["a" * 32]["decisions"]
+        assert len(per) == 2

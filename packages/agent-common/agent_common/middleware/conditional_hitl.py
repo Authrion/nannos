@@ -330,6 +330,10 @@ class ConditionalHumanInTheLoopMiddleware(HumanInTheLoopMiddleware[StateT, Conte
                     "matched_pattern": matched_pattern,
                     "server_slug": server_slug,
                     "tool_name": tool_name,
+                    # Stable per-call id so the client can return one decision per
+                    # action_request and the resume path can align decisions by id
+                    # (see executor._build_interrupt_resume_map).
+                    "call_id": tool_call["id"],
                 },
             }
 
