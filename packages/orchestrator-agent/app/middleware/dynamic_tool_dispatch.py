@@ -1707,22 +1707,11 @@ class DynamicToolDispatchMiddleware(AgentMiddleware[AgentState, GraphRuntimeCont
                             user_decisions = interrupt(pending_interrupt_value)
                             # ── Resumed after user approval ──────────────────────────────────────
                             logger.info(f"[HITL] User responded to '{subagent_type}' HITL: {user_decisions}")
-                            # Safety net: replicate single decision for multiple action_requests.
-                            # The frontend always sends exactly 1 decision; the executor normally
-                            # replicates it, but this guards against edge cases where it doesn't.
-                            if isinstance(user_decisions, dict):
-                                decisions_list = user_decisions.get("decisions", [])
-                                expected = (
-                                    len(pending_interrupt_value.get("action_requests", []))
-                                    if isinstance(pending_interrupt_value, dict)
-                                    else 0
-                                )
-                                if len(decisions_list) == 1 and expected > 1:
-                                    logger.info(
-                                        f"[HITL] Replicating single decision to match {expected} action_requests "
-                                        f"for '{subagent_type}' (PATH 1)"
-                                    )
-                                    user_decisions = {"decisions": decisions_list * expected}
+                            # Pass decisions through as-is. Replication (single blanket decision
+                            # → N items) happens inside awrap_tool_call where len(pending) is
+                            # known accurately. Replicating here against the checkpoint's
+                            # action_requests count can produce the wrong N if the checkpoint
+                            # snapshot and the live pending list diverge.
                             subagent_input = Command(resume=user_decisions if isinstance(user_decisions, dict) else {})
                             break
             except GraphInterrupt:
@@ -1983,18 +1972,7 @@ class DynamicToolDispatchMiddleware(AgentMiddleware[AgentState, GraphRuntimeCont
             user_decisions = interrupt(sub_interrupt_value)
             # ── Resumed after user approval (via except handler) ─────────────────────
             logger.info(f"[HITL] User responded to '{subagent_type}' HITL (resume): {user_decisions}")
-            # Safety net: replicate single decision for multiple action_requests.
-            if isinstance(user_decisions, dict):
-                decisions_list = user_decisions.get("decisions", [])
-                expected = (
-                    len(sub_interrupt_value.get("action_requests", [])) if isinstance(sub_interrupt_value, dict) else 0
-                )
-                if len(decisions_list) == 1 and expected > 1:
-                    logger.info(
-                        f"[HITL] Replicating single decision to match {expected} action_requests "
-                        f"for '{subagent_type}' (PATH 2)"
-                    )
-                    user_decisions = {"decisions": decisions_list * expected}
+            # Pass decisions through as-is — replication happens in awrap_tool_call.
             resume_command = Command(resume=user_decisions if isinstance(user_decisions, dict) else {})
             # Re-stream the sub-agent with the resume command
             final_result = None
