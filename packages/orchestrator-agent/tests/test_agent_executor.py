@@ -186,7 +186,7 @@ class TestAgentExecutorStreamHandling:
             is_final=True,
             streaming_artifact_id="artifact-1",
             first_chunk_sent=True,
-            streamed_bytes=45,
+            streamed_chars=45,
         )
 
         # Last artifact chunk should be empty (just stream close signal)
@@ -464,7 +464,8 @@ class TestAgentExecutorStreamHandling:
         text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
         assert "Hi — I'm here. What would you like to do?" in "".join(text_parts)
         # Terminal frame must be flushed deterministically.
-        assert status_call[1].get("final") is True
+        # Terminal turn finalization is handled outside this helper (frame is final=False here).
+        assert status_call[1].get("final") is not True
 
     async def test_handle_stream_item_streaming_input_required_closes_artifact_with_fallback(self, dynamodb_table):
         """When orchestrator streamed token chunks this turn and then resolves to
@@ -496,7 +497,7 @@ class TestAgentExecutorStreamHandling:
             is_final=True,
             streaming_artifact_id="artifact-IR",
             first_chunk_sent=True,
-            streamed_bytes=120,
+            streamed_chars=120,
         )
 
         # Artifact stream closed with an empty append+last_chunk frame
@@ -516,7 +517,8 @@ class TestAgentExecutorStreamHandling:
         text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
         assert "Which project should I file the ticket under?" in "".join(text_parts)
         assert status_call[1]["metadata"]["final_answer_source"] == "fallback"
-        assert status_call[1]["final"] is True
+        # Terminal turn finalization is handled outside this helper (frame is final=False here).
+        assert status_call[1].get("final") is not True
 
     async def test_handle_stream_item_auth_required_carries_final_message(self, dynamodb_table):
         """auth_required terminal status MUST carry the FinalResponseSchema.message
@@ -555,7 +557,8 @@ class TestAgentExecutorStreamHandling:
         final_msg = status_call[0][1]
         text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
         assert "Please sign in to Jira to continue." in "".join(text_parts)
-        assert status_call[1].get("final") is True
+        # Terminal turn finalization is handled outside this helper (frame is final=False here).
+        assert status_call[1].get("final") is not True
 
     async def test_handle_stream_item_streaming_auth_required_closes_artifact_with_fallback(self, dynamodb_table):
         """When orchestrator streamed token chunks and then resolves to
@@ -587,7 +590,7 @@ class TestAgentExecutorStreamHandling:
             is_final=True,
             streaming_artifact_id="artifact-AR",
             first_chunk_sent=True,
-            streamed_bytes=80,
+            streamed_chars=80,
         )
 
         updater.add_artifact.assert_called_once()
@@ -605,7 +608,8 @@ class TestAgentExecutorStreamHandling:
         text_parts = [p.root.text for p in final_msg.parts if hasattr(p.root, "text")]
         assert "Please re-authenticate with Google to continue." in "".join(text_parts)
         assert status_call[1]["metadata"]["final_answer_source"] == "fallback"
-        assert status_call[1]["final"] is True
+        # Terminal turn finalization is handled outside this helper (frame is final=False here).
+        assert status_call[1].get("final") is not True
 
     async def test_handle_stream_item_input_required_hitl_path_unchanged(self, dynamodb_table):
         """HITL action_requests interrupts still emit the structured HITL message
@@ -627,11 +631,7 @@ class TestAgentExecutorStreamHandling:
         item = AgentStreamResponse(
             state=TaskState.input_required,
             content="Approve creating Jira ticket?",
-            metadata={
-                "action_requests": [
-                    {"name": "create_jira_ticket", "args": {"summary": "x"}, "id": "call_1"}
-                ],
-            },
+            action_requests=[{"name": "create_jira_ticket", "args": {"summary": "x"}}],
         )
 
         await executor._handle_stream_item(
