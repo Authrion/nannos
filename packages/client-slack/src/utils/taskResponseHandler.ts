@@ -494,8 +494,14 @@ export async function recordDecision(
         ],
       } as any);
       // Decision now lives in the thinking widget — drop the standalone approval message.
-      await slackClient.chat.delete({ channel: channelId, ts: approvalMessageTs }).catch(() => {});
-      return;
+      // If the delete fails (rate-limited/expired), don't leave its live Approve/Reject
+      // buttons clickable: fall through to replacing the message with a static summary.
+      try {
+        await slackClient.chat.delete({ channel: channelId, ts: approvalMessageTs });
+        return;
+      } catch (err) {
+        logger.debug({ err }, `could not delete approval message ${approvalMessageTs}; replacing with summary`);
+      }
     } catch (err) {
       logger.debug({ err }, `could not append decision to stream ${streamTs}; using standalone card`);
     }
