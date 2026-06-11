@@ -410,10 +410,10 @@ export async function finalizeStreamedTask(params: {
 }
 
 /** rich_text block wrapping one line of plain text (for a task-card's details). */
-function decisionRichText(text: string): any {
+export function decisionRichText(text: string, max = 2000): any {
   return {
     type: 'rich_text',
-    elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: text.substring(0, 2000) }] }],
+    elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: text.substring(0, max) }] }],
   };
 }
 

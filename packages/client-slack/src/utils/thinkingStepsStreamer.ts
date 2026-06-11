@@ -2,7 +2,7 @@ import { WebClient } from '@slack/web-api';
 import type { ChatStreamer } from '@slack/web-api';
 import type { AnyChunk, TaskUpdateChunk, AnyBlock } from '@slack/types';
 import { Logger } from './logger.js';
-import { postOrUpdateMessage } from './taskResponseHandler.js';
+import { postOrUpdateMessage, decisionRichText } from './taskResponseHandler.js';
 import { getSpinnerVerb } from './spinnerVerbs.js';
 
 const logger = Logger.getLogger('thinkingStepsStreamer');
@@ -137,14 +137,6 @@ function reasoningFinalStatus(raw: string): TaskUpdateChunk['status'] {
     }
   }
   return 'complete';
-}
-
-/** Minimal rich_text block wrapping a single line of plain text (for task-card details). */
-function richText(text: string): Record<string, unknown> {
-  return {
-    type: 'rich_text',
-    elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: truncate(text, BODY_MAX) }] }],
-  };
 }
 
 /**
@@ -690,7 +682,7 @@ export class ThinkingStepsStreamer {
         title: truncate(todo.name, TITLE_MAX),
         status: TODO_STATUS[todo.state] ?? 'pending',
       };
-      if (detailBits) card.details = richText(detailBits);
+      if (detailBits) card.details = decisionRichText(detailBits, BODY_MAX);
       return card;
     });
     return { type: 'plan', block_id: 'workplan', title: 'Plan', tasks } as unknown as AnyBlock;
