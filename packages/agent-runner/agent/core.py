@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from a2a.types import AgentCard, Message, Task, TaskState
+from google.protobuf.json_format import ParseDict
 from agent_common.a2a.base import SubAgentInput
 from agent_common.a2a.config import A2AClientConfig
 from agent_common.a2a.factory import make_a2a_async_runnable
@@ -1247,12 +1248,14 @@ Create a brief, actionable message (1-2 sentences) that a user would want to rec
         async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
             resp = await client.get(agent_card_url)
             resp.raise_for_status()
-            agent_card = AgentCard(**resp.json())
+            # A2A v1.0+ uses protobuf AgentCard (ProtoJSON), parsed via ParseDict.
+            agent_card = ParseDict(resp.json(), AgentCard(), ignore_unknown_fields=True)
 
+        card_url = agent_card.supported_interfaces[0].url if agent_card.supported_interfaces else ""
         logger.info(
             "Discovered remote agent '%s' at %s for job %d",
             agent_card.name,
-            agent_card.url,
+            card_url,
             scheduled_job_id,
         )
 

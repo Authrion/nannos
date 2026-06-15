@@ -41,6 +41,7 @@ from rcplus_alloy_common.logging import (
 from sqlalchemy import text as sa_text
 from starlette.middleware.sessions import SessionMiddleware
 
+from console_backend.services.messages_service import _parse_task_state
 from console_backend.config import config
 from console_backend.db import close_db, get_async_session_factory, init_db
 from console_backend.db.docstore import close_docstore, init_docstore
@@ -790,7 +791,7 @@ async def _process_a2a_response(
                                     role="assistant",
                                     parts=[{"kind": "text", "text": accumulated}],
                                     task_id=task_id,
-                                    state=TaskState(status_state),
+                                    state=_parse_task_state(status_state),
                                     kind="status-update",
                                 )
                                 response_data["persistedMessageId"] = saved_msg.message_id
