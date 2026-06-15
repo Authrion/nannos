@@ -77,7 +77,7 @@ async def test_get_or_create_conversation_empty_title_when_no_message():
 @pytest.mark.asyncio
 async def test_process_a2a_response_receives_context_id():
     """Test that _process_a2a_response correctly receives and uses context_id."""
-    from a2a.types import Message, Role, TextPart
+    from a2a.types import Message, Part, Role, StreamResponse
 
     from app import _process_a2a_response
 
@@ -97,15 +97,15 @@ async def test_process_a2a_response_receives_context_id():
     with patch("app.sio", mock_sio):
         # Create a simple message response
         message = Message(
-            role=Role.agent,
-            parts=[TextPart(text="Response text")],
+            role=Role.ROLE_AGENT,
+            parts=[Part(text="Response text")],
             message_id="msg-response-1",
             context_id="conv-context-123",
         )
 
         # Call _process_a2a_response with context_id
         await _process_a2a_response(
-            client_event=message, sid="test-sid", request_id="req-1", context_id="conv-context-123"
+            client_event=StreamResponse(message=message), sid="test-sid", request_id="req-1", context_id="conv-context-123"
         )
 
         # Verify conversation service was called to check ownership
@@ -123,7 +123,7 @@ async def test_process_a2a_response_receives_context_id():
 @pytest.mark.asyncio
 async def test_process_a2a_response_uses_fallback_context_id():
     """Test that _process_a2a_response falls back to contextId from response_data."""
-    from a2a.types import Message, Role, TextPart
+    from a2a.types import Message, Part, Role, StreamResponse
 
     from app import _process_a2a_response
 
@@ -143,15 +143,15 @@ async def test_process_a2a_response_uses_fallback_context_id():
     with patch("app.sio", mock_sio):
         # Create message with contextId in response
         message = Message(
-            role=Role.agent,
-            parts=[TextPart(text="Response text")],
+            role=Role.ROLE_AGENT,
+            parts=[Part(text="Response text")],
             message_id="msg-response-2",
             context_id="conv-from-response-456",
         )
 
         # Call _process_a2a_response WITHOUT explicit context_id parameter
         await _process_a2a_response(
-            client_event=message,
+            client_event=StreamResponse(message=message),
             sid="test-sid",
             request_id="req-2",
             context_id=None,  # No context_id passed

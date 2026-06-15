@@ -2,8 +2,8 @@
 
 from typing import Any
 
-from a2a.types import Part, TaskState
-from pydantic import BaseModel, Field
+from a2a.types import TaskState
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Message(BaseModel):
@@ -14,15 +14,20 @@ class Message(BaseModel):
     - Sort Key: MSG#<timestamp>#<message_id>
     """
 
+    # Parts are held as ProtoJSON dicts for storage and as protobuf Part objects
+    # when hydrated for delivery — both are non-Pydantic, so allow arbitrary types.
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     conversation_id: str  # Partition key
     sort_key: str  # Sort key in format "MSG#<timestamp>#<messageId>"
     user_id: str  # User who sent the message
     message_id: str  # Unique message ID (extracted from sort_key)
     role: str  # 'user' or 'assistant'
-    parts: list[Part] = Field(default_factory=list)
+    parts: list[Any] = Field(default_factory=list)  # A2A Part (protobuf) or ProtoJSON dict
     task_id: str = ""  # Task ID (optional)
     created_at: str  # ISO format timestamp
-    state: TaskState = TaskState.unknown  # Message state as A2A TaskState
+    # A2A v1.0+ TaskState is a protobuf int enum (value stored as its int).
+    state: int = TaskState.TASK_STATE_UNSPECIFIED  # Message state as A2A TaskState
     raw_payload: str = ""  # Original JSON payload
     metadata: dict[str, Any] = Field(default_factory=dict)  # Optional metadata
     final: bool = False  # DEPRECATED: A2A 1.0.0 removes this field (kept for backward compatibility)
