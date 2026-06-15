@@ -17,7 +17,6 @@ import yaml
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import (
     add_a2a_routes_to_fastapi,
-    create_agent_card_routes,
     create_jsonrpc_routes,
 )
 from a2a.server.tasks import (
@@ -38,6 +37,8 @@ from a2a.types import (
     StringList,
 )
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from google.protobuf.json_format import MessageToDict
 from agent_common.core.model_factory import MODEL_CONFIG, get_available_models_metadata, get_default_model
 from agent_common.core.sandbox_pool import SandboxPool
 from agent_common.core.tool_risk_cache import ToolRiskCache
@@ -286,7 +287,13 @@ def create_app():
     agent_card = AgentCard(
         name="Orchestrator Agent",
         description="Intelligent orchestrator that plans and coordinates complex tasks by discovering and delegating to specialized sub-agents.",
-        supported_interfaces=[AgentInterface(url=agent_base_url, protocol_binding="JSONRPC")],
+        supported_interfaces=[
+            AgentInterface(url=agent_base_url, protocol_binding="JSONRPC"),
+            # v0.3 backward-compat interface: advertised so legacy clients
+            # (@a2a-js/sdk 0.3.x Slack/Google-Chat) know JSON-RPC v0.3 is served
+            # here until a stable @a2a-js/sdk v1.0 ships.
+            AgentInterface(url=agent_base_url, protocol_binding="JSONRPC", protocol_version="0.3"),
+        ],
         version="1.0.0",
         default_input_modes=OrchestratorDeepAgent.SUPPORTED_CONTENT_TYPES,
         default_output_modes=OrchestratorDeepAgent.SUPPORTED_CONTENT_TYPES,
@@ -316,13 +323,29 @@ def create_app():
     )
 
     # Build the FastAPI app and mount A2A routes (A2A v1.0+ replaces A2AFastAPIApplication).
-    # FastAPI is retained because the orchestrator serves a custom /models endpoint.
+    # FastAPI is retained because the orchestrator serves a custom /models endpoint and a
+    # hybrid agent-card route (below).
     app = FastAPI(lifespan=create_lifespan(agent_executor, task_store, task_store_engine))
     add_a2a_routes_to_fastapi(
         app,
-        agent_card_routes=create_agent_card_routes(agent_card),
-        jsonrpc_routes=create_jsonrpc_routes(request_handler, "/"),
+        # enable_v0_3_compat lets the orchestrator accept legacy v0.3 JSON-RPC on the same
+        # endpoint so the @a2a-js/sdk 0.3.x Slack/Google-Chat clients keep working until a
+        # stable @a2a-js/sdk v1.0 ships. Internal agents + console-backend speak pure v1.0.
+        jsonrpc_routes=create_jsonrpc_routes(request_handler, "/", enable_v0_3_compat=True),
     )
+
+    # Serve a hybrid agent card at the well-known path. The v1.0 card has no top-level
+    # `url`, but v0.3 clients resolve the service endpoint from `url` (not from
+    # `supported_interfaces`), so we inject it. v1.0 clients ignore the extra field.
+    # NOTE (pre-prod gate): the a2a-js 0.3 <-> a2a-python 1.1 v0.3-compat path is
+    # cross-implementation and unverified here — smoke-test one real Slack message
+    # against a v1.0 orchestrator before relying on it.
+    _agent_card_json = MessageToDict(agent_card)
+    _agent_card_json["url"] = agent_base_url
+
+    @app.get("/.well-known/agent-card.json")
+    async def well_known_agent_card() -> JSONResponse:
+        return JSONResponse(_agent_card_json)
 
     # Add authentication middleware stack (EXECUTION ORDER: bottom to top for requests)
 

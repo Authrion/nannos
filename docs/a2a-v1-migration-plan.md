@@ -288,6 +288,23 @@ Do these in parallel once Phase 1 lands (each only depends on `ringier-a2a-sdk` 
 
 ---
 
+## 5b. Node clients (client-slack, client-google-chat) — `@a2a-js/sdk` 0.3 → 1.0.0-alpha.0
+
+Both Node clients speak A2A **directly** to the orchestrator (`A2AClient` from `@a2a-js/sdk`), so the big-bang breaks them unless migrated. **There is no stable JS v1.0** — only `1.0.0-alpha.0` (decision: migrate to the alpha now; accept alpha risk). Package.json bumped to `1.0.0-alpha.0` + `npm install` done in both; code migration is the remaining work.
+
+**Verified `1.0.0-alpha.0` API (ts-proto/protobuf-style):**
+- `Part`: `{ content?: {$case:'text'|'raw'|'url'|'data', value}, metadata?, filename: string, mediaType: string }` — no `kind`. Build via `Part.fromJSON({text})` / `{data}` / `{url, mediaType, filename}` / `{raw, mediaType, filename}` (raw = base64 in JSON). Read via `part.content?.$case`.
+- `Message`: `{ messageId, contextId, taskId, role: Role, parts: Part[], metadata, extensions }`. `role` is the `Role` enum (number; JSON `'ROLE_USER'`).
+- `StreamResponse`: `{ payload?: {$case:'task'|'message'|'status_update'|'artifact_update', value} }` — replaces the `kind` discriminator.
+- `TaskState`/`Role` are numeric enums (`TASK_STATE_INPUT_REQUIRED` etc.); JSON via `taskStateToJSON`/`roleFromJSON`. The old wire strings (`'input-required'`) are gone.
+- Client: `A2AClient.fromCardUrl(url, {fetchImpl})`; `sendMessageStream(SendMessageRequest) -> AsyncGenerator<StreamResponse>`; `getTask(GetTaskRequest) -> Task` (was `GetTaskResponse`); `cancelTask(CancelTaskRequest) -> Task`. `MessageSendParams`/`TextPart`/`DataPart`/`FilePart`/`FileWithUri`/`FileWithBytes` removed.
+
+**Files to migrate** (blast radius from grep):
+- client-slack (4): `services/a2aClientService.ts` (build `SendMessageRequest.fromJSON({message,metadata})`, yield `StreamResponse`, `getTask`→`Task`), `listeners/events/messageHandler.ts` (the big one — `event.payload.$case` dispatch, `part.content.$case`, `TaskState` enum compares), `utils/taskResponseHandler.ts` (artifact/part `content.$case`, file parts via `url`/`raw`), `listeners/views/hitlModal.ts` (only sets request `dataParts` — likely no SDK change).
+- client-google-chat (7): `services/a2aClientService.ts`, `handlers/messageHandler.ts`, `handlers/a2aNotificationHandler.ts`, `services/googleChatService.ts`, `utils/taskRecovery.ts`, `utils/taskResponseHandler.ts`, `app.ts`.
+
+**Verification gap:** only `tsc` is available locally (no runtime/integration). Recommend a focused session with a build + a live smoke test against a v1.0 orchestrator before shipping, given the alpha SDK.
+
 ## 6. Package Dependency & Release Orchestration
 
 A breaking `ringier-a2a-sdk` change cascades through every internal consumer, so the version bumps, constraint tightening, and release must be choreographed. The good news: the repo's existing release system (`scripts/release-helpers.sh` + `just release`) is already built for this — but two of the moves below are **manual** and easy to miss.
