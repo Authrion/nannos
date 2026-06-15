@@ -1234,7 +1234,7 @@ export const getSubAgentVersionsApiV1SubAgentsSubAgentIdVersionsGetOptions = (op
  * Revert a local sub-agent to a previous configuration version.
  *
  * Creates a new version with the reverted configuration.
- * Only owner can revert. Only works for local sub-agents.
+ * Owner, admin, or users with write access can revert. Only works for local sub-agents.
  */
 export const revertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostMutation = (options?: Partial<Options<RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostData>>): UseMutationOptions<RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostResponse, RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostError, Options<RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostData>> => {
     const mutationOptions: UseMutationOptions<RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostResponse, RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostError, Options<RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostData>> = {
@@ -1255,7 +1255,7 @@ export const revertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostMut
  *
  * Submit a specific version for admin approval.
  *
- * Only the owner can submit. Version must be in 'draft' or 'rejected' status.
+ * Owner, admin, or users with write access can submit. Version must be in 'draft' or 'rejected' status.
  * Requires a change_summary describing what changed in this version.
  */
 export const submitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPostMutation = (options?: Partial<Options<SubmitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPostData>>): UseMutationOptions<SubmitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPostResponse, SubmitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPostError, Options<SubmitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPostData>> => {
@@ -1277,7 +1277,7 @@ export const submitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubm
  *
  * Delete a specific version (soft-delete).
  *
- * Only the owner can delete versions.
+ * Owner, admin, or users with write access can delete versions.
  * Only draft, pending_approval, or rejected versions can be deleted.
  * Approved versions cannot be deleted to preserve release history.
  */
@@ -1328,7 +1328,7 @@ export const reviewVersionApiV1SubAgentsSubAgentIdVersionsVersionReviewPostMutat
  *
  * Set an approved version as the default version.
  *
- * Only the owner can set the default version.
+ * Owner, admin, or users with write access can set the default version.
  * The version must be in 'approved' status.
  */
 export const setDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPutMutation = (options?: Partial<Options<SetDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPutData>>): UseMutationOptions<SetDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPutResponse, SetDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPutError, Options<SetDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPutData>> => {
