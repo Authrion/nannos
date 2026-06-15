@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from a2a.types import Part, TaskState
+from a2a.types import TaskState
 
 from console_backend.models.message import Message
 from console_backend.services.messages_service import (
@@ -284,9 +284,7 @@ async def test_hydrate_with_expired_urls():
         expired_url = "s3://bucket/path/file.txt"
 
         # Create file part with expired URL
-        file_part = Part(
-            url=expired_url, filename="test.txt", media_type="text/plain"
-        )
+        file_part = {"url": expired_url, "filename": "test.txt", "mediaType": "text/plain"}
 
         # Create message with file part
         message = Message(
@@ -306,9 +304,9 @@ async def test_hydrate_with_expired_urls():
         hydrated = await ms.hydrate_message_files(message)
 
         # Verify URL was regenerated
-        assert hydrated.parts[0].WhichOneof("content") == "url"
-        assert hydrated.parts[0].WhichOneof("content") == "url"
-        assert hydrated.parts[0].url == "https://bucket.s3.amazonaws.com/file.txt?fresh=true"
+        assert hydrated.parts[0].get("url") is not None
+        assert hydrated.parts[0].get("url") is not None
+        assert hydrated.parts[0]["url"] == "https://bucket.s3.amazonaws.com/file.txt?fresh=true"
         mock_storage.generate_presigned_get_url.assert_called_once_with("path/file.txt")
 
 
@@ -329,9 +327,7 @@ async def test_hydrate_skips_valid_urls():
         date_str = future_date.strftime("%Y%m%dT%H%M%SZ")
         valid_url = f"https://bucket.s3.amazonaws.com/file.txt?X-Amz-Date={date_str}&X-Amz-Expires=3600"
 
-        file_part = Part(
-            url=valid_url, filename="test.txt", media_type="text/plain"
-        )
+        file_part = {"url": valid_url, "filename": "test.txt", "mediaType": "text/plain"}
 
         message = Message(
             conversation_id="conv-1",
@@ -350,9 +346,9 @@ async def test_hydrate_skips_valid_urls():
         hydrated = await ms.hydrate_message_files(message)
 
         # Verify URL was NOT regenerated
-        assert hydrated.parts[0].WhichOneof("content") == "url"
-        assert hydrated.parts[0].WhichOneof("content") == "url"
-        assert hydrated.parts[0].url == valid_url
+        assert hydrated.parts[0].get("url") is not None
+        assert hydrated.parts[0].get("url") is not None
+        assert hydrated.parts[0]["url"] == valid_url
         mock_storage.generate_presigned_get_url.assert_not_called()
 
 
@@ -362,9 +358,7 @@ async def test_hydrate_with_no_file_metadata():
 
     ms = _make_messages_service()
 
-    file_part = Part(
-        url="https://example.com/file.txt", filename="test.txt", media_type="text/plain"
-    )
+    file_part = {"url": "https://example.com/file.txt", "filename": "test.txt", "mediaType": "text/plain"}
 
     message = Message(
         conversation_id="conv-1",
@@ -402,13 +396,9 @@ async def test_hydrate_multiple_files():
         mock_fs_class.return_value = mock_storage
         expired_url = "s3://bucket/path/file.txt"
 
-        text_part = Part(text="See attachments")
-        file_part1 = Part(
-            url=expired_url, filename="file1.txt", media_type="text/plain"
-        )
-        file_part2 = Part(
-            url=expired_url, filename="file2.pdf", media_type="application/pdf"
-        )
+        text_part = {"text": "See attachments"}
+        file_part1 = {"url": expired_url, "filename": "file1.txt", "mediaType": "text/plain"}
+        file_part2 = {"url": expired_url, "filename": "file2.pdf", "mediaType": "application/pdf"}
 
         message = Message(
             conversation_id="conv-1",
@@ -425,15 +415,15 @@ async def test_hydrate_multiple_files():
         hydrated = await ms.hydrate_message_files(message)
 
         # Text part should be unchanged
-        assert hydrated.parts[0].WhichOneof("content") == "text"
-        assert hydrated.parts[0].text == "See attachments"
+        assert hydrated.parts[0].get("text") is not None
+        assert hydrated.parts[0]["text"] == "See attachments"
         # File parts should be updated
-        assert hydrated.parts[1].WhichOneof("content") == "url"
-        assert hydrated.parts[1].WhichOneof("content") == "url"
-        assert hydrated.parts[2].WhichOneof("content") == "url"
-        assert hydrated.parts[2].WhichOneof("content") == "url"
-        assert hydrated.parts[1].url == "https://bucket.s3.amazonaws.com/file1.txt?fresh=true"
-        assert hydrated.parts[2].url == "https://bucket.s3.amazonaws.com/file2.pdf?fresh=true"
+        assert hydrated.parts[1].get("url") is not None
+        assert hydrated.parts[1].get("url") is not None
+        assert hydrated.parts[2].get("url") is not None
+        assert hydrated.parts[2].get("url") is not None
+        assert hydrated.parts[1]["url"] == "https://bucket.s3.amazonaws.com/file1.txt?fresh=true"
+        assert hydrated.parts[2]["url"] == "https://bucket.s3.amazonaws.com/file2.pdf?fresh=true"
         assert mock_storage.generate_presigned_get_url.call_count == 2
 
 
@@ -462,7 +452,7 @@ async def test_hydrate_multiple_messages():
             user_id="user-1",
             message_id="msg-1",
             role="assistant",
-            parts=[Part(url=expired_url, filename="file1.txt")],
+            parts=[{"url": expired_url, "filename": "file1.txt"}],
             created_at="2025-01-01T00:00:00+00:00",
             state=TaskState.TASK_STATE_COMPLETED,
             metadata={"fileMetadata": {"file1.txt": "s3://file1.txt"}},
@@ -475,7 +465,7 @@ async def test_hydrate_multiple_messages():
             user_id="user-1",
             message_id="msg-2",
             role="assistant",
-            parts=[Part(url=expired_url, filename="file2.txt")],
+            parts=[{"url": expired_url, "filename": "file2.txt"}],
             created_at="2025-01-01T00:01:00+00:00",
             state=TaskState.TASK_STATE_COMPLETED,
             metadata={"fileMetadata": {"file2.txt": "s3://file2.txt"}},
@@ -485,9 +475,9 @@ async def test_hydrate_multiple_messages():
         hydrated = await ms.hydrate_messages_files([msg1, msg2])
 
         assert len(hydrated) == 2
-        assert hydrated[0].parts[0].WhichOneof("content") == "url"
-        assert hydrated[1].parts[0].WhichOneof("content") == "url"
-        assert hydrated[0].parts[0].WhichOneof("content") == "url"
-        assert hydrated[1].parts[0].WhichOneof("content") == "url"
-        assert hydrated[0].parts[0].url == "https://bucket.s3.amazonaws.com/msg1.txt?fresh=true"
-        assert hydrated[1].parts[0].url == "https://bucket.s3.amazonaws.com/msg2.txt?fresh=true"
+        assert hydrated[0].parts[0].get("url") is not None
+        assert hydrated[1].parts[0].get("url") is not None
+        assert hydrated[0].parts[0].get("url") is not None
+        assert hydrated[1].parts[0].get("url") is not None
+        assert hydrated[0].parts[0]["url"] == "https://bucket.s3.amazonaws.com/msg1.txt?fresh=true"
+        assert hydrated[1].parts[0]["url"] == "https://bucket.s3.amazonaws.com/msg2.txt?fresh=true"

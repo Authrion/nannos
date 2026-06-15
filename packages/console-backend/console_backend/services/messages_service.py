@@ -479,12 +479,18 @@ class MessagesService:
         updated_parts = []
 
         for part in message.parts:
-            # A2A v1.0+: only URL-referenced file parts carry a URI to refresh.
-            if part.WhichOneof("content") != "url":
+            # Parts are usually ProtoJSON dicts (retrieved from the DB) but may be
+            # protobuf Part objects in-memory. A2A v1.0+ file parts carry the URI in
+            # the `url` field (top-level in ProtoJSON; the `url` oneof on a Part).
+            is_dict = isinstance(part, dict)
+            if is_dict:
+                uri = part.get("url")
+            else:
+                uri = part.url if part.WhichOneof("content") == "url" else None
+
+            if not uri:
                 updated_parts.append(part)
                 continue
-
-            uri = part.url
 
             # Check if URI is an S3 URL (s3://bucket/key/...)
             if uri.startswith("s3://"):
@@ -499,7 +505,10 @@ class MessagesService:
 
                         # Generate fresh presigned URL
                         presigned_url = await storage.generate_presigned_get_url(key)
-                        part.url = presigned_url
+                        if is_dict:
+                            part["url"] = presigned_url
+                        else:
+                            part.url = presigned_url
                         logger.debug(f"Regenerated presigned URL for S3 file: s3://{bucket}/{key}")
                     else:
                         logger.warning(f"Invalid S3 URI format: {uri}")
