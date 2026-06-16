@@ -28,7 +28,7 @@ import httpx
 from a2a.client import A2ACardResolver
 from a2a.client.client import Client, ClientConfig
 from a2a.client.client_factory import ClientFactory
-from a2a.types import AgentCard, TransportProtocol
+from a2a.types import AgentCard
 from pydantic import BaseModel, ConfigDict
 
 from ..middleware import OrchestratorAuth
@@ -392,10 +392,6 @@ class ConnectionPool:
             A2A Client instance
         """
         a2a_config = ClientConfig(
-            supported_transports=[
-                TransportProtocol.http_json,
-                TransportProtocol.jsonrpc,
-            ],
             use_client_preference=True,
             httpx_client=httpx_client,
         )

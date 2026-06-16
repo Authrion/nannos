@@ -73,7 +73,9 @@ def make_a2a_async_runnable(
             oauth2_client=oauth2_client,
         )
     """
-    logger.debug(f"Creating A2A runnable for agent: {agent_card.name} ({agent_card.url})")
+    # A2A v1.0+ AgentCard has no top-level `url`; the endpoint lives in supported_interfaces.
+    _card_url = agent_card.supported_interfaces[0].url if agent_card.supported_interfaces else ""
+    logger.debug(f"Creating A2A runnable for agent: {agent_card.name} ({_card_url})")
 
     # Set up configuration
     if config is None:

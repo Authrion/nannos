@@ -742,7 +742,7 @@ export const getSubAgentVersionsApiV1SubAgentsSubAgentIdVersionsGet = <ThrowOnEr
  * Revert a local sub-agent to a previous configuration version.
  *
  * Creates a new version with the reverted configuration.
- * Only owner can revert. Only works for local sub-agents.
+ * Owner, admin, or users with write access can revert. Only works for local sub-agents.
  */
 export const revertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPost = <ThrowOnError extends boolean = false>(options: Options<RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostData, ThrowOnError>) => (options.client ?? client).post<RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostResponses, RevertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPostErrors, ThrowOnError>({ url: '/api/v1/sub-agents/{sub_agent_id}/versions/{version}/revert', ...options });
 
@@ -751,7 +751,7 @@ export const revertToVersionApiV1SubAgentsSubAgentIdVersionsVersionRevertPost = 
  *
  * Submit a specific version for admin approval.
  *
- * Only the owner can submit. Version must be in 'draft' or 'rejected' status.
+ * Owner, admin, or users with write access can submit. Version must be in 'draft' or 'rejected' status.
  * Requires a change_summary describing what changed in this version.
  */
 export const submitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPost = <ThrowOnError extends boolean = false>(options: Options<SubmitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPostData, ThrowOnError>) => (options.client ?? client).post<SubmitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPostResponses, SubmitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubmitPostErrors, ThrowOnError>({
@@ -768,7 +768,7 @@ export const submitVersionForApprovalApiV1SubAgentsSubAgentIdVersionsVersionSubm
  *
  * Delete a specific version (soft-delete).
  *
- * Only the owner can delete versions.
+ * Owner, admin, or users with write access can delete versions.
  * Only draft, pending_approval, or rejected versions can be deleted.
  * Approved versions cannot be deleted to preserve release history.
  */
@@ -802,7 +802,7 @@ export const reviewVersionApiV1SubAgentsSubAgentIdVersionsVersionReviewPost = <T
  *
  * Set an approved version as the default version.
  *
- * Only the owner can set the default version.
+ * Owner, admin, or users with write access can set the default version.
  * The version must be in 'approved' status.
  */
 export const setDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPut = <ThrowOnError extends boolean = false>(options: Options<SetDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPutData, ThrowOnError>) => (options.client ?? client).put<SetDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPutResponses, SetDefaultVersionApiV1SubAgentsSubAgentIdDefaultVersionPutErrors, ThrowOnError>({

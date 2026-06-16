@@ -15,21 +15,21 @@ import bleach
 import httpx
 import socketio
 import yaml
-from a2a.client import A2ACardResolver, A2AClientHTTPError
-from a2a.client.client import Client, ClientEvent
+from a2a.client import A2ACardResolver, A2AClientError
+from a2a.client.client import Client
 from a2a.types import (
-    DataPart,
-    FilePart,
-    FileWithUri,
+    CancelTaskRequest,
     Message,
+    Part,
     Role,
+    SendMessageRequest,
     Task,
     TaskArtifactUpdateEvent,
-    TaskIdParams,
     TaskState,
     TaskStatusUpdateEvent,
-    TextPart,
 )
+from google.protobuf.json_format import MessageToDict, ParseDict
+from google.protobuf.struct_pb2 import Value
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -41,6 +41,7 @@ from rcplus_alloy_common.logging import (
 from sqlalchemy import text as sa_text
 from starlette.middleware.sessions import SessionMiddleware
 
+from console_backend.services.messages_service import _parse_task_state
 from console_backend.config import config
 from console_backend.db import close_db, get_async_session_factory, init_db
 from console_backend.db.docstore import close_docstore, init_docstore
@@ -483,19 +484,42 @@ _intermediate_buffers: dict[str, str] = {}
 # ==============================================================================
 
 
-def _extract_a2a_task_id(stream_result: ClientEvent | Message) -> str | None:
-    """Extract the A2A task_id from a stream event, if present."""
-    if isinstance(stream_result, tuple):
-        event = stream_result[1] if len(stream_result) > 1 and stream_result[1] else stream_result[0]
-    else:
-        event = stream_result
+# Map v1.0 protobuf TaskState names -> the legacy short wire strings that the
+# backend's turn-ending / persistence control-flow is keyed against. The frontend
+# handles raw v1.0 states natively (so we no longer rewrite the outbound payload);
+# this is used only to normalize states for internal branching below.
+_LEGACY_STATE: dict[str, str] = {
+    "TASK_STATE_SUBMITTED": "submitted",
+    "TASK_STATE_WORKING": "working",
+    "TASK_STATE_COMPLETED": "completed",
+    "TASK_STATE_FAILED": "failed",
+    "TASK_STATE_CANCELED": "canceled",
+    "TASK_STATE_INPUT_REQUIRED": "input-required",
+    "TASK_STATE_REJECTED": "rejected",
+    "TASK_STATE_AUTH_REQUIRED": "auth-required",
+    "TASK_STATE_UNSPECIFIED": "unknown",
+}
 
-    # TaskStatusUpdateEvent and TaskArtifactUpdateEvent have taskId
-    if isinstance(event, (TaskStatusUpdateEvent, TaskArtifactUpdateEvent, Message)):
-        return event.task_id
 
-    # Task objects have .id
-    return event.id
+def _legacy_state_name(state: Any) -> Any:
+    """Normalize a v1.0 ProtoJSON TaskState name to its legacy short form."""
+    return _LEGACY_STATE.get(state, state) if isinstance(state, str) else state
+
+
+def _extract_a2a_task_id(stream_result: Any) -> str | None:
+    """Extract the A2A task_id from a StreamResponse, if present.
+
+    A2A v1.0+ yields StreamResponse objects whose `payload` oneof is one of
+    {task, message, status_update, artifact_update}.
+    """
+    payload = stream_result.WhichOneof("payload")
+    if payload is None:
+        return None
+    event = getattr(stream_result, payload)
+    # status_update / artifact_update / message carry task_id; a Task carries id.
+    if payload == "task":
+        return event.id or None
+    return event.task_id or None
 
 
 async def _cancel_active_task(task_info: ActiveTaskInfo, key: str, reason: str) -> None:
@@ -508,7 +532,7 @@ async def _cancel_active_task(task_info: ActiveTaskInfo, key: str, reason: str) 
     if task_info.a2a_task_id and task_info.a2a_client:
         try:
             logger.info(f"Sending A2A cancel_task for key={key} task_id={task_info.a2a_task_id} ({reason})")
-            await task_info.a2a_client.cancel_task(TaskIdParams(id=task_info.a2a_task_id))
+            await task_info.a2a_client.cancel_task(CancelTaskRequest(id=task_info.a2a_task_id))
         except Exception:
             logger.warning(f"A2A cancel_task failed for key={key}", exc_info=True)
 
@@ -588,7 +612,7 @@ async def _flush_intermediate_buffers(
             role="assistant",
             parts=[{"kind": "text", "text": content}],
             task_id=task_id,
-            state=TaskState.completed,
+            state=TaskState.TASK_STATE_COMPLETED,
             kind="artifact-update",
             raw_payload=synthetic_payload,
             metadata={"agent_name": agent_name},
@@ -596,14 +620,14 @@ async def _flush_intermediate_buffers(
 
 
 async def _process_a2a_response(
-    client_event: ClientEvent | Message,
+    client_event: Any,
     sid: str,
     request_id: str,
     context_id: str | None = None,
 ) -> None:
     """Processes a response from the A2A client, validates it, and emits events.
 
-     This function handles the incoming ClientEvent or Message object,
+     This function handles the incoming StreamResponse object,
      correlating it with the original request using the session ID and request
 
     Args:
@@ -615,16 +639,26 @@ async def _process_a2a_response(
     # The response payload 'event' (Task, Message, etc.) may have its own 'id',
     # which can differ from the JSON-RPC request/response 'id'. We prioritize
     # the payload's ID for client-side correlation if it exists.
-    event: TaskStatusUpdateEvent | TaskArtifactUpdateEvent | Task | Message
-    if isinstance(client_event, tuple):
-        event = client_event[1] if client_event[1] else client_event[0]
-    else:
-        event = client_event
+    # A2A v1.0+: unwrap the StreamResponse oneof to the concrete event, and derive
+    # the `kind` discriminator the downstream pipeline expects (protobuf events have
+    # no `kind` field — the StreamResponse payload name is the discriminator).
+    _KIND_BY_PAYLOAD = {
+        "status_update": "status-update",
+        "artifact_update": "artifact-update",
+        "task": "task",
+        "message": "message",
+    }
+    payload = client_event.WhichOneof("payload")
+    event = getattr(client_event, payload) if payload else client_event
 
-    response_id = getattr(event, "id", request_id)
+    response_id = getattr(event, "id", "") or getattr(event, "task_id", "") or request_id
 
-    response_data = event.model_dump(exclude_none=True)
+    response_data = MessageToDict(event)
+    response_data["kind"] = _KIND_BY_PAYLOAD.get(payload, "unknown")
     response_data["id"] = response_id
+    # Emit raw v1.0 ProtoJSON (TASK_STATE_* states, flat parts) to the client — the
+    # frontend handles these natively. States are normalized inline below only where
+    # the backend's own turn-ending / persistence control-flow needs to branch on them.
 
     validation_errors = validate_message(response_data)
     response_data["validation_errors"] = validation_errors
@@ -682,7 +716,7 @@ async def _process_a2a_response(
 
                 # Extract status object early for use in multiple checks below
                 status_obj = response_data.get("status", {})
-                status_state = status_obj.get("state") if isinstance(status_obj, dict) else None
+                status_state = _legacy_state_name(status_obj.get("state")) if isinstance(status_obj, dict) else None
 
                 # Accumulate streaming artifact text for persistence.
                 # Individual chunks are transient (not saved to DB); the assembled
@@ -763,7 +797,7 @@ async def _process_a2a_response(
                                     role="assistant",
                                     parts=[{"kind": "text", "text": accumulated}],
                                     task_id=task_id,
-                                    state=TaskState.completed,
+                                    state=TaskState.TASK_STATE_COMPLETED,
                                     kind="artifact-update",
                                 )
                                 # Inject persisted message_id into response so frontend
@@ -782,7 +816,7 @@ async def _process_a2a_response(
                                     role="assistant",
                                     parts=[{"kind": "text", "text": accumulated}],
                                     task_id=task_id,
-                                    state=TaskState(status_state),
+                                    state=_parse_task_state(status_state),
                                     kind="status-update",
                                 )
                                 response_data["persistedMessageId"] = saved_msg.message_id
@@ -807,7 +841,7 @@ async def _process_a2a_response(
                 is_bare_completion_signal = (
                     response_data.get("kind") == "status-update"
                     and status_obj
-                    and status_obj.get("state") in ("completed", "failed", "canceled")
+                    and status_state in ("completed", "failed", "canceled")
                     and not status_obj.get("message")
                 )
 
@@ -966,7 +1000,7 @@ async def get_agent_card(request: Request, user: User = Depends(require_auth)) -
             logger.info(f"Fetching agent card for sid={sid} url={agent_url}")
             card = await card_resolver.get_agent_card()
 
-        card_data = card.model_dump(exclude_none=True)
+        card_data = MessageToDict(card)
         validation_errors = validate_agent_card(card_data)
         response_data = {
             "card": card_data,
@@ -1195,7 +1229,7 @@ async def handle_initialize_client(sid: str, data: dict[str, Any]) -> dict[str, 
             if agent_card:
                 logger.info(f"Agent card retrieved from cache: {agent_card.name}")
                 # Convert card to dict and add URL
-                agent_info = agent_card.model_dump(exclude_none=True)
+                agent_info = MessageToDict(agent_card)
                 agent_info["url"] = agent_card_url
                 logger.info(f"Agent card info extracted for {sid}: {agent_info.get('name', 'unknown')}")
             else:
@@ -1312,7 +1346,7 @@ async def _save_user_message_to_db(
             role="user",
             parts=parts,
             task_id="",
-            state=TaskState.working,
+            state=TaskState.TASK_STATE_WORKING,
             raw_payload=json.dumps(json_data, default=str),
             metadata=metadata,
             message_id=message_id,
@@ -1340,24 +1374,22 @@ def _build_a2a_message_parts(
     a2a_parts: list[Any] = []
 
     if message_text.strip():
-        a2a_parts.append(TextPart(text=str(message_text)))  # type: ignore[arg-type]
+        a2a_parts.append(Part(text=str(message_text)))
 
     if data_parts and isinstance(data_parts, list):
         for data in data_parts:
             if isinstance(data, dict):
-                a2a_parts.append(DataPart(data=data))  # type: ignore[arg-type]
+                a2a_parts.append(Part(data=ParseDict(data, Value())))
 
     if file_attachments and isinstance(file_attachments, list):
         for attachment in file_attachments:
             if isinstance(attachment, dict) and "uri" in attachment:
-                file_part = FilePart(
-                    file=FileWithUri(
-                        uri=attachment["uri"],
-                        mime_type=attachment.get("mimeType"),
-                        name=attachment.get("name"),
-                    )
-                )
-                a2a_parts.append(file_part)  # type: ignore[arg-type]
+                file_kwargs: dict[str, Any] = {"url": attachment["uri"]}
+                if attachment.get("mimeType"):
+                    file_kwargs["media_type"] = attachment["mimeType"]
+                if attachment.get("name"):
+                    file_kwargs["filename"] = attachment["name"]
+                a2a_parts.append(Part(**file_kwargs))
 
     return a2a_parts
 
@@ -1386,7 +1418,7 @@ async def _send_message_to_agent(
     try:
         assert a2a_client is not None, "a2a_client must not be None"
 
-        response_stream = a2a_client.send_message(message)
+        response_stream = a2a_client.send_message(SendMessageRequest(message=message))
         stream_item_count = 0
         a2a_task_id_captured = False
         async for stream_result in response_stream:
@@ -1404,21 +1436,19 @@ async def _send_message_to_agent(
                         a2a_task_id_captured = True
                         logger.info(f"[BACKEND_STREAM] Captured A2A task_id={extracted_task_id} for {task_key}")
 
-            # Log artifact-update events specifically
-            if isinstance(stream_result, tuple):
-                event = stream_result[1] if len(stream_result) > 1 and stream_result[1] else stream_result[0]
-                if hasattr(event, "kind"):
-                    logger.info(f"[BACKEND_STREAM] Event kind: {event.kind}")
-                    if event.kind == "artifact-update":
-                        artifact = getattr(event, "artifact", None)
-                        if artifact and hasattr(artifact, "metadata"):
-                            logger.info(f"[BACKEND_STREAM] artifact-update metadata: {artifact.metadata}")
+            # Log artifact-update events specifically (StreamResponse oneof payload)
+            payload = stream_result.WhichOneof("payload")
+            logger.info(f"[BACKEND_STREAM] Event payload: {payload}")
+            if payload == "artifact_update":
+                artifact = stream_result.artifact_update.artifact
+                if artifact.HasField("metadata"):
+                    logger.info(f"[BACKEND_STREAM] artifact-update metadata: {MessageToDict(artifact.metadata)}")
 
             await _process_a2a_response(stream_result, sid, message_id, message.context_id)
 
         logger.info(f"[BACKEND_STREAM] Stream complete - received {stream_item_count} total items")
         return create_success_response({"id": message_id})
-    except A2AClientHTTPError as http_err:
+    except A2AClientError as http_err:
         logger.error(f"Runtime error during message send: {http_err}", exc_info=True)
         error_response = create_error_response(
             SocketError.MSG_SEND_FAILED,
@@ -1461,7 +1491,7 @@ async def _send_steering_message_to_agent(
         # a single ack event (TaskStatusUpdateEvent).  Break after the first
         # event since the tapped child queue also receives parent events that
         # we must NOT consume here (they belong to the original stream).
-        async for _ in a2a_client.send_message(message):
+        async for _ in a2a_client.send_message(SendMessageRequest(message=message)):
             break
 
         logger.info(f"[STEERING] Steering message accepted for context_id={message.context_id}")
@@ -1479,7 +1509,7 @@ async def _send_steering_message_to_agent(
         )
         return create_success_response({"id": message_id, "steering": True})
 
-    except A2AClientHTTPError as http_err:
+    except A2AClientError as http_err:
         logger.error(f"[STEERING] Failed to send steering message: {http_err}", exc_info=True)
         error_response = create_error_response(
             SocketError.MSG_SEND_FAILED,
@@ -1608,7 +1638,7 @@ async def handle_send_message(sid: str, json_data: dict[str, Any]) -> dict[str, 
         # Build and send A2A message
         data_parts = json_data.get("dataParts")
         message = Message(
-            role=Role.user,
+            role=Role.ROLE_USER,
             parts=_build_a2a_message_parts(message_text, file_attachments, data_parts),
             message_id=message_id,
             context_id=context_id,

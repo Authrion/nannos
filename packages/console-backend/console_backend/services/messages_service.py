@@ -5,7 +5,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, cast
 
-from a2a.types import FilePart, FileWithUri, Part, TaskState
+from a2a.types import Part, TaskState
+from google.protobuf.json_format import MessageToDict
 from sqlalchemy import text
 from uuid6 import uuid7
 
@@ -25,20 +26,36 @@ def _serialize_part(p):
     # Already a plain mapping
     if isinstance(p, dict):
         return p
-    # Pydantic v2: model_dump
-    if hasattr(p, "model_dump"):
-        try:
-            dumped = p.model_dump()
-        except Exception:
-            dumped = None
-        if isinstance(dumped, dict):
-            # Unwrap RootModel that might produce {'root': {...}}
-            if "root" in dumped and isinstance(dumped["root"], dict):
-                return dumped["root"]
-            return dumped
+    # A2A v1.0+ Part is a protobuf message -> serialize to a ProtoJSON dict.
+    try:
+        return MessageToDict(p)
+    except Exception:
+        return {"value": str(p)}
 
-    # Fallback to string representation
-    return {"value": str(p)}
+
+def _parse_task_state(state_val) -> int:
+    """Parse a stored task-state value into a protobuf TaskState int.
+
+    Accepts a TaskState int, the canonical name ("TASK_STATE_COMPLETED"), or a
+    legacy/short form; falls back to UNSPECIFIED on unknown input.
+    """
+    if isinstance(state_val, int) and not isinstance(state_val, bool):
+        return state_val
+    if isinstance(state_val, str):
+        # Canonical ProtoJSON name, e.g. "TASK_STATE_WORKING".
+        try:
+            return TaskState.Value(state_val)
+        except ValueError:
+            pass
+        # Legacy/short forms, e.g. "working" or "input-required".
+        norm = state_val.strip().upper().replace("-", "_")
+        if not norm.startswith("TASK_STATE_"):
+            norm = "TASK_STATE_" + norm
+        try:
+            return TaskState.Value(norm)
+        except ValueError:
+            return TaskState.TASK_STATE_UNSPECIFIED
+    return TaskState.TASK_STATE_UNSPECIFIED
 
 
 def _parse_status_update(response_data: dict[str, Any]) -> dict[str, Any]:
@@ -59,15 +76,15 @@ def _parse_status_update(response_data: dict[str, Any]) -> dict[str, Any]:
     parts = []
     role = "assistant"
     metadata = response_data.get("metadata", {}) or {}
-    state = TaskState.completed
+    state = TaskState.TASK_STATE_COMPLETED
 
     status = response_data.get("status")
     if isinstance(status, dict):
         state_val = status.get("state", "completed")
         try:
-            state = TaskState(state_val)
+            state = _parse_task_state(state_val)
         except Exception:
-            state = TaskState.unknown
+            state = TaskState.TASK_STATE_UNSPECIFIED
 
         # Check for nested message in status
         nested = status.get("message")
@@ -136,23 +153,20 @@ def _parse_task(response_data: dict[str, Any]) -> dict[str, Any]:
     if isinstance(status, dict):
         state_val = status.get("state", "submitted")
         try:
-            state = TaskState(state_val)
+            state = _parse_task_state(state_val)
         except Exception:
-            state = TaskState.unknown
+            state = TaskState.TASK_STATE_UNSPECIFIED
     else:
-        state = TaskState.submitted
+        state = TaskState.TASK_STATE_SUBMITTED
 
     # Task responses may have history which should be saved separately
     history = None
     if "history" in response_data and isinstance(response_data.get("history"), list):
         history = response_data.get("history")
 
-    # Create a minimal task event part (use 'text' kind for compatibility)
-    # Render human-friendly state text when we have a TaskState enum
-    if hasattr(state, "value"):
-        state_text = state.value
-    else:
-        state_text = str(state)
+    # Create a minimal task event part (use 'text' kind for compatibility).
+    # A2A v1.0+ TaskState is a protobuf int enum; render a friendly short name.
+    state_text = TaskState.Name(state).removeprefix("TASK_STATE_").lower()
 
     parts = [{"kind": "text", "text": f"Task {state_text}: {task_id}"}]
 
@@ -243,9 +257,9 @@ class MessagesService:
                 try:
                     stored_state = row["state"] or "unknown"
                     try:
-                        stored_state_enum = TaskState(stored_state)
+                        stored_state_enum = _parse_task_state(stored_state)
                     except Exception:
-                        stored_state_enum = TaskState.unknown
+                        stored_state_enum = TaskState.TASK_STATE_UNSPECIFIED
 
                     results.append(
                         Message(
@@ -287,7 +301,7 @@ class MessagesService:
         role: str,
         parts: list[dict[str, Any]],
         task_id: str = "",
-        state: TaskState = TaskState.unknown,
+        state: TaskState = TaskState.TASK_STATE_UNSPECIFIED,
         raw_payload: str = "",
         metadata: dict[str, Any] | None = None,
         message_id: str | None = None,
@@ -327,7 +341,7 @@ class MessagesService:
         db_parts = [_serialize_part(p) for p in parts]
         db_parts = cast("list[Part]", db_parts)
 
-        state_str = state.value if hasattr(state, "value") else str(state)
+        state_str = TaskState.Name(state)
 
         message = Message(
             conversation_id=conversation_id,
@@ -465,17 +479,18 @@ class MessagesService:
         updated_parts = []
 
         for part in message.parts:
-            # Part is a RootModel union, get the actual part via .root
-            actual_part = part.root if hasattr(part, "root") else part
+            # Parts are usually ProtoJSON dicts (retrieved from the DB) but may be
+            # protobuf Part objects in-memory. A2A v1.0+ file parts carry the URI in
+            # the `url` field (top-level in ProtoJSON; the `url` oneof on a Part).
+            is_dict = isinstance(part, dict)
+            if is_dict:
+                uri = part.get("url")
+            else:
+                uri = part.url if part.WhichOneof("content") == "url" else None
 
-            if not isinstance(actual_part, FilePart):
+            if not uri:
                 updated_parts.append(part)
                 continue
-            if not isinstance(actual_part.file, FileWithUri):
-                updated_parts.append(part)
-                continue
-
-            uri = actual_part.file.uri
 
             # Check if URI is an S3 URL (s3://bucket/key/...)
             if uri.startswith("s3://"):
@@ -490,7 +505,10 @@ class MessagesService:
 
                         # Generate fresh presigned URL
                         presigned_url = await storage.generate_presigned_get_url(key)
-                        actual_part.file.uri = presigned_url
+                        if is_dict:
+                            part["url"] = presigned_url
+                        else:
+                            part.url = presigned_url
                         logger.debug(f"Regenerated presigned URL for S3 file: s3://{bucket}/{key}")
                     else:
                         logger.warning(f"Invalid S3 URI format: {uri}")

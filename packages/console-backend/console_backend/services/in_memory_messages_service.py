@@ -43,7 +43,7 @@ class InMemoryMessagesService:
         role: str,
         parts: list[dict[str, Any]],
         task_id: str = "",
-        state: TaskState = TaskState.unknown,
+        state: TaskState = TaskState.TASK_STATE_UNSPECIFIED,
         raw_payload: str = "",
         metadata: dict[str, Any] | None = None,
         message_id: str | None = None,

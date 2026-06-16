@@ -728,11 +728,21 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
             logger.debug({ feedbackData }, `Received feedback-request extension`);
             feedbackRequestData = feedbackData;
           } else if (statusEvent.status.state === 'completed') {
-            if (!accumulatedTask.artifacts) accumulatedTask.artifacts = [];
-            accumulatedTask.artifacts?.push({
-              artifactId: `final_response_${Date.now()}`,
-              parts: statusEvent.status.message?.parts || [],
-            })
+            // The terminal status carries the full reply as a fallback for clients
+            // that did NOT stream. When the orchestrator streamed token chunks this
+            // turn it tags the status `final_answer_source: "fallback"` — the answer
+            // already arrived via artifact-update events, so adopting status.message
+            // here too would render it twice. Only take it when nothing was streamed.
+            const isStreamedFallback =
+              (statusEvent.metadata as { final_answer_source?: string } | undefined)?.final_answer_source ===
+              'fallback';
+            if (!isStreamedFallback) {
+              if (!accumulatedTask.artifacts) accumulatedTask.artifacts = [];
+              accumulatedTask.artifacts.push({
+                artifactId: `final_response_${Date.now()}`,
+                parts: statusEvent.status.message?.parts || [],
+              });
+            }
           } else if (statusEvent.status.state !== 'input-required') {
             // Only log if it's not an interrupt
             logger.debug(`Received status update without recognized extensions. Not updating status message details.`);
@@ -746,8 +756,28 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
             })
           }
         } else if (event.kind === 'artifact-update') {
-          if (!accumulatedTask.artifacts) accumulatedTask.artifacts = [];
-          accumulatedTask.artifacts.push(event.artifact);
+          // The orchestrator streams BOTH sub-agent reasoning (intermediate-output
+          // ext) and the final answer (no ext) as artifact-update events. Keep
+          // reasoning OUT of the accumulated artifacts so it never leaks into the
+          // final message body rendered by handleTask.
+          const isIntermediate = (event.artifact.extensions || []).includes(
+            'urn:nannos:a2a:intermediate-output:1.0'
+          );
+          if (!isIntermediate) {
+            if (!accumulatedTask.artifacts) accumulatedTask.artifacts = [];
+            // Respect A2A artifact-append semantics: `append: true` extends the
+            // artifact with the same id (a delta); a snapshot/create REPLACES it.
+            // Keeping one logical artifact per id stops a re-sent full answer (or
+            // the trailing empty last-chunk) from inflating the accumulated text.
+            const existing = accumulatedTask.artifacts.find((a) => a.artifactId === event.artifact.artifactId);
+            if (existing && event.append === true) {
+              existing.parts.push(...event.artifact.parts);
+            } else if (existing) {
+              existing.parts = event.artifact.parts;
+            } else {
+              accumulatedTask.artifacts.push(event.artifact);
+            }
+          }
         } else {
           logger.debug({ taskId: accumulatedTask?.id }, `Unknown stream event: ${_.get(event, 'kind')}`);
         }
