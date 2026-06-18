@@ -18,8 +18,8 @@ from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
 from ..utils.bedrock_image_processor import preprocess_messages_for_bedrock
-from .dynamodb_checkpointer_mixin import DynamoDBCheckpointerMixin
 from .langgraph import LangGraphAgent
+from .postgres_checkpointer_mixin import PostgreSQLCheckpointerMixin
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +48,14 @@ def _get_thinking_budget(thinking_level: str) -> int:
     return budget_map.get(thinking_level, 4096)
 
 
-class LangGraphBedrockAgent(DynamoDBCheckpointerMixin, LangGraphAgent):
-    """LangGraph agent using AWS Bedrock and DynamoDB checkpointing.
+class LangGraphBedrockAgent(PostgreSQLCheckpointerMixin, LangGraphAgent):
+    """LangGraph agent using AWS Bedrock and PostgreSQL checkpointing.
 
     Supports both standard Claude models and extended thinking mode for complex reasoning.
 
     This is a concrete implementation of LangGraphAgent that:
     - Uses AWS Bedrock (Claude/other models) as the LLM
-    - Uses DynamoDB checkpointers with optional S3 offloading
+    - Uses PostgreSQL checkpointers with optional S3 offloading
     - Optionally enables Claude extended thinking mode
 
     Configuration:

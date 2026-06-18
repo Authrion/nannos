@@ -16,14 +16,14 @@ from langchain_core.tools import BaseTool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph.state import CompiledStateGraph
 
-from .dynamodb_checkpointer_mixin import DynamoDBCheckpointerMixin
 from .langgraph import LangGraphAgent
+from .postgres_checkpointer_mixin import PostgreSQLCheckpointerMixin
 
 logger = logging.getLogger(__name__)
 
 
-class LangGraphGoogleGenAIAgent(DynamoDBCheckpointerMixin, LangGraphAgent):
-    """LangGraph agent using Google Generative AI (Gemini) and DynamoDB checkpointing.
+class LangGraphGoogleGenAIAgent(PostgreSQLCheckpointerMixin, LangGraphAgent):
+    """LangGraph agent using Google Generative AI (Gemini) and PostgreSQL checkpointing.
 
     Uses ChatGoogleGenerativeAI with streaming=True so tokens are emitted incrementally
     even when tools are bound to the model.

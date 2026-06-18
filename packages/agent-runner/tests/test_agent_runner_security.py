@@ -7,7 +7,6 @@ Covers:
 """
 
 import json
-import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,18 +16,14 @@ from a2a.types import Message, Part, Role
 @pytest.fixture
 def agent_runner():
     """Create an AgentRunner instance with minimal mocking.
-
-    Patches _create_checkpointer to avoid the CHECKPOINT_DYNAMODB_TABLE_NAME
-    requirement, and suppresses cost-tracking setup.
     """
     mock_checkpointer = MagicMock(name="checkpointer")
 
-    with patch("agent.core._create_checkpointer", return_value=mock_checkpointer):
-        with patch.dict(os.environ, {"CHECKPOINT_DYNAMODB_TABLE_NAME": "test-table"}, clear=False):
-            from agent.core import AgentRunner
+    with patch("agent.core._create_checkpointer", return_value=(mock_checkpointer, None)):
+        from agent.core import AgentRunner
 
-            runner = AgentRunner()
-            return runner
+        runner = AgentRunner()
+        return runner
 
 
 class TestFetchUserIdFromBackend:
