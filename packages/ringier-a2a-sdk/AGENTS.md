@@ -58,7 +58,7 @@ The SDK provides a base agent class for building A2A agents:
 
 **LangGraphBedrockAgent** (extends BaseAgent)
 - Adds AWS Bedrock + LangGraph integration with MCP tools
-- Implements MCP tool discovery and DynamoDB checkpointing
+- Implements MCP tool discovery and PostgreSQL checkpointing (see Checkpointing below)
 - Lazy loads MCP tools on first request (not during init)
 - Provides default graph creation with FinalResponseSchema support
 - Requires async `_get_mcp_connections()` implementation
@@ -110,6 +110,31 @@ async def _get_mcp_connections(self) -> dict[str, StreamableHttpConnection]:
         )
     }
 ````
+
+### Checkpointing (PostgreSQL + optional S3 offload)
+
+LangGraph state is persisted by `PostgreSQLCheckpointerMixin`
+([`agent/postgres_checkpointer_mixin.py`](ringier_a2a_sdk/agent/postgres_checkpointer_mixin.py)).
+
+- **Storage.** Reuses the service's `POSTGRES_*` connection (the docstore DB; tables land in
+  the schema on the connection's `search_path`, `public` locally). Standard LangGraph tables:
+  `checkpoints`, `checkpoint_blobs`, `checkpoint_writes`, `checkpoint_migrations`.
+- **Thread IDs.** A top-level agent checkpoints under the bare `context_id` (empty
+  `checkpoint_ns`); a sub-agent checkpoints under `{context_id}::{agent-name}` (e.g.
+  `…::agent-creator`). Each hop resumes its own checkpoint in its own namespace.
+- **MemorySaver fallback.** When `POSTGRES_HOST` is unset the mixin falls back to an in-memory
+  saver — **local dev only**. A fallback in a real environment silently drops persisted state
+  (and any pending HITL decision), so it is gated by `CHECKPOINT_ALLOW_MEMORY` outside local.
+- **S3 offload.** `S3OffloadingSerde` wraps `JsonPlusSerializer`: when a serialized blob exceeds
+  `CHECKPOINT_S3_THRESHOLD_MB` (**default 1 MB**) it is uploaded to `CHECKPOINT_S3_BUCKET_NAME`
+  and the DB row stores a compact `s3ref` reference `{"s3_key", "original_type"}` instead; the
+  read path fetches it back on demand. Offloading is disabled when the bucket env is unset.
+  Caveat: the serde uses a bare `boto3.client("s3")` with no endpoint override, so it always
+  hits real AWS — there is **no** Localstack/`AWS_S3_ENDPOINT_URL` redirect. Offloaded objects
+  are **not** deleted automatically (lifecycle is the bucket's responsibility).
+- **Tests.** `tests/test_postgres_checkpointer_s3_offload.py` (serde offload/round-trip/error
+  paths, mocked S3 + an opt-in `WITH_REAL_S3` suite) and `tests/test_postgres_checkpointer_mixin.py`
+  (`_build_serde`, pool construction, MemorySaver fallback, version check, lifecycle).
 
 ## Testing
 
