@@ -32,11 +32,11 @@ class TestAgentSettings:
         assert AgentSettings.AGENT_DISCOVERY_CACHE_TTL == 30
 
     def test_postgres_checkpoint_configuration(self):
-        """Test Postgres checkpoint configuration defaults."""
-        assert AgentSettings.CHECKPOINT_POSTGRES_HOST is None
-        assert AgentSettings.CHECKPOINT_POSTGRES_PORT == "5432"
-        assert AgentSettings.CHECKPOINT_POSTGRES_DB == "checkpointer"
-        assert AgentSettings.CHECKPOINT_POSTGRES_SCHEMA == "checkpoints"
+        """Test Postgres checkpoint configuration defaults.
+
+        The checkpointer reuses the main POSTGRES_* connection, so it has no
+        dedicated host/db/user config — only behavioural knobs remain.
+        """
         assert AgentSettings.CHECKPOINT_TTL_DAYS == 14
         assert AgentSettings.CHECKPOINT_MAX_RETRIES == 5
 

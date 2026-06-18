@@ -197,35 +197,39 @@ class GraphFactory:
         AsyncPostgresSaver and replaces self._checkpointer before any requests are served.
         """
         from langgraph.checkpoint.memory import MemorySaver
+        from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import (
+            build_checkpointer_pool,
+            memory_fallback_allowed,
+            missing_host_error,
+        )
 
-        if not config.CHECKPOINT_POSTGRES_HOST:
-            logger.info(
-                "CHECKPOINT_POSTGRES_HOST not set – using in-memory checkpointer "
-                "(conversations will not persist across restarts)"
+        if not config.POSTGRES_HOST:
+            if not memory_fallback_allowed():
+                raise missing_host_error()
+            logger.warning(
+                "POSTGRES_HOST not set – using in-memory checkpointer (conversations will not persist across restarts)"
             )
             return MemorySaver()
 
-        from psycopg_pool import AsyncConnectionPool
-
-        conn_string = (
-            f"postgresql://{config.CHECKPOINT_POSTGRES_USER}"
-            f":{config.CHECKPOINT_POSTGRES_PASSWORD}"
-            f"@{config.CHECKPOINT_POSTGRES_HOST}"
-            f":{config.CHECKPOINT_POSTGRES_PORT}"
-            f"/{config.CHECKPOINT_POSTGRES_DB}"
-        )
-        pool = AsyncConnectionPool(
-            conninfo=conn_string,
-            open=False,
-            kwargs={"autocommit": True, "prepare_threshold": 0},
+        # The checkpointer reuses the service's main POSTGRES_* connection (same DB/user
+        # as the document store); POSTGRES_SCHEMA places the tables in the service's own
+        # schema via search_path, consistent with the per-service-schema convention.
+        pool = build_checkpointer_pool(
+            host=config.POSTGRES_HOST,
+            port=str(config.POSTGRES_PORT),
+            db=config.POSTGRES_DB,
+            user=config.POSTGRES_USER,
+            password=config.POSTGRES_PASSWORD,
+            schema=config.POSTGRES_SCHEMA,
         )
         self._checkpointer_pool = pool
 
         logger.info(
-            "Prepared PostgreSQL checkpointer pool (host=%s, db=%s) — "
+            "Prepared PostgreSQL checkpointer pool (host=%s, db=%s, schema=%s) — "
             "AsyncPostgresSaver will be created in _setup_checkpointer()",
-            config.CHECKPOINT_POSTGRES_HOST,
-            config.CHECKPOINT_POSTGRES_DB,
+            config.POSTGRES_HOST,
+            config.POSTGRES_DB,
+            config.POSTGRES_SCHEMA or "<role default>",
         )
         # Placeholder replaced by AsyncPostgresSaver in _setup_checkpointer()
         return MemorySaver()
@@ -340,11 +344,13 @@ class GraphFactory:
         if pool is None:
             return  # permanent MemorySaver — nothing to do
 
-        if not getattr(pool, "_opened", False):
-            await pool.open()
-            logger.info("Opened AsyncConnectionPool for checkpointer")
+        from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import (
+            _verify_postgres_version,
+            open_pool_if_closed,
+        )
 
-        from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import _verify_postgres_version
+        await open_pool_if_closed(pool)
+        logger.info("Checkpoint connection pool open")
 
         await _verify_postgres_version(pool)
 
@@ -355,15 +361,16 @@ class GraphFactory:
             from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import S3OffloadingSerde
 
             threshold = int(self.config.CHECKPOINT_S3_THRESHOLD_MB * 1024 * 1024)
-            serde = S3OffloadingSerde(
-                bucket=self.config.CHECKPOINT_S3_BUCKET_NAME, threshold_bytes=threshold
-            )
+            serde = S3OffloadingSerde(bucket=self.config.CHECKPOINT_S3_BUCKET_NAME, threshold_bytes=threshold)
             logger.info("S3 checkpoint offloading enabled: %s", self.config.CHECKPOINT_S3_BUCKET_NAME)
 
         checkpointer = AsyncPostgresSaver(pool, serde=serde)
         await checkpointer.setup()
         self._checkpointer = checkpointer
-        logger.info("PostgreSQL checkpointer ready (tables in public schema)")
+        logger.info(
+            "PostgreSQL checkpointer ready (tables in schema=%s)",
+            self.config.POSTGRES_SCHEMA or "<role default>",
+        )
 
     @property
     def a2a_middleware(self) -> A2ATaskTrackingMiddleware:
@@ -376,8 +383,10 @@ class GraphFactory:
             await self.cost_logger.shutdown()
             logger.info("Cost logger shutdown complete")
 
-        if self._checkpointer_pool is not None and getattr(self._checkpointer_pool, "_opened", False):
-            await self._checkpointer_pool.close()
+        if self._checkpointer_pool is not None:
+            from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import close_pool_if_open
+
+            await close_pool_if_open(self._checkpointer_pool)
             logger.info("Closed AsyncConnectionPool for checkpointer")
 
         if self._connection_pool is not None and self._connection_pool._opened:

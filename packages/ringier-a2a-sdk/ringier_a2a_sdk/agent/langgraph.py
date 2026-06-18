@@ -1058,8 +1058,11 @@ class LangGraphAgent(BaseAgent):
 
             logger.debug(f"Stream processing complete. Total chunks: {chunk_count}")
 
-            # Get final state
-            final_state = self._graph.get_state(config)
+            # Get final state. Must use the async API: AsyncPostgresSaver forbids
+            # synchronous get_state() from the running event loop (the previous
+            # DynamoDBSaver was synchronous, which is why .get_state() worked before
+            # the Postgres migration).
+            final_state = await self._graph.aget_state(config)
 
             # Check for interrupts
             if final_state.interrupts:

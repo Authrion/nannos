@@ -34,16 +34,16 @@ from app.models.config import AgentSettings
 def mock_config():
     """Create a properly configured mock AgentSettings."""
     config = Mock(spec=AgentSettings)
-    config.CHECKPOINT_POSTGRES_HOST = None
     config.CHECKPOINT_TTL_DAYS = 14
     config.CHECKPOINT_MAX_RETRIES = 3
     config.MAX_RETRIES = 3
     config.BACKOFF_FACTOR = 2
-    # Postgres settings
+    # Postgres settings (the checkpointer reuses these)
     config.POSTGRES_USER = "testuser"
     config.POSTGRES_PASSWORD = "testpass"  # pragma: allowlist secret
     config.POSTGRES_HOST = "localhost"
     config.POSTGRES_PORT = "5432"
+    config.POSTGRES_SCHEMA = "public"
     config.POSTGRES_DB = "testdb"
     config.get_bedrock_region = Mock(return_value="eu-central-1")
     # Add missing method mocks

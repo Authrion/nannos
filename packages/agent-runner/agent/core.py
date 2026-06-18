@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from a2a.types import AgentCard, Message, Task, TaskState
-from google.protobuf.json_format import ParseDict
 from agent_common.a2a.base import SubAgentInput
 from agent_common.a2a.config import A2AClientConfig
 from agent_common.a2a.factory import make_a2a_async_runnable
@@ -43,8 +42,9 @@ from agent_common.core.cost_tracking_embeddings import CostTrackingBedrockEmbedd
 from agent_common.core.document_store_tools import create_document_store_tools
 from agent_common.core.graph_utils import build_sub_agent_graph
 from agent_common.core.model_factory import _has_aws_credentials, create_model, is_valid_model
-from object_storage import get_object_storage_service
 from agent_common.models.base import get_resolved_default_model
+from google.protobuf.json_format import ParseDict
+from object_storage import get_object_storage_service
 
 if TYPE_CHECKING:
     from agent_common.core.sandbox_pool import SandboxPool
@@ -112,29 +112,36 @@ def _create_checkpointer() -> tuple[MemorySaver, AsyncConnectionPool | None]:
 
     Returns (placeholder, pool). Pool is None when falling back to MemorySaver.
     """
-    host = os.getenv("CHECKPOINT_POSTGRES_HOST")
+    from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import (
+        build_checkpointer_pool,
+        memory_fallback_allowed,
+        missing_host_error,
+    )
+
+    # The checkpointer reuses the service's main POSTGRES_* connection (same DB/user as
+    # the document store); POSTGRES_SCHEMA places its tables in the service's own schema.
+    host = os.getenv("POSTGRES_HOST")
     if not host:
+        if not memory_fallback_allowed():
+            raise missing_host_error()
         logger.warning(
-            "CHECKPOINT_POSTGRES_HOST not set — using in-memory checkpointer. "
-            "Conversation history will be lost on restart."
+            "POSTGRES_HOST not set — using in-memory checkpointer. Conversation history will be lost on restart."
         )
         return MemorySaver(), None
 
-    port = os.getenv("CHECKPOINT_POSTGRES_PORT", "5432")
-    db = os.getenv("CHECKPOINT_POSTGRES_DB", "checkpointer")
-    user = os.getenv("CHECKPOINT_POSTGRES_USER", "postgres")
-    password = os.getenv("CHECKPOINT_POSTGRES_PASSWORD", "")
+    port = os.getenv("POSTGRES_PORT", "5432")
+    db = os.getenv("POSTGRES_DB", "postgres")
+    user = os.getenv("POSTGRES_USER", "postgres")
+    password = os.getenv("POSTGRES_PASSWORD", "")
+    schema = os.getenv("POSTGRES_SCHEMA")
 
-    pool = AsyncConnectionPool(
-        conninfo=f"postgresql://{user}:{password}@{host}:{port}/{db}",
-        open=False,
-        kwargs={"autocommit": True, "prepare_threshold": 0},
-    )
+    pool = build_checkpointer_pool(host=host, port=port, db=db, user=user, password=password, schema=schema)
     logger.info(
-        "Prepared PostgreSQL checkpointer pool (host=%s, db=%s) — "
+        "Prepared PostgreSQL checkpointer pool (host=%s, db=%s, schema=%s) — "
         "AsyncPostgresSaver will be created in setup_checkpointer()",
         host,
         db,
+        schema or "<role default>",
     )
     return MemorySaver(), pool
 
@@ -338,40 +345,41 @@ class AgentRunner(BaseAgent):
         pool = self._checkpointer_pool
         if pool is None:
             return  # permanent MemorySaver — nothing to do
-        if not getattr(pool, "_opened", False):
-            await pool.open()
-            logger.info("Opened AsyncConnectionPool for checkpointer")
 
-        from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import _verify_postgres_version
+        from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import (
+            _verify_postgres_version,
+            open_pool_if_closed,
+        )
+
+        await open_pool_if_closed(pool)
+        logger.info("Checkpoint connection pool open")
 
         await _verify_postgres_version(pool)
 
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-        schema = os.getenv("CHECKPOINT_POSTGRES_SCHEMA", "checkpoints")
         serde = None
         s3_bucket = os.getenv("CHECKPOINT_S3_BUCKET_NAME")
         if s3_bucket:
             from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import S3OffloadingSerde
 
-            threshold = int(float(os.getenv("CHECKPOINT_S3_THRESHOLD_MB", "10")) * 1024 * 1024)
+            threshold = int(float(os.getenv("CHECKPOINT_S3_THRESHOLD_MB", "1")) * 1024 * 1024)
             serde = S3OffloadingSerde(bucket=s3_bucket, threshold_bytes=threshold)
 
+        # AsyncPostgresSaver v3.x does not support custom schema names — tables are
+        # always created in the public schema.
         checkpointer = AsyncPostgresSaver(pool, serde=serde)
-        try:
-            checkpointer.schema_name = schema  # type: ignore[attr-defined]
-        except AttributeError:
-            pass
-
         await checkpointer.setup()
         self._checkpointer = checkpointer
-        logger.info("PostgreSQL checkpointer ready (schema=%s, s3_offload=%s)", schema, bool(serde))
+        logger.info("PostgreSQL checkpointer ready (tables in public schema, s3_offload=%s)", bool(serde))
 
     async def teardown_checkpointer(self) -> None:
         """Close the checkpoint connection pool."""
         pool = self._checkpointer_pool
-        if pool is not None and getattr(pool, "_opened", False):
-            await pool.close()
+        if pool is not None:
+            from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import close_pool_if_open
+
+            await close_pool_if_open(pool)
             logger.info("Closed checkpoint connection pool")
 
     async def ensure_store_setup(self) -> None:

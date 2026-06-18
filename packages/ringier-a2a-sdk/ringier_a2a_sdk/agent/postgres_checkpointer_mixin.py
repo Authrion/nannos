@@ -7,31 +7,44 @@ backed by AsyncPostgresSaver (langgraph-checkpoint-postgres ≥ 3.1).
 Environment variables
 ────────────────────────────────────────────────────────────────────────────────
 
-Connection (CHECKPOINT_POSTGRES_* — separate from the main app POSTGRES_* vars
-so the checkpoint DB can live on a different host/user):
+Connection — the checkpointer reuses the service's main POSTGRES_* connection
+(same database/user as the document store and A2A task store), following the
+repo convention of one shared DB with a per-service user + schema:
 
-    CHECKPOINT_POSTGRES_HOST        Host name or IP.  Required.
-                                    When absent the mixin falls back to MemorySaver
-                                    (local development only).
-    CHECKPOINT_POSTGRES_PORT        Port.  Default: 5432.
-    CHECKPOINT_POSTGRES_DB          Database name.  Default: console.
-    CHECKPOINT_POSTGRES_USER        Database user.  Default: postgres.
-    CHECKPOINT_POSTGRES_PASSWORD    Password.  Required in production.
+    POSTGRES_HOST        Host name or IP.  Gates persistence.
+                         When absent the mixin falls back to MemorySaver.
+    POSTGRES_PORT        Port.  Default: 5432.
+    POSTGRES_DB          Database name.  Default: postgres.
+    POSTGRES_USER        Database user.  Default: postgres.
+    POSTGRES_PASSWORD    Password.
+    POSTGRES_SCHEMA      Schema the checkpoint tables live in.  Optional; when set,
+                         the connection search_path is pinned to "<schema>,public".
 
-Tables are created in the public schema (AsyncPostgresSaver v3.x does not
-support custom schema names).
+When POSTGRES_HOST is absent the mixin falls back to MemorySaver, but only in
+local development: the fallback is allowed when ENVIRONMENT is unset/"local" or
+CHECKPOINT_ALLOW_MEMORY is truthy.  In any deployed environment a missing host is
+treated as a misconfiguration and raises RuntimeError rather than silently losing
+conversation history on restart.
 
-The resulting DSN:
-    postgresql://<user>:<password>@<host>:<port>/<db>
+Schema placement: AsyncPostgresSaver's MIGRATIONS use *unqualified* table names,
+so the checkpoint tables land wherever the connection's search_path points — NOT a
+hard-coded "public".  Setting POSTGRES_SCHEMA (or a role-level
+``ALTER USER … SET search_path``) places them in the service's own schema, so
+AsyncPostgresSaver.setup() — itself a versioned, incremental migration runner —
+fully owns the checkpoint schema lifecycle.  No separate Rambler migration is
+needed as long as the connecting user owns (has DDL on) that schema.
 
-Required grants for CHECKPOINT_POSTGRES_USER:
-    CREATE, SELECT, INSERT, UPDATE, DELETE on all tables in public
+Required grants for POSTGRES_USER on its schema:
+    CREATE, SELECT, INSERT, UPDATE, DELETE  (schema owner satisfies all of these)
 
 Connection pool (psycopg AsyncConnectionPool):
     autocommit=True     Required by AsyncPostgresSaver — implicit per-statement
                         transactions; no explicit BEGIN/COMMIT overhead.
     prepare_threshold=0 Disables server-side prepared statements.
                         Required for PgBouncer transaction-mode compatibility.
+
+    CHECKPOINT_POSTGRES_POOL_MIN_SIZE  Minimum idle connections.  Default: 1.
+    CHECKPOINT_POSTGRES_POOL_MAX_SIZE  Maximum pool size.  Default: 10.
 
 ────────────────────────────────────────────────────────────────────────────────
 Optional S3 offloading
@@ -53,7 +66,15 @@ Relevant env vars:
     CHECKPOINT_S3_BUCKET_NAME   S3 bucket name.  When absent, S3 offloading is
                                 disabled and all blobs are stored in PostgreSQL.
     CHECKPOINT_S3_THRESHOLD_MB  Blob size threshold in megabytes above which
-                                offloading is triggered.  Default: 10.
+                                offloading is triggered.  Default: 1.
+
+Lifecycle / cleanup: offloaded objects are NOT deleted automatically.  The serde runs
+below LangGraph's checkpoint lifecycle and cannot observe row/thread deletion, so
+overwrites and TTL cleanups leave orphaned objects behind.  Configure an S3 lifecycle
+policy on the ``checkpoints/`` prefix to expire them (pair its expiry with
+CHECKPOINT_TTL_DAYS).  Disabling offloading (unsetting CHECKPOINT_S3_BUCKET_NAME) while
+``s3ref`` rows still exist will make those rows fail to load — keep the bucket
+configured until such rows have aged out.
 
 Note: S3 serialisation/deserialisation is called inside asyncio.to_thread() by
 AsyncPostgresSaver, so synchronous boto3 is safe to use here.
@@ -73,8 +94,8 @@ read and logged at startup so it is visible in configuration audits.
 Thread-ID isolation (unchanged from DynamoDB era)
 ────────────────────────────────────────────────────────────────────────────────
 
-All agents share the same PostgreSQL table.  Isolation is achieved through the
-existing thread_id naming convention — no changes required:
+Agents that share a schema also share the checkpoint tables; isolation is achieved
+through the existing thread_id naming convention — no changes required:
 
     orchestrator  →  {context_id}::orchestrator
     agent-creator →  {context_id}::agent-creator
@@ -110,9 +131,12 @@ import json
 import logging
 import os
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
+
+if TYPE_CHECKING:
+    from psycopg_pool import AsyncConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +170,7 @@ class S3OffloadingSerde:
     def _get_s3(self):
         if self._s3 is None:
             import boto3
+
             self._s3 = boto3.client("s3")
         return self._s3
 
@@ -170,11 +195,29 @@ class S3OffloadingSerde:
         if type_tag != self._S3_TYPE_TAG:
             return self._inner.loads_typed((type_tag, raw))
 
-        ref = json.loads(raw)
-        response = self._get_s3().get_object(Bucket=self._bucket, Key=ref["s3_key"])
-        actual_data: bytes = response["Body"].read()
-        logger.debug("Fetched checkpoint blob from S3 (key=%s)", ref["s3_key"])
-        return self._inner.loads_typed((ref["original_type"], actual_data))
+        try:
+            ref = json.loads(raw)
+            s3_key = ref["s3_key"]
+            original_type = ref["original_type"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"Corrupt S3 checkpoint reference (type tag={self._S3_TYPE_TAG!r}): {exc}. "
+                "The DB row points at an offloaded blob but the reference cannot be parsed."
+            ) from exc
+
+        try:
+            response = self._get_s3().get_object(Bucket=self._bucket, Key=s3_key)
+            actual_data: bytes = response["Body"].read()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to fetch offloaded checkpoint blob from S3 "
+                f"(bucket={self._bucket}, key={s3_key}): {exc}. The blob may have been "
+                "removed by an S3 lifecycle policy or manual cleanup, or "
+                "CHECKPOINT_S3_BUCKET_NAME may point at the wrong bucket."
+            ) from exc
+
+        logger.debug("Fetched checkpoint blob from S3 (key=%s)", s3_key)
+        return self._inner.loads_typed((original_type, actual_data))
 
 
 # ─── Version check helper ─────────────────────────────────────────────────────
@@ -192,7 +235,10 @@ async def _verify_postgres_version(pool) -> None:
     async with pool.connection() as conn:
         result = await conn.execute("SHOW server_version_num")
         row = await result.fetchone()
-        version_num = int(row[0])
+        # The pool uses dict_row (rows keyed by column name), so row[0] would KeyError.
+        # Read the single value regardless of the connection's row factory.
+        raw = next(iter(row.values())) if isinstance(row, dict) else row[0]
+        version_num = int(raw)
 
     if version_num < _MIN_PG_VERSION:
         major = version_num // 10000
@@ -224,7 +270,7 @@ class PostgreSQLCheckpointerMixin:
     is verified (≥ PG 11), and the schema is initialised in the async
     _setup_checkpointer() call, which LangGraphAgent.startup() invokes automatically.
 
-    Falls back to MemorySaver when CHECKPOINT_POSTGRES_HOST is not set (local dev).
+    Falls back to MemorySaver when POSTGRES_HOST is not set (local dev).
 
     See module docstring for full configuration reference.
     """
@@ -240,25 +286,25 @@ class PostgreSQLCheckpointerMixin:
 
         Returns:
             MemorySaver placeholder (replaced by AsyncPostgresSaver at startup), or a
-            permanent MemorySaver when CHECKPOINT_POSTGRES_HOST is not set.
+            permanent MemorySaver when POSTGRES_HOST is not set.
         """
         from langgraph.checkpoint.memory import MemorySaver
 
-        host = os.getenv("CHECKPOINT_POSTGRES_HOST")
+        host = os.getenv("POSTGRES_HOST")
         if not host:
+            if not memory_fallback_allowed():
+                raise missing_host_error()
             logger.warning(
-                "CHECKPOINT_POSTGRES_HOST not set — using in-memory checkpointer.  "
-                "Conversation history will be lost on restart."
+                "POSTGRES_HOST not set — using in-memory checkpointer.  Conversation history will be lost on restart."
             )
             self._checkpointer_pool = None
             return MemorySaver()
 
-        from psycopg_pool import AsyncConnectionPool
-
-        port = os.getenv("CHECKPOINT_POSTGRES_PORT", "5432")
-        db = os.getenv("CHECKPOINT_POSTGRES_DB", "checkpointer")
-        user = os.getenv("CHECKPOINT_POSTGRES_USER", "postgres")
-        password = os.getenv("CHECKPOINT_POSTGRES_PASSWORD", "")
+        port = os.getenv("POSTGRES_PORT", "5432")
+        db = os.getenv("POSTGRES_DB", "postgres")
+        user = os.getenv("POSTGRES_USER", "postgres")
+        password = os.getenv("POSTGRES_PASSWORD", "")
+        schema = os.getenv("POSTGRES_SCHEMA")
 
         ttl_days = int(os.getenv("CHECKPOINT_TTL_DAYS", "14"))
         logger.info(
@@ -267,22 +313,15 @@ class PostgreSQLCheckpointerMixin:
             ttl_days,
         )
 
-        conn_string = f"postgresql://{user}:{password}@{host}:{port}/{db}"
-
-        # autocommit=True  — required by AsyncPostgresSaver
-        # prepare_threshold=0 — disables server-side prepared statements (PgBouncer compat)
-        pool = AsyncConnectionPool(
-            conninfo=conn_string,
-            open=False,
-            kwargs={"autocommit": True, "prepare_threshold": 0},
-        )
+        pool = build_checkpointer_pool(host=host, port=port, db=db, user=user, password=password, schema=schema)
         self._checkpointer_pool = pool
 
         logger.info(
-            "Prepared PostgreSQL checkpointer pool (host=%s, db=%s) — "
+            "Prepared PostgreSQL checkpointer pool (host=%s, db=%s, schema=%s) — "
             "AsyncPostgresSaver will be created in _setup_checkpointer()",
             host,
             db,
+            schema or "<role default>",
         )
         # Placeholder: replaced by AsyncPostgresSaver in _setup_checkpointer()
         return MemorySaver()
@@ -300,9 +339,8 @@ class PostgreSQLCheckpointerMixin:
         if pool is None:
             return  # permanent MemorySaver — nothing to do
 
-        if not getattr(pool, "_opened", False):
-            await pool.open()
-            logger.info("Opened AsyncConnectionPool for checkpoint store")
+        await open_pool_if_closed(pool)
+        logger.info("Checkpoint connection pool open")
 
         await _verify_postgres_version(pool)
 
@@ -316,14 +354,15 @@ class PostgreSQLCheckpointerMixin:
         # Swap placeholder with the real checkpointer before any requests are served
         self._checkpointer = checkpointer
         logger.info(
-            "PostgreSQL checkpointer ready (tables in public schema, s3_offload=%s)", bool(serde)
+            "PostgreSQL checkpointer ready (tables in the connection's search_path schema, s3_offload=%s)",
+            bool(serde),
         )
 
     async def _teardown_checkpointer(self) -> None:
         """Close the connection pool on shutdown."""
         pool = getattr(self, "_checkpointer_pool", None)
-        if pool is not None and getattr(pool, "_opened", False):
-            await pool.close()
+        if pool is not None:
+            await close_pool_if_open(pool)
             logger.info("Closed checkpoint connection pool")
 
 
@@ -336,7 +375,7 @@ def _build_serde() -> S3OffloadingSerde | None:
     if not bucket:
         return None
 
-    threshold_mb = float(os.getenv("CHECKPOINT_S3_THRESHOLD_MB", "10"))
+    threshold_mb = float(os.getenv("CHECKPOINT_S3_THRESHOLD_MB", "1"))
     threshold_bytes = int(threshold_mb * 1024 * 1024)
     logger.info(
         "S3 checkpoint offloading enabled (bucket=%s, threshold=%.1f MB)",
@@ -344,3 +383,98 @@ def _build_serde() -> S3OffloadingSerde | None:
         threshold_mb,
     )
     return S3OffloadingSerde(bucket=bucket, threshold_bytes=threshold_bytes)
+
+
+# ─── Shared pool / lifecycle helpers (reused by graph_factory and agent-runner) ──
+
+
+def memory_fallback_allowed() -> bool:
+    """Whether an in-memory checkpointer is acceptable when no Postgres host is set.
+
+    Allowed only in local development: when CHECKPOINT_ALLOW_MEMORY is explicitly
+    truthy, or when ENVIRONMENT is unset/"local".  In any deployed environment a
+    missing POSTGRES_HOST is a misconfiguration that must fail fast rather than
+    silently drop conversation history on restart.
+    """
+    if os.getenv("CHECKPOINT_ALLOW_MEMORY", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    return os.getenv("ENVIRONMENT", "local").strip().lower() == "local"
+
+
+def missing_host_error() -> RuntimeError:
+    """Build the fail-fast error raised when POSTGRES_HOST is required but unset."""
+    return RuntimeError(
+        f"POSTGRES_HOST is not set but ENVIRONMENT="
+        f"{os.getenv('ENVIRONMENT', 'local')!r} requires a persistent checkpoint store. "
+        "Set POSTGRES_HOST, or set CHECKPOINT_ALLOW_MEMORY=true to explicitly opt into "
+        "the in-memory checkpointer (development only — conversation history is lost on "
+        "every restart)."
+    )
+
+
+def pool_sizes() -> tuple[int, int]:
+    """Return (min_size, max_size) for the checkpoint pool from env (defaults 1/10)."""
+    min_size = int(os.getenv("CHECKPOINT_POSTGRES_POOL_MIN_SIZE", "1"))
+    max_size = int(os.getenv("CHECKPOINT_POSTGRES_POOL_MAX_SIZE", "10"))
+    return min_size, max_size
+
+
+def build_checkpointer_pool(
+    *,
+    host: str,
+    port: str,
+    db: str,
+    user: str,
+    password: str,
+    schema: str | None = None,
+) -> AsyncConnectionPool:
+    """Create a closed AsyncConnectionPool for the checkpoint store.
+
+    The DSN is assembled with psycopg.conninfo.make_conninfo so special characters in
+    the user/password (``@ : / ? #`` — common in generated secrets) are escaped
+    correctly instead of corrupting an f-string URL.  The pool is explicitly sized
+    (psycopg's default min_size=4 would hold idle connections per process) and created
+    with open=False so it can be constructed synchronously.  Connection kwargs match
+    AsyncPostgresSaver.from_conn_string (autocommit, prepare_threshold=0, dict_row).
+
+    When ``schema`` is given the connection search_path is pinned to
+    ``<schema>,public`` so AsyncPostgresSaver's unqualified DDL creates the checkpoint
+    tables in the service's own schema rather than public.
+    """
+    from psycopg.conninfo import make_conninfo
+    from psycopg.rows import dict_row
+    from psycopg_pool import AsyncConnectionPool
+
+    conninfo = make_conninfo(host=host, port=port, dbname=db, user=user, password=password)
+    conn_kwargs: dict[str, Any] = {
+        "autocommit": True,
+        "prepare_threshold": 0,
+        "row_factory": dict_row,
+    }
+    if schema:
+        conn_kwargs["options"] = f"-c search_path={schema},public"
+    min_size, max_size = pool_sizes()
+    return AsyncConnectionPool(
+        conninfo=conninfo,
+        open=False,
+        min_size=min_size,
+        max_size=max_size,
+        kwargs=conn_kwargs,
+    )
+
+
+async def open_pool_if_closed(pool) -> None:
+    """Open the pool only when closed (uses the public ``closed`` property).
+
+    psycopg_pool.close() sets ``closed`` back to True but never resets the private
+    ``_opened`` flag, so guarding on ``_opened`` would skip re-opening a pool that was
+    torn down and set up again.  ``closed`` reflects the real state across cycles.
+    """
+    if pool.closed:
+        await pool.open()
+
+
+async def close_pool_if_open(pool) -> None:
+    """Close the pool only when it is currently open."""
+    if not pool.closed:
+        await pool.close()

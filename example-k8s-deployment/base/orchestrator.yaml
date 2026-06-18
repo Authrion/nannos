@@ -72,6 +72,8 @@ spec:
           value: "docstore"
         - name: POSTGRES_SCHEMA
           value: "docstore"
+        # The checkpointer reuses the POSTGRES_* connection above (docstore DB, docstore
+        # schema). It fails fast in deployed environments if POSTGRES_HOST is unset.
         # Sandbox (optional — omit SANDBOX_PROVIDER to disable)
         # - name: SANDBOX_PROVIDER
         #   value: "gatana"

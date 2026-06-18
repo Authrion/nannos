@@ -56,6 +56,20 @@ spec:
           value: "https://YOUR_ORG_ID.gatana.ai/mcp"
         - name: MCP_GATEWAY_CLIENT_ID
           value: "gatana"
+        # Shared docstore connection (per the per-service-schema convention). The
+        # checkpointer reuses this; conversation state persists in the docstore schema.
+        # It fails fast in deployed environments if POSTGRES_HOST is unset.
+        # POSTGRES_PASSWORD must be provided via agent-creator-secrets.
+        - name: POSTGRES_HOST
+          value: "${POSTGRES_HOST}"
+        - name: POSTGRES_PORT
+          value: "5432"
+        - name: POSTGRES_DB
+          value: "docstore"
+        - name: POSTGRES_USER
+          value: "docstore"
+        - name: POSTGRES_SCHEMA
+          value: "docstore"
         envFrom:
         - secretRef:
             name: agent-creator-secrets

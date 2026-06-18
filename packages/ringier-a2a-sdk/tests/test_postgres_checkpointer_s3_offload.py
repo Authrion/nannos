@@ -1,4 +1,4 @@
-"""Test PostgreSQL checkpointer with S3 offloading for large blobs.
+r"""Test PostgreSQL checkpointer with S3 offloading for large blobs.
 
 Tests the S3OffloadingSerde wrapper that transparently offloads checkpoint
 blobs exceeding a size threshold to S3, storing compact JSON references in
@@ -206,6 +206,112 @@ class TestS3OffloadingIntegration:
                 ref = json.loads(data)
                 assert "s3_key" in ref
                 assert ref["s3_key"].startswith("checkpoints/")
+
+
+class TestS3OffloadingRoundTripRealSerde:
+    """Round-trip through offloading using the REAL inner serializer (no inner mock).
+
+    Mirrors the production path verified end-to-end against a live orchestrator:
+    a large blob is offloaded as type 's3ref', the reference records the real
+    ``original_type`` produced by JsonPlusSerializer, and ``loads_typed``
+    reconstructs the exact original object after fetching the bytes back from S3.
+    The other tests mock ``_inner``; these exercise it for real.
+    """
+
+    @pytest.fixture
+    def serde(self):
+        return S3OffloadingSerde(bucket="test-bucket", threshold_bytes=1024)
+
+    @pytest.fixture
+    def fake_s3(self):
+        """In-memory S3 stand-in: put_object stores bytes, get_object returns them."""
+        store: dict[tuple[str, str], bytes] = {}
+        client = MagicMock()
+
+        def _put(Bucket, Key, Body):
+            store[(Bucket, Key)] = Body
+            return {}
+
+        def _get(Bucket, Key):
+            body = MagicMock()
+            body.read.return_value = store[(Bucket, Key)]
+            return {"Body": body}
+
+        client.put_object.side_effect = _put
+        client.get_object.side_effect = _get
+        return client
+
+    def test_large_object_round_trips_through_s3(self, serde, fake_s3):
+        """A >threshold object survives dump→offload→fetch→load unchanged."""
+        original = {"messages": [{"role": "user", "content": "x" * 50} for _ in range(50)]}
+
+        with patch.object(serde, "_get_s3", return_value=fake_s3):
+            type_tag, ref = serde.dumps_typed(original)
+            assert type_tag == "s3ref"
+
+            # The reference records the REAL inner type tag, not a hard-coded guess.
+            expected_type, _ = serde._inner.dumps_typed(original)
+            assert json.loads(ref)["original_type"] == expected_type
+
+            restored = serde.loads_typed((type_tag, ref))
+
+        assert restored == original
+
+    def test_small_object_round_trips_inline(self, serde, fake_s3):
+        """A <=threshold object stays in the DB and never touches S3."""
+        original = {"k": "v"}
+
+        with patch.object(serde, "_get_s3", return_value=fake_s3):
+            type_tag, data = serde.dumps_typed(original)
+            assert type_tag != "s3ref"
+            fake_s3.put_object.assert_not_called()
+
+            restored = serde.loads_typed((type_tag, data))
+
+        assert restored == original
+
+
+class TestS3OffloadingLoadErrors:
+    """Read-path failure modes: a dangling/garbled s3ref must fail loudly."""
+
+    @pytest.fixture
+    def serde(self):
+        return S3OffloadingSerde(bucket="test-bucket", threshold_bytes=1024)
+
+    def test_non_s3ref_delegates_to_inner(self, serde):
+        """A normal (non-offloaded) blob is deserialized by the inner serde unchanged."""
+        original = {"hello": "world"}
+        type_tag, data = serde._inner.dumps_typed(original)
+
+        assert type_tag != "s3ref"
+        assert serde.loads_typed((type_tag, data)) == original
+
+    def test_unparseable_reference_raises(self, serde):
+        """An s3ref blob whose body isn't JSON raises a clear RuntimeError."""
+        with pytest.raises(RuntimeError, match="Corrupt S3 checkpoint reference"):
+            serde.loads_typed(("s3ref", b"not-json"))
+
+    def test_reference_missing_key_raises(self, serde):
+        """An s3ref reference lacking s3_key raises a clear RuntimeError."""
+        bad = json.dumps({"original_type": "json"}).encode()
+        with pytest.raises(RuntimeError, match="Corrupt S3 checkpoint reference"):
+            serde.loads_typed(("s3ref", bad))
+
+    def test_s3_fetch_failure_raises(self, serde):
+        """When the offloaded object is gone, loads_typed surfaces a RuntimeError.
+
+        This is the failure mode that bites if an S3 lifecycle policy or manual
+        cleanup removes a blob that a checkpoint still references.
+        """
+        ref = json.dumps({"s3_key": "checkpoints/gone", "original_type": "json"}).encode()
+
+        with patch.object(serde, "_get_s3") as mock_s3:
+            client = MagicMock()
+            client.get_object.side_effect = Exception("NoSuchKey")
+            mock_s3.return_value = client
+
+            with pytest.raises(RuntimeError, match="Failed to fetch offloaded checkpoint blob"):
+                serde.loads_typed(("s3ref", ref))
 
 
 @pytest.mark.skipif(

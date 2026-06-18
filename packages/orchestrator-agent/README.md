@@ -127,16 +127,14 @@ OIDC_CLIENT_ID=your-client-id
 OIDC_AUDIENCE=api://default
 
 # PostgreSQL Checkpoints (for conversation persistence)
-CHECKPOINT_POSTGRES_HOST=localhost
-CHECKPOINT_POSTGRES_PORT=5403
-CHECKPOINT_POSTGRES_DB=checkpointer
-CHECKPOINT_POSTGRES_USER=postgres
-CHECKPOINT_POSTGRES_PASSWORD=password
-CHECKPOINT_POSTGRES_SCHEMA=checkpoints
+# The checkpointer reuses the POSTGRES_* connection above (same DB/user as the document
+# store). Checkpoint tables are created in POSTGRES_SCHEMA via the connection search_path
+# by AsyncPostgresSaver.setup() — no separate database, user, or migration required.
+CHECKPOINT_TTL_DAYS=14            # retention hint (not auto-enforced; see mixin docstring)
 
-# Optional S3 Offloading (for checkpoints > 10 MB)
+# Optional S3 Offloading (for checkpoint blobs above the threshold; default 1 MB)
 # CHECKPOINT_S3_BUCKET_NAME=my-bucket
-# CHECKPOINT_S3_THRESHOLD_MB=10
+# CHECKPOINT_S3_THRESHOLD_MB=1
 
 # Agent Discovery
 AGENT_REGISTRY_URL=http://localhost:9000/agents
@@ -319,8 +317,8 @@ Key variables:
 - Review discovery logs with `LOG_LEVEL=DEBUG`
 
 **PostgreSQL checkpoint errors**
-- Verify PostgreSQL is running: `pg_isready -h localhost -p 5403`
-- Check checkpoint schema exists: `psql -h localhost -U postgres -d checkpointer -c "SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'checkpoints';"`
+- Verify PostgreSQL is running: `pg_isready -h "$POSTGRES_HOST" -p "$POSTGRES_PORT"` (the checkpointer shares the docstore DB)
+- Check checkpoint tables exist (in the POSTGRES_SCHEMA of the docstore DB): `psql -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\dt $POSTGRES_SCHEMA.checkpoint*"`
 - Check IAM/credentials for checkpoint database
 - For S3 offloading issues, verify S3 bucket permissions and `CHECKPOINT_S3_BUCKET_NAME` is set
 
