@@ -214,8 +214,7 @@ printf "${CYAN}│${RESET}                                                      
 # Infrastructure
 printf "${CYAN}│${RESET}  Infrastructure:                                       ${CYAN}│${RESET}\n"
 printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} PostgreSQL (console)       ${DIM}(Docker, localhost:5401)${RESET}\n"
-printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} PostgreSQL (docstore)      ${DIM}(Docker, localhost:5402)${RESET}\n"
-printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} PostgreSQL (checkpointer)  ${DIM}(Docker, localhost:5403)${RESET}\n"
+printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} PostgreSQL (docstore)      ${DIM}(Docker, localhost:5402; also holds checkpoints)${RESET}\n"
 if [[ "$_OIDC_MODE" == "local" ]]; then
   printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} Keycloak        ${DIM}(Docker, localhost:8180)${RESET}\n"
 else
@@ -537,9 +536,6 @@ done
 until docker compose exec -T postgres-docstore pg_isready -U postgres >/dev/null 2>&1; do
   sleep 1
 done
-until docker compose exec -T postgres-checkpointer pg_isready -U postgres >/dev/null 2>&1; do
-  sleep 1
-done
 ok "PostgreSQL is ready"
 
 # ─── 5. Run database migrations ──────────────────────────────────
@@ -839,8 +835,7 @@ cat <<'EOF'
     soffice-worker .... http://localhost:8090
     Keycloak .......... $_KC_BASE_URL
     PostgreSQL (console)       localhost:5401
-    PostgreSQL (docstore)      localhost:5402
-    PostgreSQL (checkpointer)  localhost:5403
+    PostgreSQL (docstore)      localhost:5402  (also holds checkpoints)
 
   LLM Providers:
 ${_LLM_LINES}
@@ -1015,12 +1010,7 @@ procs:
       GCP_KEY: '$GCP_KEY'
       GCP_PROJECT_ID: "$GCP_PROJECT_ID"
       GCP_LOCATION: "$GCP_LOCATION"
-      CHECKPOINT_POSTGRES_HOST: "localhost"
-      CHECKPOINT_POSTGRES_PORT: "5403"
-      CHECKPOINT_POSTGRES_DB: "checkpointer"
-      CHECKPOINT_POSTGRES_USER: "postgres"
-      CHECKPOINT_POSTGRES_PASSWORD: "password"
-      CHECKPOINT_POSTGRES_SCHEMA: "checkpointer"
+      # Checkpointer reuses the POSTGRES_* connection above (docstore DB / public schema)
       CHECKPOINT_S3_BUCKET_NAME: "$CHECKPOINT_S3_BUCKET_NAME"
       DOCUMENT_STORE_S3_BUCKET: "$DOCUMENT_STORE_S3_BUCKET"
       OBJECT_STORAGE_TYPE: "$OBJECT_STORAGE_TYPE"
@@ -1059,12 +1049,13 @@ procs:
       AZURE_OPENAI_ENDPOINT: "$AZURE_OPENAI_ENDPOINT"
       AWS_BEDROCK_REGION: "$AWS_BEDROCK_REGION"
       BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-      CHECKPOINT_POSTGRES_HOST: "localhost"
-      CHECKPOINT_POSTGRES_PORT: "5403"
-      CHECKPOINT_POSTGRES_DB: "checkpointer"
-      CHECKPOINT_POSTGRES_USER: "postgres"
-      CHECKPOINT_POSTGRES_PASSWORD: "password"
-      CHECKPOINT_POSTGRES_SCHEMA: "checkpointer"
+      # Checkpointer reuses POSTGRES_* (docstore DB / public schema), like the other agents
+      POSTGRES_HOST: "localhost"
+      POSTGRES_PORT: "5402"
+      POSTGRES_DB: "docstore"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "password"
+      POSTGRES_SCHEMA: "public"
       CHECKPOINT_S3_BUCKET_NAME: "$CHECKPOINT_S3_BUCKET_NAME"
 
   runner:
@@ -1098,12 +1089,7 @@ procs:
       GCP_KEY: '$GCP_KEY'
       GCP_PROJECT_ID: "$GCP_PROJECT_ID"
       GCP_LOCATION: "$GCP_LOCATION"
-      CHECKPOINT_POSTGRES_HOST: "localhost"
-      CHECKPOINT_POSTGRES_PORT: "5403"
-      CHECKPOINT_POSTGRES_DB: "checkpointer"
-      CHECKPOINT_POSTGRES_USER: "postgres"
-      CHECKPOINT_POSTGRES_PASSWORD: "password"
-      CHECKPOINT_POSTGRES_SCHEMA: "checkpointer"
+      # Checkpointer reuses the POSTGRES_* connection above (docstore DB / public schema)
       CHECKPOINT_S3_BUCKET_NAME: "$CHECKPOINT_S3_BUCKET_NAME"
       DOCUMENT_STORE_S3_BUCKET: "$DOCUMENT_STORE_S3_BUCKET"
       SANDBOX_PROVIDER: "${SANDBOX_PROVIDER:-}"

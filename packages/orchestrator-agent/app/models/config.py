@@ -302,18 +302,15 @@ class AgentSettings:
     # Cache configuration
     AGENT_DISCOVERY_CACHE_TTL = 30  # seconds
 
-    # PostgreSQL checkpoint configuration
-    CHECKPOINT_POSTGRES_HOST: str | None = os.getenv("CHECKPOINT_POSTGRES_HOST", None)
-    CHECKPOINT_POSTGRES_PORT: str = os.getenv("CHECKPOINT_POSTGRES_PORT", "5432")
-    CHECKPOINT_POSTGRES_DB: str = os.getenv("CHECKPOINT_POSTGRES_DB", "checkpointer")
-    CHECKPOINT_POSTGRES_USER: str = os.getenv("CHECKPOINT_POSTGRES_USER", "postgres")
-    CHECKPOINT_POSTGRES_PASSWORD: str = os.getenv("CHECKPOINT_POSTGRES_PASSWORD", "")
+    # PostgreSQL checkpoint configuration.
+    # The checkpointer reuses the main POSTGRES_* connection (same DB/user/schema as the
+    # document store); tables live in POSTGRES_SCHEMA via the connection search_path.
     CHECKPOINT_TTL_DAYS: int = int(os.getenv("CHECKPOINT_TTL_DAYS", "14"))
     CHECKPOINT_MAX_RETRIES: int = int(os.getenv("CHECKPOINT_MAX_RETRIES", "5"))
 
     # Optional S3 offloading for large checkpoint blobs
     CHECKPOINT_S3_BUCKET_NAME: str | None = os.getenv("CHECKPOINT_S3_BUCKET_NAME", None)
-    CHECKPOINT_S3_THRESHOLD_MB: float = float(os.getenv("CHECKPOINT_S3_THRESHOLD_MB", "10"))
+    CHECKPOINT_S3_THRESHOLD_MB: float = float(os.getenv("CHECKPOINT_S3_THRESHOLD_MB", "1"))
 
     # file store configuration
     DOCUMENT_STORE_S3_BUCKET = os.getenv("DOCUMENT_STORE_S3_BUCKET", "dev-nannos-infrastructure-agents-files")

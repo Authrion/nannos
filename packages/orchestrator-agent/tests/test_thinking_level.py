@@ -176,13 +176,13 @@ class TestThinkingLevelCaching:
         from app.core.graph_factory import GraphFactory
 
         config = Mock(spec=AgentSettings)
-        config.CHECKPOINT_POSTGRES_HOST = None
         config.CHECKPOINT_TTL_DAYS = 30
         config.POSTGRES_USER = "test"
         config.POSTGRES_PASSWORD = "test"
         config.POSTGRES_HOST = "localhost"
         config.POSTGRES_PORT = 5432
         config.POSTGRES_DB = "test"
+        config.POSTGRES_SCHEMA = "public"
         config.MAX_RETRIES = 3
         config.BACKOFF_FACTOR = 2
         config.get_bedrock_region.return_value = "eu-central-1"
@@ -209,13 +209,13 @@ class TestThinkingLevelCaching:
         from app.core.graph_factory import GraphFactory
 
         config = Mock(spec=AgentSettings)
-        config.CHECKPOINT_POSTGRES_HOST = None
         config.CHECKPOINT_TTL_DAYS = 30
         config.POSTGRES_USER = "test"
         config.POSTGRES_PASSWORD = "test"
         config.POSTGRES_HOST = "localhost"
         config.POSTGRES_PORT = 5432
         config.POSTGRES_DB = "test"
+        config.POSTGRES_SCHEMA = "public"
         config.MAX_RETRIES = 3
         config.BACKOFF_FACTOR = 2
         config.get_bedrock_region.return_value = "eu-central-1"

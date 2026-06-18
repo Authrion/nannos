@@ -178,13 +178,13 @@ class TestGraphCreationWithThinking:
         from app.models.config import AgentSettings
 
         mock_config = Mock(spec=AgentSettings)
-        mock_config.CHECKPOINT_POSTGRES_HOST = None
         mock_config.CHECKPOINT_TTL_DAYS = 30
         mock_config.POSTGRES_USER = "test"
         mock_config.POSTGRES_PASSWORD = "test"
         mock_config.POSTGRES_HOST = "localhost"
         mock_config.POSTGRES_PORT = 5432
         mock_config.POSTGRES_DB = "test"
+        mock_config.POSTGRES_SCHEMA = "public"
         mock_config.MAX_RETRIES = 3
         mock_config.BACKOFF_FACTOR = 2
         mock_config.get_bedrock_region.return_value = "eu-central-1"

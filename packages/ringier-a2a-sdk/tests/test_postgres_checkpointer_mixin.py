@@ -35,6 +35,18 @@ def _install_submodule(modname: str, **attrs) -> None:
 
 if "psycopg_pool" not in sys.modules:
     _install_submodule("psycopg_pool", AsyncConnectionPool=MagicMock())
+if "psycopg" not in sys.modules:
+    # psycopg lives behind the `langgraph` extra; stub conninfo/rows so the mixin's
+    # build_checkpointer_pool helper imports cleanly. make_conninfo returns a real
+    # keyword conninfo string so DSN-escaping assertions stay meaningful.
+    def _fake_make_conninfo(conninfo: str = "", **kwargs) -> str:
+        return " ".join(f"{k}={v}" for k, v in kwargs.items())
+
+    _install_submodule("psycopg")
+    _install_submodule("psycopg.conninfo", make_conninfo=_fake_make_conninfo)
+    _install_submodule("psycopg.rows", dict_row=object())
+    sys.modules["psycopg"].conninfo = sys.modules["psycopg.conninfo"]
+    sys.modules["psycopg"].rows = sys.modules["psycopg.rows"]
 if "langgraph.checkpoint.postgres" not in sys.modules:
     _install_submodule("langgraph.checkpoint.postgres")
     _install_submodule("langgraph.checkpoint.postgres.aio", AsyncPostgresSaver=MagicMock())
@@ -49,7 +61,6 @@ from ringier_a2a_sdk.agent.postgres_checkpointer_mixin import (  # noqa: E402
     _build_serde,
     _verify_postgres_version,
 )
-
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -67,10 +78,15 @@ class _AsyncCM:
         return None
 
 
-def _fake_pool_with_version(version_num: int) -> MagicMock:
-    """Build a pool mock whose `connection()` yields a conn returning version_num."""
+def _fake_pool_with_version(version_num: int, *, dict_row: bool = False) -> MagicMock:
+    """Build a pool mock whose `connection()` yields a conn returning version_num.
+
+    With dict_row=True the row is a dict keyed by column name (as the real pool's
+    dict_row factory produces), exercising the row-factory-agnostic version read.
+    """
+    row = {"server_version_num": version_num} if dict_row else [version_num]
     result = MagicMock()
-    result.fetchone = AsyncMock(return_value=[version_num])
+    result.fetchone = AsyncMock(return_value=row)
     conn = MagicMock()
     conn.execute = AsyncMock(return_value=result)
     pool = MagicMock()
@@ -98,8 +114,8 @@ class TestBuildSerde:
 
         assert isinstance(serde, S3OffloadingSerde)
         assert serde._bucket == "test-bucket"
-        # Default is 10 MB → 10 * 1024 * 1024 bytes
-        assert serde._threshold == 10 * 1024 * 1024
+        # Default is 1 MB → 1 * 1024 * 1024 bytes
+        assert serde._threshold == 1 * 1024 * 1024
 
     def test_returns_serde_with_custom_threshold(self, monkeypatch):
         monkeypatch.setenv("CHECKPOINT_S3_BUCKET_NAME", "another-bucket")
@@ -117,7 +133,10 @@ class TestBuildSerde:
 
 class TestCreateCheckpointer:
     def test_falls_back_to_memory_saver_when_host_unset(self, monkeypatch):
-        monkeypatch.delenv("CHECKPOINT_POSTGRES_HOST", raising=False)
+        # The checkpointer reuses the main POSTGRES_* connection; no host → MemorySaver.
+        monkeypatch.delenv("POSTGRES_HOST", raising=False)
+        monkeypatch.delenv("ENVIRONMENT", raising=False)  # default "local" allows fallback
+        monkeypatch.delenv("CHECKPOINT_ALLOW_MEMORY", raising=False)
         stub = _Stub()
 
         result = stub._create_checkpointer()
@@ -126,11 +145,13 @@ class TestCreateCheckpointer:
         assert stub._checkpointer_pool is None
 
     def test_constructs_pool_with_required_kwargs(self, monkeypatch):
-        monkeypatch.setenv("CHECKPOINT_POSTGRES_HOST", "db.example.com")
-        monkeypatch.setenv("CHECKPOINT_POSTGRES_PORT", "5433")
-        monkeypatch.setenv("CHECKPOINT_POSTGRES_DB", "ckpt")
-        monkeypatch.setenv("CHECKPOINT_POSTGRES_USER", "ckpt_user")
-        monkeypatch.setenv("CHECKPOINT_POSTGRES_PASSWORD", "s3cret")
+        # Reuses POSTGRES_* (same connection as the document store / task store).
+        monkeypatch.setenv("POSTGRES_HOST", "db.example.com")
+        monkeypatch.setenv("POSTGRES_PORT", "5433")
+        monkeypatch.setenv("POSTGRES_DB", "ckpt")
+        monkeypatch.setenv("POSTGRES_USER", "ckpt_user")
+        monkeypatch.setenv("POSTGRES_PASSWORD", "s3cret")
+        monkeypatch.setenv("POSTGRES_SCHEMA", "docstore")
 
         with patch("psycopg_pool.AsyncConnectionPool") as mock_pool_cls:
             sentinel = MagicMock(name="pool_instance")
@@ -141,9 +162,24 @@ class TestCreateCheckpointer:
 
         mock_pool_cls.assert_called_once()
         call_kwargs = mock_pool_cls.call_args.kwargs
-        assert call_kwargs["conninfo"] == "postgresql://ckpt_user:s3cret@db.example.com:5433/ckpt"
+        # DSN is assembled with psycopg make_conninfo (keyword form) so special
+        # characters in user/password are escaped instead of corrupting a URL.
+        conninfo = call_kwargs["conninfo"]
+        assert "host=db.example.com" in conninfo
+        assert "port=5433" in conninfo
+        assert "dbname=ckpt" in conninfo
+        assert "user=ckpt_user" in conninfo
+        assert "password=s3cret" in conninfo
         assert call_kwargs["open"] is False
-        assert call_kwargs["kwargs"] == {"autocommit": True, "prepare_threshold": 0}
+        # Connection kwargs mirror AsyncPostgresSaver.from_conn_string.
+        assert call_kwargs["kwargs"]["autocommit"] is True
+        assert call_kwargs["kwargs"]["prepare_threshold"] == 0
+        assert "row_factory" in call_kwargs["kwargs"]
+        # POSTGRES_SCHEMA pins the search_path so tables land in the service's own schema.
+        assert call_kwargs["kwargs"]["options"] == "-c search_path=docstore,public"
+        # Pool is explicitly sized (defaults 1/10), not psycopg's default min_size=4.
+        assert call_kwargs["min_size"] == 1
+        assert call_kwargs["max_size"] == 10
 
         assert stub._checkpointer_pool is sentinel
         # Placeholder is a MemorySaver until _setup_checkpointer swaps it.
@@ -173,6 +209,16 @@ class TestVerifyPostgresVersion:
         pool = _fake_pool_with_version(160003)  # PG 16.3
         await _verify_postgres_version(pool)  # should not raise
 
+    @pytest.mark.asyncio
+    async def test_reads_version_from_dict_row(self):
+        # The real pool uses dict_row, so SHOW returns {"server_version_num": ...};
+        # row[0] would KeyError. The version read must be row-factory agnostic.
+        pool = _fake_pool_with_version(160003, dict_row=True)
+        await _verify_postgres_version(pool)  # should not raise
+        bad = _fake_pool_with_version(100023, dict_row=True)
+        with pytest.raises(RuntimeError, match=r"server_version_num=100023"):
+            await _verify_postgres_version(bad)
+
 
 # ─── _setup_checkpointer ──────────────────────────────────────────────────────
 
@@ -194,7 +240,7 @@ class TestSetupCheckpointer:
         monkeypatch.delenv("CHECKPOINT_S3_BUCKET_NAME", raising=False)
 
         pool = _fake_pool_with_version(160003)
-        pool._opened = False
+        pool.closed = True
         pool.open = AsyncMock()
 
         fake_saver = MagicMock()
@@ -221,7 +267,7 @@ class TestSetupCheckpointer:
         monkeypatch.setenv("CHECKPOINT_S3_THRESHOLD_MB", "1")
 
         pool = _fake_pool_with_version(160003)
-        pool._opened = False
+        pool.closed = True
         pool.open = AsyncMock()
 
         fake_saver = MagicMock()
@@ -244,7 +290,7 @@ class TestSetupCheckpointer:
         monkeypatch.delenv("CHECKPOINT_S3_BUCKET_NAME", raising=False)
 
         pool = _fake_pool_with_version(160003)
-        pool._opened = True
+        pool.closed = False
         pool.open = AsyncMock()
 
         fake_saver = MagicMock()
@@ -262,7 +308,7 @@ class TestSetupCheckpointer:
     @pytest.mark.asyncio
     async def test_propagates_old_postgres_error(self, monkeypatch):
         pool = _fake_pool_with_version(100023)  # PG 10.23
-        pool._opened = False
+        pool.closed = True
         pool.open = AsyncMock()
 
         with patch("langgraph.checkpoint.postgres.aio.AsyncPostgresSaver") as saver_cls:
@@ -290,7 +336,7 @@ class TestTeardownCheckpointer:
     @pytest.mark.asyncio
     async def test_no_op_when_pool_not_opened(self):
         pool = MagicMock()
-        pool._opened = False
+        pool.closed = True
         pool.close = AsyncMock()
 
         stub = _Stub()
@@ -303,7 +349,7 @@ class TestTeardownCheckpointer:
     @pytest.mark.asyncio
     async def test_closes_pool_when_opened(self):
         pool = MagicMock()
-        pool._opened = True
+        pool.closed = False
         pool.close = AsyncMock()
 
         stub = _Stub()
