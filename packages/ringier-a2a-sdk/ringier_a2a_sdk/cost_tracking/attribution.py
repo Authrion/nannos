@@ -18,6 +18,10 @@ import contextlib
 import contextvars
 import json
 
+import httpx
+
+from ..utils.http_pool import LazyClient
+
 # Canonical attribution ContextVars. ringier-a2a-sdk sets these per request.
 current_user_sub: contextvars.ContextVar = contextvars.ContextVar("nannos_user_sub", default=None)
 current_conversation_id: contextvars.ContextVar = contextvars.ContextVar("nannos_conversation_id", default=None)
@@ -94,7 +98,9 @@ async def _stamp_metadata(request) -> None:
         request.headers[_HEADER] = json.dumps(attrib)
 
 
-_shared_http_client = None
+_shared_http_client = LazyClient(
+    lambda: httpx.AsyncClient(event_hooks={"request": [_stamp_metadata]}, timeout=600.0)
+)
 
 
 def build_attribution_http_client():
@@ -113,9 +119,4 @@ def build_attribution_http_client():
     client, not a per-request resource). httpx clients are loop-agnostic until first use, so
     a module-level singleton is safe across the app's single event loop.
     """
-    global _shared_http_client
-    if _shared_http_client is None:
-        import httpx
-
-        _shared_http_client = httpx.AsyncClient(event_hooks={"request": [_stamp_metadata]}, timeout=600.0)
-    return _shared_http_client
+    return _shared_http_client.get()

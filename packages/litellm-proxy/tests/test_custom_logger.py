@@ -144,12 +144,22 @@ async def test_flush_failure_does_not_kill_worker(logger_env, monkeypatch):
 
 
 def test_is_retryable_classification():
-    """5xx / timeouts / connection errors retry; 4xx and unknown shapes do not."""
+    """5xx and the transient 4xx (408/429) / timeouts / connection errors retry; other 4xx
+    and unknown shapes do not."""
     req = httpx.Request("POST", "http://x")
-    assert cl._is_retryable(httpx.HTTPStatusError("", request=req, response=httpx.Response(503, request=req)))
-    assert cl._is_retryable(httpx.HTTPStatusError("", request=req, response=httpx.Response(500, request=req)))
-    assert not cl._is_retryable(httpx.HTTPStatusError("", request=req, response=httpx.Response(400, request=req)))
-    assert not cl._is_retryable(httpx.HTTPStatusError("", request=req, response=httpx.Response(401, request=req)))
+
+    def status(code: int) -> httpx.HTTPStatusError:
+        return httpx.HTTPStatusError("", request=req, response=httpx.Response(code, request=req))
+
+    assert cl._is_retryable(status(503))
+    assert cl._is_retryable(status(500))
+    # Transient 4xx: a throttled or server-timed-out ingest will succeed on a retry — dropping
+    # these would lose billing records the backend was simply too busy to accept right now.
+    assert cl._is_retryable(status(429))  # Too Many Requests
+    assert cl._is_retryable(status(408))  # Request Timeout
+    # Non-transient 4xx: bad token / rejected payload — never retried (would wedge the worker).
+    assert not cl._is_retryable(status(400))
+    assert not cl._is_retryable(status(401))
     assert cl._is_retryable(httpx.ConnectError("refused"))
     assert cl._is_retryable(httpx.ReadTimeout("slow"))
     assert not cl._is_retryable(RuntimeError("unknown"))

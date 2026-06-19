@@ -11,10 +11,17 @@ import logging
 import os
 
 import httpx
+from ringier_a2a_sdk.utils.http_pool import LazyClient
 
 from ..config import config
 
 logger = logging.getLogger(__name__)
+
+# One process-wide pooled client for all console-backend → gateway calls, instead of a fresh
+# TCP+TLS handshake per call (gateway_chat + the per-sync-job alias lookup). Per-request
+# timeouts still vary, so each call passes its own `timeout=`. (LazyClient is dependency-free
+# and pulls no langchain — keeps this module's httpx-only footprint.)
+_client = LazyClient(lambda: httpx.AsyncClient())
 
 
 async def gateway_registered_aliases(timeout: float = 10.0) -> set[str] | None:
@@ -28,10 +35,9 @@ async def gateway_registered_aliases(timeout: float = 10.0) -> set[str] | None:
     headers = {"Authorization": f"Bearer {os.getenv('LLM_GATEWAY_API_KEY', 'sk-nannos-gateway')}"}
     url = f"{config.model_gateway.url.rstrip('/')}/v1/model/info"
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
-            data = resp.json().get("data", [])
+        resp = await _client.get().get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
         return {m["model_name"] for m in data if m.get("model_name")}
     except Exception as e:
         logger.warning("Gateway model list unreadable (%s); treating registration as unknown", e)
@@ -69,16 +75,16 @@ async def gateway_chat(
         headers["x-litellm-spend-logs-metadata"] = json.dumps({k: v for k, v in metadata.items() if v is not None})
 
     url = f"{config.model_gateway.url.rstrip('/')}/v1/chat/completions"
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            url,
-            headers=headers,
-            json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens},
-        )
-        resp.raise_for_status()
-        # content is null on a refusal / tool-call-only / empty completion — that's a
-        # *successful* response with no text, not a transport failure. Return "" so callers'
-        # str ops (re.sub/.strip) don't crash; they treat empty as "no usable output" and
-        # apply their own fallback, distinct from the gateway error path (which raises above).
-        content = resp.json()["choices"][0]["message"].get("content")
-        return content or ""
+    resp = await _client.get().post(
+        url,
+        headers=headers,
+        json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    # content is null on a refusal / tool-call-only / empty completion — that's a
+    # *successful* response with no text, not a transport failure. Return "" so callers'
+    # str ops (re.sub/.strip) don't crash; they treat empty as "no usable output" and
+    # apply their own fallback, distinct from the gateway error path (which raises above).
+    content = resp.json()["choices"][0]["message"].get("content")
+    return content or ""

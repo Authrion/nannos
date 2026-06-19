@@ -24,12 +24,13 @@ import base64
 import contextvars
 import logging
 import os
-import threading
 from concurrent.futures import Executor
 from typing import Any
 
 import httpx
 from langchain_core.embeddings import Embeddings
+
+from .utils.http_pool import LazyClient
 
 logger = logging.getLogger(__name__)
 
@@ -68,20 +69,9 @@ _HTTP_TIMEOUT = 60.0  # generous: multimodal/fused image embeds are slower than 
 # One process-wide connection pool reused across every _invoke (and every GeminiEmbeddings
 # instance), instead of a fresh TCP+TLS handshake per embedding call — indexing a large
 # catalog otherwise pays one handshake per chunk. httpx.Client is safe to share across
-# threads, so the executor-backed async paths reuse it too. Mirrors the pooled clients in
-# cost_tracking.attribution and the litellm-proxy custom_logger.
-_client: httpx.Client | None = None
-_client_lock = threading.Lock()
-
-
-def _get_client() -> httpx.Client:
-    global _client
-    if _client is None:
-        # Double-checked: concurrent _invoke calls run in executor threads on the async path.
-        with _client_lock:
-            if _client is None:
-                _client = httpx.Client(timeout=_HTTP_TIMEOUT)
-    return _client
+# threads, so the executor-backed async paths reuse it too. LazyClient handles the
+# thread-safe lazy init shared with cost_tracking.attribution.
+_client: LazyClient[httpx.Client] = LazyClient(lambda: httpx.Client(timeout=_HTTP_TIMEOUT))
 
 
 class GeminiEmbeddings(Embeddings):
@@ -164,7 +154,7 @@ class GeminiEmbeddings(Embeddings):
         headers.update(self._attribution_header())
 
         body = {"model": self.model_id, "input": inputs, "dimensions": self.dimension}
-        resp = _get_client().post(f"{_gateway_base()}/embeddings", json=body, headers=headers)
+        resp = _client.get().post(f"{_gateway_base()}/embeddings", json=body, headers=headers)
         resp.raise_for_status()
         data = resp.json()["data"]
         # Vertex multimodal fuses every input-list element into ONE vector, so we expect a

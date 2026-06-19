@@ -237,13 +237,19 @@ def _build_record(kwargs: dict, response_obj) -> dict | None:
     }
 
 
+_RETRYABLE_STATUS = frozenset({408, 429})  # request-timeout / too-many-requests: transient
+
+
 def _is_retryable(exc: Exception) -> bool:
-    """Whether a flush failure is worth retrying. 5xx, timeouts and connection/transport
-    errors are transient; a 4xx (bad/expired token, malformed or rejected payload) will
-    never succeed, so retrying it forever would wedge the single worker behind a poison
-    batch. Unknown exception shapes are treated as non-retryable for the same reason."""
+    """Whether a flush failure is worth retrying. 5xx, plus the transient 4xx codes
+    (408 Request Timeout, 429 Too Many Requests), and timeouts/connection/transport errors
+    are transient and worth a retry. A non-transient 4xx (bad/expired token, malformed or
+    rejected payload) will never succeed, so retrying it forever would wedge the single
+    worker behind a poison batch. Unknown exception shapes are treated as non-retryable for
+    the same reason."""
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code >= 500
+        code = exc.response.status_code
+        return code >= 500 or code in _RETRYABLE_STATUS
     if isinstance(exc, httpx.RequestError):  # timeout / connection / transport
         return True
     return False

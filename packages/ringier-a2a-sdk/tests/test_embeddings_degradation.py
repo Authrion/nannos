@@ -128,7 +128,6 @@ def test_supports_image_fusion(litellm_model, expected):
 
 def test_invoke_reuses_one_pooled_client(monkeypatch):
     """_invoke must share one process-wide httpx.Client, not build one per call (#8)."""
-    monkeypatch.setattr(emb_mod, "_client", None)  # reset the singleton for a clean count
     monkeypatch.setattr(emb_mod, "_gateway_base", lambda: "http://gateway")
     constructed = {"n": 0}
 
@@ -147,6 +146,8 @@ def test_invoke_reuses_one_pooled_client(monkeypatch):
             return _FakeResp()
 
     monkeypatch.setattr(emb_mod.httpx, "Client", _FakeClient)
+    # Fresh LazyClient so the count starts clean and the real singleton is restored on teardown.
+    monkeypatch.setattr(emb_mod, "_client", emb_mod.LazyClient(lambda: emb_mod.httpx.Client()))
 
     emb = GeminiEmbeddings(role="document", model_id="vertex_ai/gemini-embedding-2")
     emb._attribution_header = lambda: {}  # isolate from cost-attribution wiring
