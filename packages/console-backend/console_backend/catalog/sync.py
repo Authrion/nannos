@@ -31,13 +31,12 @@ import random
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
 from uuid import uuid4
 
 import aiobotocore.session
-import boto3
 from langchain_core.documents import Document
 from langchain_core.vectorstores import VectorStore
 from ringier_a2a_sdk.embeddings import GeminiEmbeddings
@@ -46,7 +45,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..catalog.adapters.base import CatalogSourceAdapter, ExtractedPage, ExtractionResourceError, SourceFile
 from ..catalog.adapters.google_drive import _PPTX_THUMBNAILS_ENABLED, PPTX_MIME, ExportTimeoutError
-from ..catalog.executor import get_io_executor, run_in_sync_executor
+from ..catalog.executor import get_io_executor
+from ..services.llm_gateway import gateway_chat
 from ..catalog.task_queue import (
     FileTaskPayload,
     FileTaskProcessor,
@@ -425,16 +425,16 @@ class SyncCancelled(Exception):
 
 @dataclass
 class _SyncJobState:
-    """Per-sync-job state — isolates concurrent syncs from each other."""
+    """Per-sync-job state — isolates concurrent syncs from each other.
 
+    Embeddings are required and always built by ``setup_job`` from the resolved default
+    alias — there is no default-constructed fallback (indexing without a configured model
+    is blocked upstream, not silently embedded with a guessed alias)."""
+
+    index_embeddings: GeminiEmbeddings
+    query_embeddings: GeminiEmbeddings
     user_sub: str | None = None
     catalog_id: str | None = None
-    index_embeddings: GeminiEmbeddings = field(
-        default_factory=lambda: GeminiEmbeddings(role="document", executor=get_io_executor())
-    )
-    query_embeddings: GeminiEmbeddings = field(
-        default_factory=lambda: GeminiEmbeddings(role="query", executor=get_io_executor())
-    )
     progress_callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
 
 
@@ -460,12 +460,31 @@ class CatalogSyncPipeline:
         self._render_budget = _WeightedSemaphore(RENDER_SLIDE_BUDGET)
         # Per-job state — keyed by sync_job_id to isolate concurrent syncs
         self._job_state: dict[str, _SyncJobState] = {}
-        # Bedrock client for summarization (Claude Haiku)
-        self._bedrock_client = boto3.client("bedrock-runtime", region_name=_AWS_REGION)
+        # Document summarization goes through the Model Gateway (see gateway_chat).
+
+    async def resolve_embedding_readiness(self) -> tuple[str, str | None, str | None]:
+        """Whether this pipeline can embed → ``(status, alias, reason)``.
+
+        Makes the SAME decision as the System Status page
+        (``feature_status.resolve_embedding_readiness``), so the worker and the UI never
+        disagree: ``ready`` only when a default embedding alias is set AND registered on the
+        gateway. ``disabled`` when none is set; ``degraded`` when the set alias is retired/
+        unregistered (the silent-misconfiguration case the worker used to walk into and fail
+        mid-sync). Fails open to ``ready`` when the gateway list is unreadable.
+        """
+        from ..repositories.model_defaults_repository import ModelDefaultsRepository
+        from ..services.feature_status import resolve_embedding_readiness
+        from ..services.llm_gateway import gateway_registered_aliases
+
+        async with self._db_session_factory() as db:
+            defaults = await ModelDefaultsRepository().get_all(db)
+        registered = await gateway_registered_aliases()
+        return resolve_embedding_readiness(defaults, registered)
 
     def setup_job(
         self,
         sync_job_id: str,
+        embedding_model: str,
         user_sub: str | None = None,
         catalog_id: str | None = None,
         progress_callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
@@ -473,26 +492,27 @@ class CatalogSyncPipeline:
         """Register per-job state (cost attribution, embeddings, progress callback).
 
         Must be called before ``run_full_sync`` / ``run_incremental_sync`` /
-        ``reindex_unindexed_pages`` and cleaned up via ``teardown_job()``
-        when the sync finishes.
+        ``reindex_unindexed_pages`` and cleaned up via ``teardown_job()`` when the sync
+        finishes. `embedding_model` is the resolved default alias (see
+        ``resolve_embedding_readiness``) and is required — callers must block the job when
+        embeddings aren't ready rather than relying on a fallback.
         """
+
+        def _emb(role: str) -> GeminiEmbeddings:
+            return GeminiEmbeddings(
+                role=role,
+                model_id=embedding_model,
+                cost_logger=self._cost_logger,
+                user_sub=user_sub,
+                catalog_id=catalog_id,
+                executor=get_io_executor(),
+            )
+
         self._job_state[sync_job_id] = _SyncJobState(
             user_sub=user_sub,
             catalog_id=catalog_id,
-            index_embeddings=GeminiEmbeddings(
-                role="document",
-                cost_logger=self._cost_logger,
-                user_sub=user_sub,
-                catalog_id=catalog_id,
-                executor=get_io_executor(),
-            ),
-            query_embeddings=GeminiEmbeddings(
-                role="query",
-                cost_logger=self._cost_logger,
-                user_sub=user_sub,
-                catalog_id=catalog_id,
-                executor=get_io_executor(),
-            ),
+            index_embeddings=_emb("document"),
+            query_embeddings=_emb("query"),
             progress_callback=progress_callback,
         )
 
@@ -553,15 +573,33 @@ class CatalogSyncPipeline:
                 logger.warning("Sync job %s has unexpected status '%s', treating as cancelled", sync_job_id, status)
                 raise SyncCancelled()
 
-    def _get_vector_store(self, catalog_id: str, sync_job_id: str | None = None) -> VectorStore:
-        """Get or create a vector store for a catalog."""
+    def _get_vector_store(
+        self, catalog_id: str, sync_job_id: str | None = None, *, for_delete: bool = False
+    ) -> VectorStore:
+        """Get or create a vector store for a catalog.
+
+        Indexing/search callers pass a ``sync_job_id`` whose job state carries embeddings
+        resolved from the configured default alias (built in ``setup_job``).
+
+        Delete-only callers pass ``for_delete=True`` to get an embedding-less store:
+        ``adelete`` removes by vector ID and never invokes an embedding model, so file/vector
+        cleanup keeps working even when no default embedding model is configured. The store
+        raises if anyone tries to add through it.
+        """
+        if for_delete:
+            return CatalogVectorStoreFactory.create(
+                catalog_id=catalog_id, index_embedding=None, query_embedding=None
+            )
         state = self._job_state.get(sync_job_id) if sync_job_id else None
-        index_emb = state.index_embeddings if state else GeminiEmbeddings(role="document", executor=get_io_executor())
-        query_emb = state.query_embeddings if state else GeminiEmbeddings(role="query", executor=get_io_executor())
+        if state is None:
+            raise RuntimeError(
+                f"No embedding job state for sync_job_id={sync_job_id!r}; setup_job must run "
+                "before indexing (requires a configured default embedding model)."
+            )
         return CatalogVectorStoreFactory.create(
             catalog_id=catalog_id,
-            index_embedding=index_emb,
-            query_embedding=query_emb,
+            index_embedding=state.index_embeddings,
+            query_embedding=state.query_embeddings,
         )
 
     async def run_full_sync(
@@ -1744,7 +1782,7 @@ class CatalogSyncPipeline:
         # Remove vectors for deleted files
         if vector_ids_to_delete:
             try:
-                vector_store = self._get_vector_store(catalog_id)
+                vector_store = self._get_vector_store(catalog_id, for_delete=True)
                 await vector_store.adelete(ids=vector_ids_to_delete)
                 logger.info("Deleted %d vectors for removed files in catalog %s", len(vector_ids_to_delete), catalog_id)
             except Exception:
@@ -1773,7 +1811,7 @@ class CatalogSyncPipeline:
 
         if vector_ids:
             try:
-                vector_store = self._get_vector_store(catalog_id)
+                vector_store = self._get_vector_store(catalog_id, for_delete=True)
                 await vector_store.adelete(ids=vector_ids)
                 logger.info("Deleted %d vectors for file %s in catalog %s", len(vector_ids), source_file_id, catalog_id)
             except Exception:
@@ -1873,40 +1911,18 @@ class CatalogSyncPipeline:
 
         model_id = config.catalog.summarization_model_id
 
-        def _invoke() -> str:
-            response = self._bedrock_client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(
-                    {
-                        "anthropic_version": "bedrock-2023-05-31",
-                        "max_tokens": 200,
-                        "messages": [{"role": "user", "content": prompt}],
-                    }
-                ),
-            )
-            result = json.loads(response["body"].read())
-
-            # Log Bedrock summarization cost
-            if self._cost_logger and job_user_sub:
-                usage = result.get("usage", {})
-                billing: dict[str, int] = {}
-                if usage.get("input_tokens"):
-                    billing["base_input_tokens"] = usage["input_tokens"]
-                if usage.get("output_tokens"):
-                    billing["base_output_tokens"] = usage["output_tokens"]
-                if billing:
-                    self._cost_logger.log_cost_async(
-                        user_sub=job_user_sub,
-                        billing_unit_breakdown=billing,
-                        provider="bedrock_converse",
-                        model_name=model_id,
-                        catalog_id=job_catalog_id,
-                    )
-
-            return result["content"][0]["text"].strip()
-
+        # Summarize via the Model Gateway. Cost is captured proxy-side from
+        # the spend_logs_metadata below — no in-app cost logging needed.
         try:
-            return await run_in_sync_executor(_invoke)
+            text = await gateway_chat(
+                prompt,
+                model=model_id,
+                max_tokens=200,
+                metadata={"user_sub": job_user_sub, "catalog_id": job_catalog_id},
+            )
+            # Empty content (refusal / no text) is a successful-but-useless response now that
+            # gateway_chat returns "" instead of None — fall back rather than store a blank summary.
+            return text.strip() or f"Document: {file.name}"
         except Exception:
             logger.warning("Failed to generate summary for %s, using fallback", file.name)
             return f"Document: {file.name}"

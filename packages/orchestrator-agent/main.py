@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 import jwt
 
-# Load .env BEFORE any agent_common imports (MODEL_CONFIG is built at import time)
+# Load .env BEFORE any agent_common imports (LLM_GATEWAY_URL etc. read at import time)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -41,7 +41,7 @@ from a2a.types import (
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from google.protobuf.json_format import MessageToDict
-from agent_common.core.model_factory import MODEL_CONFIG, get_available_models_metadata, get_default_model
+from agent_common.core.model_factory import get_available_models, get_available_models_metadata, get_default_model
 from agent_common.core.sandbox_pool import SandboxPool
 from agent_common.core.tool_risk_cache import ToolRiskCache
 from gatana_client import GatanaClient
@@ -98,12 +98,18 @@ def create_lifespan(
         # Startup: Initialize and start budget guard singleton
         logger.info("Starting application lifespan...")
 
+        # Fail fast if the Model Gateway isn't configured: it's the sole path
+        # for LLM traffic, so surface a missing LLM_GATEWAY_URL loudly at boot rather than
+        # as an opaque per-request failure (or a misleading "no models registered").
+        from agent_common.core.model_factory import assert_gateway_configured
+
+        assert_gateway_configured()
+
         budget_guard = init_budget_guard(
-            project_name=AgentSettings.get_langsmith_project(),
-            token_limit=AgentSettings.get_budget_monthly_token_limit(),
+            base_url=os.getenv("CONSOLE_BACKEND_URL", "http://localhost:5001"),
+            oauth2_client=agent_executor.agent.oauth2_client,
+            audience=os.getenv("CONSOLE_BACKEND_CLIENT_ID", "agent-console"),
             check_interval_seconds=AgentSettings.get_budget_check_interval(),
-            warning_thresholds=AgentSettings.get_budget_warning_thresholds(),
-            enabled=AgentSettings.get_budget_enabled(),
         )
 
         # Start background polling
@@ -228,14 +234,15 @@ def create_lifespan(
 def create_app():
     """Factory function to create the FastAPI app instance."""
 
-    # Log available LLM providers at startup
-    if MODEL_CONFIG:
-        logger.info("Available LLM models: %s", ", ".join(MODEL_CONFIG.keys()))
-        logger.info("Default model: %s", get_default_model())
-    else:
-        logger.error(
-            "No LLM models available! Set cloud credentials or OPENAI_COMPATIBLE_BASE_URL to enable at least one model."
-        )
+    # Models live on the Model Gateway; log the default + the live list
+    # (best-effort — the gateway is the source of truth).
+    logger.info("Default model: %s; gateway: %s", get_default_model(), os.getenv("LLM_GATEWAY_URL", "<unset>"))
+    try:
+        available = get_available_models()
+        if available:
+            logger.info("Models registered on the gateway: %s", ", ".join(available))
+    except Exception as e:
+        logger.debug("Could not list gateway models at startup: %s", e)
 
     capabilities = AgentCapabilities(
         streaming=True,
@@ -384,44 +391,11 @@ app = create_app()
 async def list_available_models():
     """Return the models available on this orchestrator instance.
 
-    For local OpenAI-compatible providers (LM Studio, Ollama, vLLM) the list of
-    loaded models is fetched live from the LLM server so the frontend always sees
-    the current selection regardless of what was available at startup.
+    The Model Gateway is the single source of truth for the live model list,
+    including any local OpenAI-compatible server (LM Studio, Ollama, vLLM), which is
+    registered as a gateway alias rather than probed directly.
     """
-    metadata = get_available_models_metadata()
-
-    llm_base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "").rstrip("/")
-    if llm_base_url:
-        v1_base = llm_base_url + "/v1" if not llm_base_url.endswith("/v1") else llm_base_url
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{v1_base}/models")
-                resp.raise_for_status()
-                data = resp.json()
-                live_ids: list[str] = [m["id"] for m in data.get("data", []) if "id" in m]
-
-            if live_ids:
-                # Strip any stale local entries that were registered at import time
-                metadata = [
-                    m
-                    for m in metadata
-                    if not m.get("value", "").startswith("local") and m.get("provider") != "OpenAI Compatible"
-                ]
-                is_default_local = not any(m.get("is_default") for m in metadata)
-                for i, model_id in enumerate(live_ids):
-                    metadata.append(
-                        {
-                            "value": model_id,
-                            "label": model_id,
-                            "provider": "OpenAI Compatible",
-                            "supports_thinking": False,
-                            "is_default": is_default_local and i == 0,
-                        }
-                    )
-        except Exception as e:
-            logger.debug("Could not fetch live models from LLM server: %s", e)
-
-    return metadata
+    return get_available_models_metadata()
 
 
 def _caller_azp(request: Request) -> str | None:

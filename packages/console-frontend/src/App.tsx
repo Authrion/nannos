@@ -24,6 +24,9 @@ import { GroupsPage } from './pages/admin/GroupsPage';
 import { GroupDetailPage } from './pages/admin/GroupDetailPage';
 import { AuditPage } from './pages/admin/AuditPage';
 import { RateCardsPage } from './pages/admin/RateCardsPage';
+import { ModelGatewayPage } from './pages/admin/ModelGatewayPage';
+import { BudgetGuardPage } from './pages/admin/BudgetGuardPage';
+import { SystemStatusPage } from './pages/admin/SystemStatusPage';
 import { BugReportsPage } from './pages/admin/BugReportsPage';
 import { ScimTokensPage } from './pages/admin/ScimTokensPage';
 import { OutboundScimPage } from './pages/admin/OutboundScimPage';
@@ -143,6 +146,30 @@ function App() {
           element={
             <AdminRoute>
               <RateCardsPage />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="admin/system-status"
+          element={
+            <AdminRoute>
+              <SystemStatusPage />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="admin/model-gateway"
+          element={
+            <AdminRoute>
+              <ModelGatewayPage />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="admin/budget-guard"
+          element={
+            <AdminRoute>
+              <BudgetGuardPage />
             </AdminRoute>
           }
         />

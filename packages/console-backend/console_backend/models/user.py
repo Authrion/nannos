@@ -9,12 +9,13 @@ from pydantic import BaseModel, Field
 
 
 class OrchestratorThinkingLevel(str, Enum):
-    """Thinking depth level for extended thinking mode."""
+    """Reasoning effort (LiteLLM convention). Per-model support comes from the gateway."""
 
     MINIMAL = "minimal"
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
+    XHIGH = "xhigh"
 
 
 class UserStatus(str, Enum):
@@ -163,6 +164,11 @@ class UserSettings(BaseModel):
     custom_prompt: str | None = None
     mcp_tools: list[str] = Field(default_factory=list)
     preferred_model: str | None = None
+    # Derived, not persisted — model lifecycle for preferred_model, computed on the read path
+    # from the live gateway registry + chat default (see services/model_status.py). Mirrors
+    # the sub-agent fields so the Settings UI can render "<preferred> (retired) -> <effective>".
+    preferred_model_retired: bool = False
+    effective_preferred_model: str | None = None
     enable_thinking: bool | None = None
     thinking_level: OrchestratorThinkingLevel | None = None
     phone_number_override: str | None = None

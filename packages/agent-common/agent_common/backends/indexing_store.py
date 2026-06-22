@@ -70,8 +70,8 @@ class IndexingStoreBackend(StoreBackend):
     Args:
         runtime: ToolRuntime providing store access and metadata
         model_name: Model to use for indexing/chunking contextualization. When
-            ``None``, ``get_default_indexing_model()`` selects the cheapest
-            available provider model automatically.
+            ``None``, ``get_default_indexing_model()`` uses the low chat tier
+            (the fleet's cheap chat model), falling back to the chat default.
         cost_logger: Optional CostLogger for reporting indexing costs
         namespace_factory: Optional callable for determining write namespace
     """
@@ -88,7 +88,8 @@ class IndexingStoreBackend(StoreBackend):
         Args:
             store: AsyncPostgresStore for storage and indexing
             model_name: Model to use for chunking/contextualization. When ``None``,
-                ``get_default_indexing_model()`` picks the cheapest available model.
+                ``get_default_indexing_model()`` uses the low chat tier (cheap), then
+                falls back to the chat default.
             cost_logger: Optional CostLogger for reporting LLM usage costs
             namespace_factory: Optional callable that takes a Runtime and returns
                 namespace tuple. Used to scope file storage (read/write operations).

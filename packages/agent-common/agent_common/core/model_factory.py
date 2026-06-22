@@ -1,22 +1,20 @@
-"""
-Model factory utilities for creating LangChain models.
+"""Model factory — creates LangChain clients pointed at the Nannos Model Gateway.
 
-This module provides utility functions for creating and configuring LangChain models
-without introducing circular dependencies. It's used by both the orchestrator and
-agent-runner services to create models dynamically.
-
-Provider dependencies are lazily imported so that services only need to install
-the providers they actually use (see pyproject.toml optional dependency groups).
-
-MODEL_CONFIG is built dynamically at import time: only models whose cloud
-credentials are detected in the environment (or whose provider is available
-locally) are registered.  This allows the orchestrator to start without
-*any* cloud env-vars when a local OpenAI-compatible server is configured.
+All LLM traffic routes through the LiteLLM proxy. The **gateway is the
+single source of truth** for which models exist (runtime registration) — the app
+keeps NO static model registry. `create_model` builds one OpenAI-compatible
+`ChatOpenAI` per alias; validity comes from the live gateway list; extended thinking
+is the unified `reasoning_effort`, always sent (the gateway drops it for non-reasoning
+models via `drop_params`). The only per-model check is the non-portable `minimal` tier
+(see `get_reasoning_effort`), grounded in the gateway's own capability flags.
 """
 
 import json
 import logging
 import os
+import threading
+import time
+import urllib.request
 
 from langchain_core.language_models import BaseChatModel
 
@@ -24,606 +22,436 @@ from agent_common.models.base import ModelType, ThinkingLevel, get_resolved_defa
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Model metadata (labels, providers, capabilities) for API consumers
-# ---------------------------------------------------------------------------
-
-_MODEL_METADATA: dict[str, dict] = {
-    "gpt-4o": {"label": "GPT-4o", "provider": "Azure OpenAI", "supports_thinking": False},
-    "gpt-4o-mini": {"label": "GPT-4o Mini", "provider": "Azure OpenAI", "supports_thinking": False},
-    "claude-sonnet-4.5": {"label": "Claude Sonnet 4.5", "provider": "AWS Bedrock", "supports_thinking": True},
-    "claude-sonnet-4.6": {"label": "Claude Sonnet 4.6", "provider": "AWS Bedrock", "supports_thinking": True},
-    "claude-haiku-4-5": {"label": "Claude Haiku 4.5", "provider": "AWS Bedrock", "supports_thinking": True},
-    "gemini-3-pro-preview": {
-        "label": "Gemini 3 Pro Preview",
-        "provider": "Google Vertex AI",
-        "supports_thinking": True,
-        "thinking_levels": ["low", "high"],
-    },
-    "gemini-3-flash-preview": {
-        "label": "Gemini 3 Flash Preview",
-        "provider": "Google Vertex AI",
-        "supports_thinking": True,
-    },
-    "local": {"label": "Local Model", "provider": "OpenAI Compatible", "supports_thinking": False},
-}
-
-# ---------------------------------------------------------------------------
-# Provider-credential detection helpers
-# ---------------------------------------------------------------------------
-
-# All possible model entries - keyed by provider so each group can be toggled.
-_AZURE_MODELS: dict[str, dict] = {
-    "gpt-4o": {
-        "api_version": "2024-08-01-preview",
-        "deployment": "chatgpt-4o",
-        "model_name": "gpt-4o",
-        "input_modes": ["text", "image"],
-        "backend": "azure_openai",
-        "display_name": "GPT-4o",
-        "description": "Best for general-purpose tasks, faster responses, strong coding capabilities",
-    },
-    "gpt-4o-mini": {
-        "api_version": "2025-01-01-preview",
-        "deployment": "gpt-4o-mini",
-        "model_name": "gpt-4o-mini",
-        "input_modes": ["text", "image"],
-        "backend": "azure_openai",
-        "display_name": "GPT-4o Mini",
-        "description": "Cost-effective option for simpler tasks, faster responses, good for routine operations",
-    },
-}
-
-_BEDROCK_MODELS: dict[str, dict] = {
-    "claude-sonnet-4.5": {
-        "bedrock_model_id": "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "input_modes": ["text", "image", "file"],
-        "backend": "bedrock",
-        "display_name": "Claude Sonnet 4.5",
-        "description": "Best for detailed analysis, longer context understanding, nuanced communication, supports thinking mode",
-    },
-    "claude-sonnet-4.6": {
-        "bedrock_model_id": "global.anthropic.claude-sonnet-4-6",
-        "input_modes": ["text", "image", "file"],
-        "backend": "bedrock",
-        "display_name": "Claude Sonnet 4.6",
-        "description": "Improved reasoning and creativity over 4.5, ideal for complex problem-solving and creative tasks, supports thinking mode",
-    },
-    "claude-haiku-4-5": {
-        "bedrock_model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "input_modes": ["text", "image", "file"],
-        "backend": "bedrock",
-        "display_name": "Claude Haiku 4.5",
-        "description": "Ultra-fast and cost-efficient for high-volume, low-latency tasks",
-    },
-}
-
-_GEMINI_MODELS: dict[str, dict] = {
-    "gemini-3.1-pro-preview": {
-        "model_id": "gemini-3.1-pro-preview",
-        "input_modes": ["text", "image", "audio", "video", "file"],
-        "backend": "google",
-        "location": "global",
-        "display_name": "Gemini 3.1 Pro (Preview)",
-        "description": "Google's advanced model for complex reasoning, supports multimodal input including audio and video, supports thinking mode",
-    },
-    "gemini-3-flash-preview": {
-        "model_id": "gemini-3-flash-preview",
-        "input_modes": ["text", "image", "audio", "video", "file"],
-        "backend": "google",
-        "location": "global",
-        "display_name": "Gemini 3 Flash (Preview)",
-        "description": "Google's fast and efficient model, supports multimodal input including audio and video, supports thinking mode",
-    },
-}
-
-
-def _has_azure_credentials() -> bool:
-    """Check whether Azure OpenAI credentials are configured."""
-    return bool(os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY"))
-
 
 def _has_aws_credentials() -> bool:
-    """Check whether AWS credentials are available (env vars, profile, or instance role)."""
+    """Whether AWS credentials are available (env, profile, or instance role).
+
+    Chat models no longer need this (they go through the gateway). It remains only
+    for the direct-Bedrock embeddings path, which migrates to the gateway in Phase 5.
+    """
     try:
         import botocore.session
 
-        session = botocore.session.get_session()
-        credentials = session.get_credentials()
-        return credentials is not None
+        return botocore.session.get_session().get_credentials() is not None
     except Exception:
         return False
 
 
-def _has_gcp_credentials() -> bool:
-    """Check whether GCP credentials are configured for Gemini."""
-    return bool(os.getenv("GCP_KEY") and os.getenv("GCP_PROJECT_ID"))
+# ---------------------------------------------------------------------------
+# Gateway client
+# ---------------------------------------------------------------------------
 
 
-def _has_local_provider() -> bool:
-    """Check whether a local OpenAI-compatible endpoint is configured."""
-    return bool(os.getenv("OPENAI_COMPATIBLE_BASE_URL"))
-
-
-def _fetch_local_models(v1_base_url: str) -> list[str]:
-    """Query GET /v1/models on a local LLM server and return model IDs.
-
-    Returns an empty list if the server is unreachable or returns no models.
-    Called once at import time with a short timeout.
-    """
-    import urllib.error
-    import urllib.request
-
-    try:
-        req = urllib.request.Request(f"{v1_base_url}/models")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read())
-            return [m["id"] for m in data.get("data", []) if "id" in m]
-    except Exception as e:
-        logger.debug("Could not fetch local models from %s/models: %s", v1_base_url, e)
-        return []
-
-
-def _build_model_config() -> dict[str, dict]:
-    """Build MODEL_CONFIG dynamically based on available credentials.
-
-    Only models whose provider credentials are detected are registered.
-    This is called once at module import time.
-    """
-    config: dict[str, dict] = {}
-
-    if _has_azure_credentials():
-        config.update(_AZURE_MODELS)
-        logger.info("Azure OpenAI credentials detected - registered models: %s", list(_AZURE_MODELS))
-    else:
-        logger.info("Azure OpenAI credentials not found - GPT models unavailable")
-
-    if _has_aws_credentials():
-        config.update(_BEDROCK_MODELS)
-        logger.info("AWS credentials detected - registered models: %s", list(_BEDROCK_MODELS))
-    else:
-        logger.info("AWS credentials not found - Claude models unavailable")
-
-    if _has_gcp_credentials():
-        config.update(_GEMINI_MODELS)
-        logger.info("GCP credentials detected - registered models: %s", list(_GEMINI_MODELS))
-    else:
-        logger.info("GCP credentials not found - Gemini models unavailable")
-
-    if _has_local_provider():
-        base_url_raw = os.getenv("OPENAI_COMPATIBLE_BASE_URL", "").rstrip("/")
-        # Normalize to /v1 for the discovery call
-        v1_base = base_url_raw + "/v1" if not base_url_raw.endswith("/v1") else base_url_raw
-        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY", "not-needed")
-
-        local_model_ids = _fetch_local_models(v1_base)
-        if local_model_ids:
-            for model_id in local_model_ids:
-                config[model_id] = {
-                    "base_url": base_url_raw,
-                    "model_name": model_id,
-                    "api_key": api_key,
-                    "is_local": True,
-                }
-            logger.info(
-                "Local OpenAI-compatible provider - registered %d model(s): %s",
-                len(local_model_ids),
-                local_model_ids,
-            )
-        else:
-            # Fallback: register a single generic 'local' entry
-            model_name = os.getenv("OPENAI_COMPATIBLE_MODEL", "default")
-            config["local"] = {
-                "base_url": base_url_raw,
-                "model_name": model_name,
-                "api_key": api_key,
-                "is_local": True,
-            }
-            logger.info(
-                "Local OpenAI-compatible provider - base_url=%s, model=%s (could not reach /v1/models)",
-                base_url_raw,
-                model_name,
-            )
-    else:
-        logger.info("OPENAI_COMPATIBLE_BASE_URL not set - local model unavailable")
-
-    if not config:
-        logger.warning(
-            "No model provider credentials found. Set cloud credentials or "
-            "OPENAI_COMPATIBLE_BASE_URL to enable at least one model."
+def _gateway_base_url() -> str:
+    url = os.getenv("LLM_GATEWAY_URL")
+    if not url:
+        raise RuntimeError(
+            "LLM_GATEWAY_URL is not set. The Model Gateway is the sole path for LLM "
+            "calls; point it at the litellm-proxy service."
         )
-
-    return config
-
-
-# Model-specific configuration - built dynamically from environment
-MODEL_CONFIG: dict[str, dict] = _build_model_config()
+    return url.rstrip("/")
 
 
-def _resolve_bedrock_region(bedrock_region: str | None) -> str:
-    """Resolve Bedrock region from explicit value or environment variables."""
-    return bedrock_region or os.getenv("AWS_BEDROCK_REGION", os.getenv("AWS_REGION", "eu-west-1"))
+def _gateway_api_key() -> str:
+    """The virtual/master key apps present to the gateway. Single resolver so every gateway
+    caller (chat, embeddings, the model-info fetch) sends the SAME credential — they used to
+    disagree (some defaulted to '' → silent 401s when the env was unset)."""
+    return os.getenv("LLM_GATEWAY_API_KEY", "sk-nannos-gateway")
 
 
-def get_available_models() -> list[ModelType]:
-    """Get list of all available model types.
+def assert_gateway_configured() -> None:
+    """Fail fast at startup when the gateway URL is missing.
 
-    Returns:
-        List of all supported model types.
-    """
-    return list(MODEL_CONFIG.keys())  # type: ignore
-
-
-def get_available_models_metadata() -> list[dict]:
-    """Get available models with their metadata for API responses.
-
-    Returns only models that have valid credentials configured.
-    Each entry includes: value, label, provider, supports_thinking,
-    and optionally thinking_levels and is_default.
-    """
-    default_model = get_default_model()
-    result = []
-    all_thinking_levels = [level.value for level in ThinkingLevel]
-    for model_key in MODEL_CONFIG:
-        model_cfg = MODEL_CONFIG[model_key]
-        if model_cfg.get("is_local"):
-            # Dynamically registered local model — no static metadata entry
-            model_name = model_cfg.get("model_name", model_key)
-            entry = {
-                "value": model_key,
-                "label": model_name,
-                "provider": "OpenAI Compatible",
-                "supports_thinking": False,
-                "is_default": model_key == default_model,
-            }
-        else:
-            meta = _MODEL_METADATA.get(model_key, {})
-            entry = {
-                "value": model_key,
-                "label": meta.get("label", model_key),
-                "provider": meta.get("provider", "Unknown"),
-                "supports_thinking": meta.get("supports_thinking", False),
-                "is_default": model_key == default_model,
-            }
-            if entry["supports_thinking"]:
-                entry["thinking_levels"] = meta.get("thinking_levels", all_thinking_levels)
-        result.append(entry)
-    return result
+    The gateway is the sole path for LLM traffic, so a service that needs
+    models should call this in its startup hook to surface the misconfiguration loudly
+    at boot rather than as an opaque per-request failure deep in the graph."""
+    _gateway_base_url()
 
 
-def is_valid_model(model_name: str) -> bool:
-    """Check if a model name is valid.
+def get_reasoning_effort(
+    thinking_level: ThinkingLevel | None, model_type: ModelType | None = None
+) -> str | None:
+    """Map the app `thinking_level` (minimal/low/medium/high) to LiteLLM's `reasoning_effort`.
 
-    Args:
-        model_name: Model name to validate.
-
-    Returns:
-        True if the model name is valid, False otherwise.
-    """
-    return model_name in MODEL_CONFIG
-
-
-def get_default_model() -> ModelType:
-    """Get the default model type.
-
-    Returns the configured DEFAULT_MODEL if it is available (has credentials),
-    otherwise falls back to the first available model.
-
-    Returns:
-        The default model type.
-    """
-    return get_resolved_default_model()
-
-
-# Ordered preference for cheap/fast models suitable for indexing/chunking.
-# Only models that are registered in MODEL_CONFIG (i.e. have live credentials)
-# will be selected.
-_INDEXING_MODEL_PREFERENCE: list[str] = [
-    "claude-haiku-4-5",  # Bedrock — fastest Claude, very cheap
-    "gpt-4o-mini",  # Azure — cost-effective GPT
-    "gemini-3-flash-preview",  # GCP — fast Gemini
-]
-
-
-def get_default_indexing_model() -> ModelType:
-    """Return the cheapest/fastest available model for semantic indexing.
-
-    Iterates through _INDEXING_MODEL_PREFERENCE and returns the first entry
-    that is registered in MODEL_CONFIG (i.e. has valid provider credentials).
-    Falls back to the first available model when none of the preferred ones
-    are configured.
-
-    Returns:
-        A model key from MODEL_CONFIG suitable for chunking/contextualization.
-
-    Raises:
-        RuntimeError: When no model provider credentials are configured.
-    """
-    for model in _INDEXING_MODEL_PREFERENCE:
-        if model in MODEL_CONFIG:
-            return model  # type: ignore[return-value]
-    if MODEL_CONFIG:
-        return next(iter(MODEL_CONFIG))  # type: ignore[return-value]
-    raise RuntimeError(
-        "No model provider credentials found. Cannot determine an indexing model. "
-        "Configure at least one of: AWS (Bedrock), Azure OpenAI, GCP (Vertex AI), "
-        "or a local OpenAI-compatible endpoint."
-    )
-
-
-def get_models_prompt_text() -> str:
-    """Generate a prompt-ready text block describing all available models.
-
-    This is the single source of truth for model descriptions used in system prompts.
-    Services that cannot import this module should keep their copy in sync.
-
-    Returns:
-        A formatted string with one line per model: "- DisplayName (model-id): Description"
-    """
-    lines = []
-    for model_id, config in MODEL_CONFIG.items():
-        display_name = config.get("display_name", model_id)
-        description = config.get("description", "")
-        lines.append(f"- {display_name} ({model_id}): {description}")
-    return "\n".join(lines)
-
-
-def get_thinking_budget(thinking_level: ThinkingLevel) -> int:
-    """Map thinking level to Claude token budget.
-
-    Based on Anthropic's official documentation and recommendations:
-    - minimal: 1024 tokens (hard minimum, simple queries)
-    - low: 4096 tokens (standard agent tasks, balanced default)
-    - medium: 10000 tokens (complex reasoning, multi-step analysis)
-    - high: 16000 tokens (very complex problems, deep analysis)
-
-    Args:
-        thinking_level: The thinking depth level.
-
-    Returns:
-        Token budget for Claude extended thinking.
-    """
-    budget_map = {
-        "minimal": 1024,
-        "low": 4096,
-        "medium": 10000,
-        "high": 16000,
-    }
-    return budget_map[thinking_level]
-
-
-def get_model_input_capabilities(model_type: ModelType) -> list[str]:
-    """Get supported input modes (content types) for a model.
-
-    Args:
-        model_type: The type of model to query
-
-    Returns:
-        List of supported content types (e.g., ["text", "image"])
-
-    Raises:
-        ValueError: If model type is not recognized
-    """
-    if model_type not in MODEL_CONFIG:
-        raise ValueError(f"Unknown model type: {model_type}")
-    return MODEL_CONFIG[model_type]["input_modes"]
-
-
-def get_model_backend(model_type: ModelType) -> str:
-    """Get the provider backend for a model type.
-
-    Args:
-        model_type: The type of model to query
-
-    Returns:
-        Provider backend string: "bedrock", "openai", or "google"
-
-    Raises:
-        ValueError: If model type is not recognized
-    """
-    if model_type not in MODEL_CONFIG:
-        raise ValueError(f"Unknown model type: {model_type}")
-    return MODEL_CONFIG[model_type]["backend"]
+    low/medium/high are accepted by every reasoning provider and pass through. `minimal` is
+    NOT portable — OpenAI-family models accept it as a distinct (smallest) tier, but
+    Anthropic/Bedrock/Vertex reject it as an invalid value. So `minimal` is preserved only
+    when the gateway model_info declares ``supports_minimal_reasoning_effort`` — the same
+    capability flag console-backend's ``thinking_levels_for`` uses to decide which levels to
+    offer, so the UI and this runtime mapping never disagree. Otherwise it floors to `low`,
+    including when the model is unknown or the gateway snapshot is cold. The gateway drops the
+    param entirely for non-reasoning models (`drop_params`)."""
+    if not thinking_level:
+        return None
+    value = thinking_level.value if isinstance(thinking_level, ThinkingLevel) else str(thinking_level)
+    if value == "minimal":
+        info = _gateway_models().get(model_type) if model_type else None
+        if not (info and info.get("supports_minimal_reasoning_effort")):
+            return "low"
+    return value
 
 
 def create_model(
     model_type: ModelType,
-    bedrock_region: str | None = None,
+    bedrock_region: str | None = None,  # accepted for call-site compatibility; gateway owns region
     thinking_level: ThinkingLevel | None = None,
     callbacks: list | None = None,
     streaming: bool = True,
 ) -> BaseChatModel:
-    """Create a model instance for the given model type.
+    """Create a gateway-backed chat model for the given alias.
 
-    Utility function that can be used by both the orchestrator and agent-runner
-    to create models dynamically.
-
-    Provider-specific dependencies (langchain-openai, langchain-google-genai,
-    langchain-aws) are imported lazily so that services only need to install
-    the providers they actually use.
-
-    Args:
-        model_type: The type of model to create
-        bedrock_region: AWS region for Bedrock models. If None, reads from
-                       AWS_BEDROCK_REGION or AWS_REGION env vars.
-        thinking_level: Thinking depth level (minimal/low/medium/high) for Claude Sonnet and Gemini models.
-                       If None, thinking is disabled.
-        callbacks: Optional list of LangChain callbacks (e.g., for cost tracking)
-
-    Returns:
-        BaseChatModel: The created model instance
+    `thinking_level` becomes `reasoning_effort` and is always forwarded; the gateway
+    drops it for models that don't support reasoning (`drop_params`), so no per-model
+    capability check is needed here.
     """
-    if model_type in ("gemini-3.1-pro-preview", "gemini-3-flash-preview"):
-        # Lazy import for Gemini provider
-        from google.oauth2 import service_account
-        from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_openai import ChatOpenAI
 
-        # Gemini 3 models via Vertex AI
-        # Temperature MUST be 1.0 for Gemini 3.0+ to prevent infinite loops and degraded reasoning
-        model_config = MODEL_CONFIG[model_type]
-        model_id = model_config["model_id"]
+    from ringier_a2a_sdk.cost_tracking.attribution import build_attribution_http_client
 
-        # Vertex AI authentication with service account
-        gcp_key = os.getenv("GCP_KEY")
-        if not gcp_key:
-            raise ValueError("GCP_KEY environment variable is required for Gemini models")
+    model_type = resolve_chat_model(model_type)
+    # The proxy CostLogger is the single source of cost for all gateway traffic.
+    # Drop any in-app CostTrackingCallback some call sites still pass, or the
+    # call is double-counted — once proxy-side (correct provider) and once in-app (which
+    # sees the OpenAI-compatible client and mislabels the provider as "openai").
+    if callbacks:
+        callbacks = [cb for cb in callbacks if type(cb).__name__ != "CostTrackingCallback"] or None
 
-        try:
-            credentials = service_account.Credentials.from_service_account_info(
-                json.loads(gcp_key),
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    model_kwargs: dict = {}
+    effort = get_reasoning_effort(thinking_level, model_type)
+    if effort:
+        model_kwargs["reasoning_effort"] = effort
+
+    logger.info("Creating gateway model alias=%s thinking=%s streaming=%s", model_type, effort, streaming)
+    return ChatOpenAI(
+        base_url=_gateway_base_url(),
+        api_key=_gateway_api_key(),
+        model=model_type,
+        streaming=streaming,
+        stream_usage=True,  # usage in the final chunk so cost callbacks see usage_metadata
+        callbacks=callbacks,
+        http_async_client=build_attribution_http_client(),  # per-request attribution
+        model_kwargs=model_kwargs,
+    )
+
+
+class EmbeddingModelNotConfigured(RuntimeError):
+    """Raised when no embedding model is available — neither requested nor a default.
+
+    Embedding-dependent features should catch this and disable gracefully (an admin must
+    set a default embedding model in the console first)."""
+
+
+# Single source of truth for the embedding vector dimension. The pgvector document-store
+# index is created with a fixed `dims`, so the embeddings we produce MUST match it or
+# inserts/similarity-search break. We pin the request dimension here (Matryoshka-capable
+# models truncate to it) and the stores read the SAME value for their index `dims`.
+# Defaults to 1024 (the historical Titan/Gemini dimension); override only in lockstep with
+# a re-index, since changing it invalidates existing vectors.
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
+
+
+def get_embedding_dimension() -> int:
+    """The embedding vector dimension to request and to size the pgvector index with.
+
+    Stores MUST use this for their index `dims` so the index and the produced vectors agree
+    (see create_embeddings, which forwards it as the `dimensions` request param)."""
+    return EMBEDDING_DIMENSION
+
+
+def create_embeddings(model_type: str | None = None, multimodal: bool = False):
+    """Create a gateway-backed text embeddings client.
+
+    Cost is captured proxy-side via the attribution http client. When
+    `model_type` is omitted, the configured **default** embedding model is used (the
+    "use the default when set" behavior); if no default is set, raises
+    EmbeddingModelNotConfigured so callers can disable the feature gracefully. An explicit
+    `model_type` is honored as-is (a retired alias still degrades to the default).
+
+    The output `dimensions` is pinned to get_embedding_dimension() so the produced vectors
+    match the pgvector index the document store is created with — otherwise a default model
+    whose native dimension differs from the index (e.g. 3072 vs 1024) breaks inserts/search.
+    """
+    from langchain_openai import OpenAIEmbeddings
+
+    from ringier_a2a_sdk.cost_tracking.attribution import build_attribution_http_client
+
+    if model_type is None:
+        model_type = get_default_embedding_model(multimodal)
+        if not model_type:
+            raise EmbeddingModelNotConfigured(
+                "No default embedding model is configured — set one in the console (Admin → Model Gateway)."
             )
-        except (json.JSONDecodeError, ValueError) as e:
-            raise ValueError(f"Failed to parse GCP_KEY as valid service account JSON: {e}")
-
-        gcp_project = os.getenv("GCP_PROJECT_ID")
-        gcp_location = model_config.get("location") or os.getenv("GCP_LOCATION", "europe-west4")
-
-        if not gcp_project:
-            raise ValueError("GCP_PROJECT_ID environment variable is required for Gemini models")
-
-        # Configure thinking mode if enabled
-        gemini_thinking_level = None
-        include_thoughts = False
-        if thinking_level:
-            gemini_thinking_level = thinking_level  # Pass level directly (minimal, low, medium, high)
-            include_thoughts = True
-            logger.info(f"Gemini thinking mode enabled with level={gemini_thinking_level}")
-
-        logger.info(
-            f"Creating Gemini Vertex AI model: model={model_id}, project={gcp_project}, "
-            f"location={gcp_location}, thinking_level={gemini_thinking_level}"
-        )
-
-        return ChatGoogleGenerativeAI(
-            model=model_id,
-            credentials=credentials,
-            project=gcp_project,
-            location=gcp_location,
-            temperature=1.0,  # CRITICAL: Gemini 3.0+ requires 1.0 to prevent infinite loops
-            thinking_level=gemini_thinking_level,
-            include_thoughts=include_thoughts,
-            callbacks=callbacks,
-            streaming=streaming,  # Enable token-level streaming
-        )
-    elif model_type in ("claude-sonnet-4.5", "claude-sonnet-4.6", "claude-haiku-4-5"):
-        # Lazy import for AWS Bedrock provider
-        import boto3
-        from botocore.config import Config as BotoConfig
-        from langchain_aws import ChatBedrockConverse
-
-        region = _resolve_bedrock_region(bedrock_region)
-
-        # Both Claude Sonnet and Haiku support Extended Thinking
-        if thinking_level:
-            budget_tokens = get_thinking_budget(thinking_level)
-            thinking_params = {"type": "enabled", "budget_tokens": budget_tokens}
-            temperature = 1.0
-            logger.info(
-                f"Claude {model_type} thinking enabled with level={thinking_level}, budget={budget_tokens} tokens"
-            )
-        else:
-            thinking_params = {"type": "disabled", "budget_tokens": 0}
-            temperature = 0.0
-
-        # Configure boto3 client with timeouts and retry logic from environment variables
-        # to handle long-running Claude requests
-        read_timeout = int(os.getenv("BEDROCK_READ_TIMEOUT", "300"))  # Default: 5 minutes
-        connect_timeout = int(os.getenv("BEDROCK_CONNECT_TIMEOUT", "10"))  # Default: 10 seconds
-        max_attempts = int(os.getenv("BEDROCK_MAX_RETRY_ATTEMPTS", "3"))  # Default: 3 retries
-        retry_mode = os.getenv("BEDROCK_RETRY_MODE", "adaptive")  # Default: adaptive
-
-        boto_config = BotoConfig(
-            read_timeout=read_timeout,
-            connect_timeout=connect_timeout,
-            retries={  # type: ignore
-                "max_attempts": max_attempts,
-                "mode": retry_mode,
-            },
-        )
-
-        # Create bedrock-runtime client with custom configuration
-        bedrock_client = boto3.client(
-            "bedrock-runtime",
-            region_name=region,
-            config=boto_config,
-        )
-
-        # Get model-specific Bedrock model ID
-        bedrock_model_id = MODEL_CONFIG[model_type]["bedrock_model_id"]
-
-        logger.info(
-            f"Created Bedrock client with model={bedrock_model_id}, read_timeout={read_timeout}s, "
-            f"connect_timeout={connect_timeout}s, max_retry_attempts={max_attempts} ({retry_mode} mode)"
-        )
-
-        return ChatBedrockConverse(
-            client=bedrock_client,
-            model=bedrock_model_id,
-            temperature=temperature,
-            region_name=region,
-            additional_model_request_fields={"thinking": thinking_params}
-            if thinking_params["type"] == "enabled"
-            else {},
-            callbacks=callbacks,
-            # NOTE: Bedrock streams automatically when using .astream() - no 'streaming' parameter needed
-        )
-    elif model_type == "local" or MODEL_CONFIG.get(model_type, {}).get("is_local"):
-        # Local OpenAI-compatible provider (Ollama, LM Studio, vLLM, etc.)
-        # Handles both the generic "local" fallback key and individually registered model IDs.
-        from langchain_openai import ChatOpenAI
-
-        if thinking_level:
-            logger.warning("Thinking mode is not supported for local OpenAI-compatible models.")
-
-        model_config = MODEL_CONFIG[model_type]
-        base_url = model_config["base_url"].rstrip("/")
-        # langchain_openai appends /chat/completions directly to base_url, so it
-        # must already include the /v1 prefix (e.g. LM Studio, Ollama, vLLM all
-        # serve on /v1/chat/completions).  Auto-append /v1 when absent.
-        if not base_url.endswith("/v1"):
-            base_url = base_url + "/v1"
-        model_name = model_config["model_name"]
-        api_key = model_config["api_key"]
-
-        logger.info(f"Creating local OpenAI-compatible model: base_url={base_url}, model={model_name}")
-
-        return ChatOpenAI(
-            base_url=base_url,
-            model=model_name,
-            api_key=api_key,
-            temperature=0.7,
-            callbacks=callbacks,
-            # Force OpenAI's streaming API to include `usage` in the final
-            # chunk (stream_options={"include_usage": true}) so LangChain
-            # populates `usage_metadata` on the AIMessage. Without this,
-            # CostTrackingCallback sees no usage data on plain ChatOpenAI
-            # endpoints and OpenAI-backed conversations report zero cost.
-            stream_usage=True,
-        )
     else:
-        # Lazy import for Azure OpenAI provider
-        from langchain_openai import AzureChatOpenAI
+        model_type = resolve_embedding_model(model_type, multimodal=multimodal)
+    return OpenAIEmbeddings(
+        base_url=_gateway_base_url(),
+        api_key=_gateway_api_key(),
+        model=model_type,
+        dimensions=get_embedding_dimension(),  # match the store's pgvector index dims
+        http_async_client=build_attribution_http_client(),
+        check_embedding_ctx_length=False,  # don't run tiktoken against a non-OpenAI model
+    )
 
-        # Default to gpt-4o/gpt-4o-mini (Azure OpenAI)
-        if thinking_level:
-            logger.warning("Thinking mode is only supported for Claude Sonnet and Gemini models.")
 
-        # Get model-specific configuration
-        model_config = MODEL_CONFIG[model_type]
-        api_version = model_config["api_version"]
-        deployment = model_config["deployment"]
-        model_name = model_config["model_name"]
+# ---------------------------------------------------------------------------
+# Live model registry (from the gateway; cached). No static config.
+# ---------------------------------------------------------------------------
 
-        logger.info(
-            f"Creating Azure OpenAI model: deployment={deployment}, model={model_name}, api_version={api_version}"
+# Cached snapshot of the gateway registry: {model_name: model_info}. model_info
+# carries capabilities (input_modes, supports_reasoning, …) set at registration.
+# Fetched with the app's virtual key (no master key needed). ts starts
+# far in the past so the first call fetches; every path updates ts so failures are
+# cached too (no per-call refetch storm).
+# These caches are read from sync `create_model`/resolution helpers that run inside the
+# apps' async event loops. To avoid blocking the loop on network I/O, the fetch runs on
+# a daemon thread and callers get the cached snapshot immediately; we only ever block on
+# the very first fetch (cold start, typically at app startup) so there's data to serve.
+_COLD = -1e9
+_COLD_WAIT = 3.0  # cap a cold waiter's block; fetch() itself times out at 2s
+
+
+def _refresh_if_stale(cache: dict, key: str, ttl: float, cond: threading.Condition, fetch) -> None:
+    if time.monotonic() - cache["ts"] < ttl:
+        return  # fast path: fresh enough, no lock
+
+    with cond:
+        # Re-check under the lock — another thread may have refreshed or started since.
+        if time.monotonic() - cache["ts"] < ttl:
+            return
+        cold = cache["ts"] == _COLD
+        if cache["inflight"]:
+            if not cold:
+                return  # warm: a background refresh is running → serve the stale snapshot
+            # Cold: someone else is doing the first population. Block until it lands so we
+            # never hand back an empty registry. _run() always notifies (success or failure),
+            # so the only way to hit the timeout is a genuinely stuck owner.
+            cond.wait_for(lambda: not (cache["inflight"] and cache["ts"] == _COLD), timeout=_COLD_WAIT)
+            return
+        cache["inflight"] = True  # we own this refresh
+
+    def _run():
+        try:
+            cache[key] = fetch()
+            cache["last_error"] = None
+        except Exception as e:
+            cache["last_error"] = e
+            logger.debug("Background refresh of '%s' failed: %s", key, e)
+        finally:
+            with cond:
+                cache["ts"] = time.monotonic()  # set even on failure → back off a full TTL
+                cache["inflight"] = False
+                cond.notify_all()  # release any cold waiters
+
+    if cold:
+        _run()  # block this owner until populated (no stale snapshot yet)
+    else:
+        threading.Thread(target=_run, daemon=True, name=f"refresh-{key}").start()
+
+
+_GW_CACHE: dict = {"ts": _COLD, "models": {}, "inflight": False, "last_error": None}
+_GW_TTL = 60.0
+_GW_LOCK = threading.Condition()
+
+
+def _fetch_gateway_models() -> dict[str, dict]:
+    # _gateway_base_url() raises when LLM_GATEWAY_URL is unset — a misconfiguration, NOT an
+    # empty registry. The error is recorded in `last_error` (models_known_empty() then
+    # returns False so the orchestrator won't tell the user "no models registered").
+    req = urllib.request.Request(
+        _gateway_base_url() + "/v1/model/info",
+        headers={"Authorization": f"Bearer {_gateway_api_key()}"},
+    )
+    with urllib.request.urlopen(req, timeout=2) as resp:  # noqa: S310 (internal cluster URL)
+        data = json.loads(resp.read()).get("data", [])
+    return {m["model_name"]: (m.get("model_info") or {}) for m in data if m.get("model_name")}
+
+
+def _gateway_models() -> dict[str, dict]:
+    """{model_name: model_info} from the gateway /v1/model/info (cached, refreshed
+    off-thread). model_info carries capabilities set at registration; fetched with the
+    app's virtual key (no master key needed)."""
+    _refresh_if_stale(_GW_CACHE, "models", _GW_TTL, _GW_LOCK, _fetch_gateway_models)
+    return _GW_CACHE["models"]
+
+
+# Defaults live in console-backend (not the gateway): LiteLLM's /model/update can't
+# persist a custom flag, so console-backend is the authoritative, runtime-editable store
+# and exposes them on an unauthenticated in-cluster endpoint.
+_DEFAULTS_CACHE: dict = {"ts": _COLD, "defaults": {}, "inflight": False, "last_error": None}
+_DEFAULTS_TTL = 60.0
+_DEFAULTS_LOCK = threading.Condition()
+
+
+def _fetch_model_defaults() -> dict[str, str]:
+    base = os.getenv("CONSOLE_BACKEND_URL")
+    if not base:
+        return _DEFAULTS_CACHE["defaults"]  # nothing to fetch; keep last-known
+    req = urllib.request.Request(base.rstrip("/") + "/api/v1/models/defaults")
+    with urllib.request.urlopen(req, timeout=2) as resp:  # noqa: S310 (internal cluster URL)
+        return json.loads(resp.read()) or {}
+
+
+def _model_defaults() -> dict[str, str]:
+    """{role: default_alias} from console-backend /api/v1/models/defaults (cached,
+    refreshed off-thread)."""
+    _refresh_if_stale(_DEFAULTS_CACHE, "defaults", _DEFAULTS_TTL, _DEFAULTS_LOCK, _fetch_model_defaults)
+    return _DEFAULTS_CACHE["defaults"]
+
+
+def _default_alias_for(role: str) -> ModelType | None:
+    """The alias the console has set as default for a role (chat/embedding/
+    multimodal_embedding), so a retired alias degrades gracefully."""
+    return _model_defaults().get(role)  # type: ignore[return-value]
+
+
+def get_default_embedding_model(multimodal: bool = False) -> ModelType | None:
+    """The configured default embedding alias, or None when none is set.
+
+    Multimodal prefers the multimodal-embedding default, then the text default. When this
+    returns None, embedding-dependent features should disable gracefully rather than fail
+    (an admin must set a default embedding model in the console first)."""
+    if multimodal:
+        return _default_alias_for("multimodal_embedding") or _default_alias_for("embedding")
+    return _default_alias_for("embedding")
+
+
+def is_embeddings_configured(multimodal: bool = False) -> bool:
+    """Whether a default embedding model is set (gate embedding-dependent features on this)."""
+    return get_default_embedding_model(multimodal) is not None
+
+
+def resolve_chat_model(model_type: ModelType) -> ModelType:
+    """Map a requested chat alias to one that's actually registered, degrading to the
+    gateway's default-for-chat model when the requested one has been retired.
+
+    When the gateway list can't be read we pass through unchanged — the gateway is the
+    authority and will 400 on a genuinely unknown alias."""
+    models = _gateway_models()
+    if not models or model_type in models:
+        return model_type
+    default = _default_alias_for("chat")
+    if default and default != model_type:
+        logger.warning(
+            "Chat model '%s' not registered on the gateway; falling back to default '%s'", model_type, default
         )
+        return default
+    logger.warning("Chat model '%s' not registered and no gateway chat default set; passing through", model_type)
+    return model_type
 
-        return AzureChatOpenAI(
-            azure_deployment=deployment,
-            api_version=api_version,
-            temperature=0.7,
-            model=model_name,
-            callbacks=callbacks,
-            streaming=streaming,  # Enable token-level streaming
-        )
+
+def resolve_embedding_model(model_type: str, multimodal: bool = False) -> str:
+    """Embedding counterpart to resolve_chat_model. A multimodal request prefers the
+    default-for-multimodal_embedding model, then the plain embedding default."""
+    models = _gateway_models()
+    if not models or model_type in models:
+        return model_type
+    roles = ("multimodal_embedding", "embedding") if multimodal else ("embedding",)
+    for role in roles:
+        default = _default_alias_for(role)
+        if default and default != model_type:
+            logger.warning(
+                "Embedding model '%s' not registered; falling back to default '%s' (role=%s)",
+                model_type,
+                default,
+                role,
+            )
+            return default
+    logger.warning("Embedding model '%s' not registered and no gateway embedding default set; passing through", model_type)
+    return model_type
+
+
+def get_available_models() -> list[ModelType]:
+    """Models registered on the gateway (live)."""
+    return list(_gateway_models().keys())  # type: ignore[return-value]
+
+
+def models_known_empty() -> bool:
+    """True only when the gateway was queried successfully and returned no models.
+
+    Distinguishes a genuinely empty registry (guide the admin to register one) from a
+    transient/cold-start fetch failure (don't block — the gateway is the authority).
+    On a failed or not-yet-completed fetch this returns False so callers fail open."""
+    models = _gateway_models()
+    return _GW_CACHE.get("last_error") is None and not models
+
+
+def is_valid_model(model_name: str) -> bool:
+    """Valid if registered on the gateway. When the gateway list can't be read, don't
+    reject — the gateway is the authority and will 400 on a genuinely unknown alias."""
+    models = _gateway_models()
+    return (model_name in models) if models else True
+
+
+def get_model_input_capabilities(model_type: ModelType) -> list[str]:
+    """Content types a model accepts, from the gateway model_info (set at registration).
+
+    This is the orchestrator's source of truth for what payloads it can send to a
+    (dynamic) sub-agent. Falls back to text+image only if the gateway snapshot or the
+    model's input_modes is unavailable.
+    """
+    info = _gateway_models().get(model_type) or {}
+    modes = info.get("input_modes")
+    return list(modes) if modes else ["text", "image"]
+
+
+def get_model_provider(model_type: ModelType) -> str:
+    """The LiteLLM provider family for a model, from the gateway model_info
+    (e.g. ``'bedrock_converse'``, ``'openai'``, ``'azure'``, ``'vertex_ai'``); ``''`` when
+    the model is unknown or the gateway snapshot is unavailable.
+
+    Gateway-native replacement for branching on hardcoded alias strings: the
+    request strategy a model needs (tool-based vs native structured output, Gemini's
+    text-embedded JSON, built-in tools) follows from its provider/capabilities, not from
+    its name — so a renamed/re-registered alias (e.g. ``claude-sonnet-4-6`` vs
+    ``claude-sonnet-4.6``) can't silently route into the wrong branch.
+    """
+    info = _gateway_models().get(model_type) or {}
+    return info.get("litellm_provider") or ""
+
+
+def is_gemini_model(model_type: ModelType) -> bool:
+    """Whether a model is Google Gemini — and thus accepts Google's server-side built-in
+    tools (google_search, code_execution) and emits text-embedded structured JSON.
+
+    Interim heuristic: the gateway exposes no built-in-tools capability flag yet, and these
+    tools are Google-product-specific, so some Google-specificity is unavoidable. Gemini is
+    served via the ``gemini`` provider (AI Studio) or ``vertex_ai`` (Vertex). Crucially we do
+    NOT treat all of ``vertex_ai`` as Gemini — Vertex also hosts Claude/Llama, which must not
+    be bound Google built-in tools (the gateway would 4xx). For Vertex we additionally require
+    the alias to name gemini. Fails safe: a mis-detected Gemini merely misses built-in tools
+    rather than binding wrong ones. Replace with a gateway capability flag when one lands.
+    """
+    provider = get_model_provider(model_type)
+    if provider == "gemini":
+        return True
+    if provider == "vertex_ai":
+        return "gemini" in (model_type or "").lower()
+    return False
+
+
+def get_default_model() -> ModelType:
+    """Fleet default chat model: the gateway's default-for-chat flag if set, else the
+    configured DEFAULT_MODEL env (DB-stored default wins)."""
+    return _default_alias_for("chat") or get_resolved_default_model()
+
+
+def get_available_models_metadata() -> list[dict]:
+    """Minimal picker metadata from the live list. Rich capability/label data is
+    served by console-backend directly from the gateway `/model/info`; this
+    orchestrator-side view is intentionally minimal."""
+    default_model = get_default_model()
+    return [
+        {"value": name, "label": name, "provider": "Model Gateway", "is_default": name == default_model}
+        for name in get_available_models()
+    ]
+
+
+def get_default_indexing_model() -> ModelType:
+    """Model for semantic indexing/chunking (generating context descriptions).
+
+    Indexing is high-volume and cost-sensitive, so it runs on the low chat tier
+    (``chat:low``) — the fleet's designated cheap chat model — falling back to the standard
+    chat default only when no low tier is set. No hardcoded alias list and no separate
+    "indexing" slot: the gateway + the existing chat tiers are the single source of truth,
+    so a retired/renamed alias never silently routes indexing to an arbitrary model."""
+    return _default_alias_for("chat:low") or get_default_model()
