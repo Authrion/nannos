@@ -1,6 +1,7 @@
 import { Routes, Route, Navigate } from 'react-router';
 import { useAuth } from './contexts/AuthContext';
 import { LoginRequiredPage } from './pages/LoginRequiredPage';
+import { LoggedOutPage } from './pages/LoggedOutPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { DashboardLayout } from './layouts/DashboardLayout';
 import { ChatPage } from './pages/ChatPage';
@@ -56,6 +57,7 @@ function App() {
   return (
     <Routes>
       <Route path="/login" element={isAuthenticated ? <Navigate to="/app" replace /> : <LoginRequiredPage />} />
+      <Route path="/logged-out" element={<LoggedOutPage />} />
       <Route
         path="/app"
         element={

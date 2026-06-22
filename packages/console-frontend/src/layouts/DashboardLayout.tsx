@@ -27,7 +27,7 @@ export function DashboardLayout() {
   const { user, isAdmin, isGroupManager, adminMode, toggleAdminMode } = useAuth();
 
   const handleLogout = () => {
-    window.location.href = `/api/v1/auth/logout?redirectTo=${encodeURIComponent(window.location.origin + '/')}`;
+    window.location.href = `/api/v1/auth/logout?redirectTo=${encodeURIComponent(window.location.origin + '/logged-out')}`;
   };
 
   return (
