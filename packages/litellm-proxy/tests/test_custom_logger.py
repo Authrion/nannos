@@ -246,19 +246,43 @@ async def test_buffer_full_dead_letters_record(logger_env, monkeypatch):
     assert dead == [[{"id": 1}]]
 
 
-def test_dead_letter_emits_parseable_line(caplog):
-    """Each dead-lettered record is logged as a JSON line under the [cost][dead-letter] marker."""
+def test_dead_letter_emits_parseable_redacted_line(caplog):
+    """Each dead-lettered record is logged as a JSON line under the [cost][dead-letter] marker,
+    redacted to the non-PII allow-list: user_sub/conversation_id are stripped, the safe keys
+    (provider/model/units/resource ids) are kept for operational diagnosis."""
     import json as _json
     import logging as _logging
 
+    record = {
+        "user_sub": "u1",
+        "conversation_id": "c1",
+        "provider": "bedrock",
+        "model_name": "claude-sonnet",
+        "billing_unit_breakdown": {"base_input_tokens": 10},
+        "sub_agent_id": "agent-1",
+        "scheduled_job_id": None,
+        "sub_agent_config_version_id": "cfg-1",
+        "catalog_id": "cat-1",
+    }
     logger = cl.NannosCostLogger()
     with caplog.at_level(_logging.ERROR, logger="nannos.litellm.custom_logger"):
-        logger._dead_letter([{"id": 1, "user_sub": "u1"}], RuntimeError("boom"))
+        logger._dead_letter([record], RuntimeError("boom"))
 
     lines = [r.getMessage() for r in caplog.records if "[cost][dead-letter]" in r.getMessage()]
     assert len(lines) == 1
     payload = _json.loads(lines[0].split("[cost][dead-letter]", 1)[1].strip())
-    assert payload == {"id": 1, "user_sub": "u1"}
+    # PII is gone; safe operational context survives.
+    assert "user_sub" not in payload
+    assert "conversation_id" not in payload
+    assert payload == {
+        "provider": "bedrock",
+        "model_name": "claude-sonnet",
+        "billing_unit_breakdown": {"base_input_tokens": 10},
+        "sub_agent_id": "agent-1",
+        "scheduled_job_id": None,
+        "sub_agent_config_version_id": "cfg-1",
+        "catalog_id": "cat-1",
+    }
 
 
 # --- Billing breakdown: embedding token-counting edge cases (#7) ---

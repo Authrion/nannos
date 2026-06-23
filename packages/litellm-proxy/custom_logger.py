@@ -276,6 +276,28 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
+# Fields safe to emit in the dead-letter log. user_sub (an OIDC subject) and conversation_id
+# correlate to a person, so they are PII and are redacted. Allow-list (not deny-list) so a new
+# attribution field added to _build_record never leaks by default — it must be opted in here.
+# Consequence: a dead-lettered record is NOT billing-recoverable from the log (its billing
+# target, user_sub, is gone). The line is an operational LOSS ALERT — which provider/model/agent
+# dropped usage and how much — not a replay source.
+# TODO(durability): put a managed queue (e.g. SQS) in front of console-backend so a backend
+#   outage buffers usage durably and attributably instead of dead-lettering to a lossy log. Keep
+#   the gateway a dumb HTTP producer (no cloud SDK) — the queue lives in deployment infra, so the
+#   callback stays cloud-agnostic. Prereq: gateway-batch-log ingestion must be idempotent on a
+#   per-record key, or queue redelivery (and any replay) double-bills.
+_DEAD_LETTER_SAFE_KEYS = (
+    "provider",
+    "model_name",
+    "billing_unit_breakdown",
+    "sub_agent_id",
+    "scheduled_job_id",
+    "sub_agent_config_version_id",
+    "catalog_id",
+)
+
+
 class NannosCostLogger(CustomLogger):
     """Captures usage off the LLM hot path: each success event builds its record and
     enqueues it (non-blocking); a background worker batches enqueued records and POSTs them
@@ -300,7 +322,12 @@ class NannosCostLogger(CustomLogger):
             if record is None:
                 return
             if not CONSOLE_BACKEND_URL:
-                logger.info("[cost] (no CONSOLE_BACKEND_URL) %s", record)
+                logger.info(
+                    "[cost] (no CONSOLE_BACKEND_URL) dropping usage record: provider=%s model=%s units=%s",
+                    record.get("provider"),
+                    record.get("model_name"),
+                    sorted((record.get("billing_unit_breakdown") or {}).keys()),
+                )
                 return
             self._ensure_worker()
             try:
@@ -360,13 +387,19 @@ class NannosCostLogger(CustomLogger):
         self._dead_letter(batch, last_exc)
 
     def _dead_letter(self, batch: list[dict], exc: Exception | None) -> None:
-        """Last-resort sink for records we cannot deliver. console-backend is the only
-        billing destination and any durable store would have to reach it too, so the
-        backend-independent fallback is the error log: emit each record as a parseable line
-        (marker `[cost][dead-letter]`) that a reconciliation job can grep and replay."""
-        logger.error("[cost] dead-lettering %d undeliverable usage record(s): %s", len(batch), exc)
+        """Last-resort handling for records we cannot deliver. Emit one redacted, non-PII line
+        per record (marker `[cost][dead-letter]`, keys per _DEAD_LETTER_SAFE_KEYS) so an operator
+        can see which provider/model/agent dropped usage and how much. user_sub/conversation_id
+        are stripped, so these records are NOT billing-recoverable from the log — this is a loss
+        alert, not a replay source. Durable, attributable recovery is the managed-queue TODO."""
+        logger.error(
+            "[cost] dead-lettering %d undeliverable usage record(s) — BILLING DATA LOST: %s",
+            len(batch),
+            exc,
+        )
         for record in batch:
-            logger.error("[cost][dead-letter] %s", json.dumps(record, default=str))
+            safe = {k: record[k] for k in _DEAD_LETTER_SAFE_KEYS if k in record}
+            logger.error("[cost][dead-letter] %s", json.dumps(safe, default=str))
 
 
 proxy_handler_instance = NannosCostLogger()
