@@ -497,6 +497,12 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
   let statusMessageTs: string | undefined;
   let feedbackRequestData: { sub_agents?: string[] } | null = null;
   let interruptWidgetPosted = false;
+  // Set once we've delivered the final response to Slack. This — not the streamed
+  // task state — is what tells the finally cleanup the in-flight record can be
+  // removed: the terminal `status-update` event isn't guaranteed to arrive over
+  // the stream (it can close right after the final artifact), so keying deletion
+  // off the state alone leaves the record behind and the recovery loop re-posts.
+  let responsePosted = false;
   // Declared at function scope so the finally cleanup can read the final task
   // state to decide whether the stream was sealed.
   let accumulatedTask: Task | null = null;
@@ -871,10 +877,14 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
                   await postMessage(client, channelId, threadTs, interruptMessage);
                 }
 
-                // Store the interrupt context so we can resume later
-                await inFlightTaskStore.touch(accumulatedTask.id).catch((err) => {
-                  logger.error(err, `Failed to update in-flight task for interrupt: ${err}`);
-                });
+                // The approval widget has been delivered to the user, so the
+                // in-flight record's job is done — mark it delivered so the
+                // finally cleanup removes it. Resume does NOT read this record (it
+                // re-enters via the IDs encoded in the widget's button payload —
+                // see hitlButton.ts), so leaving the record behind only lets the
+                // recovery loop re-post the approval prompt ~5 min later. Keeping
+                // it would reintroduce the duplicate-message bug for HITL pauses.
+                responsePosted = true;
               }
             }
           }
@@ -994,6 +1004,8 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
         statusMessageTs,
       },
     });
+    // We've delivered the final answer to Slack — recovery must never re-post it.
+    responsePosted = true;
     if (result.messageTs) {
       contextStore.set(contextKey, accumulatedTask?.contextId, result.messageTs).catch((err) => {
         logger.error(err, `Failed to update context store for task ${accumulatedTask?.id}: ${err}`);
@@ -1104,16 +1116,23 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
       await streamer.discard();
     }
 
-    // Once a task reaches a terminal state we've already posted its final
-    // response, so the in-flight record must be removed. Leaving it behind makes
-    // the periodic recovery loop treat the completed task as orphaned and re-post
-    // its answer ~5 min later (the recovery cadence). Interrupted states
-    // (input-required/auth-required) are intentionally NOT deleted — they must
-    // persist for HITL resume — and a dropped/errored "working" task is left in
-    // place so recovery can legitimately finish it.
-    if (accumulatedTask && isTerminatedState(accumulatedTask.status?.state)) {
+    // Remove the in-flight record once we've delivered a response to Slack,
+    // otherwise the periodic recovery loop treats the leftover record as orphaned
+    // and re-posts the message ~5 min later (the recovery cadence). The signal is
+    // `responsePosted` (set right after finalize), NOT the task state: a soft
+    // `input-required` clarification ("did you mean…?") is delivered through the
+    // normal finalize path, so even though the state is "interrupted" we've
+    // already shown it to the user and must delete the record. A terminal state
+    // is also a delete (covers any path that ends without posting). Records are
+    // deliberately KEPT when:
+    //   - a true HITL approval widget was posted — that path returns early before
+    //     finalize, so responsePosted stays false and the record persists for the
+    //     resume turn;
+    //   - the stream dropped/errored mid-flight while still "working" — recovery
+    //     should legitimately finish it.
+    if (accumulatedTask && (responsePosted || isTerminatedState(accumulatedTask.status?.state))) {
       await inFlightTaskStore.delete(accumulatedTask.id).catch((err) => {
-        logger.error(err, `Failed to delete completed in-flight task ${accumulatedTask?.id}: ${err}`);
+        logger.error(err, `Failed to delete in-flight task ${accumulatedTask?.id} after delivery: ${err}`);
       });
     }
   }
