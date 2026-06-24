@@ -1,12 +1,12 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus, Edit2, Trash2, Copy, Info } from 'lucide-react';
+import { Plus, Edit2, Trash2, Copy, Info, Search, ChevronDown, ChevronLeft, ChevronRight } from 'lucide-react';
 import { toast } from 'sonner';
 import {
-  listRateCardEntriesApiV1AdminRateCardsGetOptions,
   createRateCardEntryApiV1AdminRateCardsEntryPostMutation,
   expireRateCardEntryApiV1AdminRateCardsExpireRateIdPostMutation,
 } from '@/api/generated/@tanstack/react-query.gen';
+import { listRateCardEntriesApiV1AdminRateCardsGet } from '@/api/generated/sdk.gen';
 import type { RateCardEntry, RateCardEntryCreate } from '@/api/generated';
 import { Button } from '@/components/ui/button';
 
@@ -27,7 +27,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent } from '@/components/ui/card';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { CardListSkeleton } from '@/components/skeletons';
 import { Badge } from '@/components/ui/badge';
 
@@ -35,43 +36,58 @@ interface GroupedModel {
   provider: string;
   model_name: string;
   model_name_pattern: string | null;
+  // ALL active entries for this model (kept so edit/delete can expire every version — this is
+  // what compacts the historical duplicates over time). `latestEntries` is the deduped view.
   entries: RateCardEntry[];
+  latestEntries: RateCardEntry[];
   inputPrice?: number;
   outputPrice?: number;
   otherPrices: Array<{ billing_unit: string; price: number }>;
 }
 
+const PAGE_SIZE = 8;
+
+// Fetch every active entry (the list endpoint caps at 100/page, and there can be more —
+// especially with historical versions — so page through to the end). Grouping/search/pagination
+// then happen client-side over models.
+async function fetchAllActiveEntries(): Promise<RateCardEntry[]> {
+  const limit = 100;
+  const all: RateCardEntry[] = [];
+  for (let page = 1; ; page++) {
+    const { data, error } = await listRateCardEntriesApiV1AdminRateCardsGet({
+      query: { active_only: true, page, limit },
+    });
+    if (error) throw error;
+    const batch = data?.entries ?? [];
+    all.push(...batch);
+    if (batch.length === 0 || all.length >= (data?.total ?? all.length)) break;
+  }
+  return all;
+}
+
+const prettyUnit = (u: string) => u.split('_').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+
 export function RateCardsPage() {
   const [selectedProvider, setSelectedProvider] = useState<string>('all');
+  const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
   const [addModelOpen, setAddModelOpen] = useState(false);
   const [editModel, setEditModel] = useState<GroupedModel | null>(null);
 
   const queryClient = useQueryClient();
 
-  // Fetch all entries to get available providers (unfiltered)
-  const { data: allEntriesData } = useQuery({
-    ...listRateCardEntriesApiV1AdminRateCardsGetOptions({
-      query: {
-        active_only: true,
-      },
-    }),
-  });
-
-  // Fetch filtered entries for display
-  const { data: entriesData, isLoading: entriesLoading } = useQuery({
-    ...listRateCardEntriesApiV1AdminRateCardsGetOptions({
-      query: {
-        provider: selectedProvider !== 'all' ? selectedProvider : undefined,
-        active_only: true,
-      },
-    }),
+  // One fetch of ALL active entries; provider filter, search and pagination are client-side over
+  // the grouped models (so a model never gets split across a server page and silently hidden).
+  const { data: entries = [], isLoading: entriesLoading } = useQuery({
+    queryKey: ['rate-card-entries-all'],
+    queryFn: fetchAllActiveEntries,
   });
 
   const createEntryMutation = useMutation({
     ...createRateCardEntryApiV1AdminRateCardsEntryPostMutation(),
     onSuccess: () => {
       toast.success('Rate card created successfully');
-      queryClient.invalidateQueries({ queryKey: ['listRateCardEntriesApiV1AdminRateCardsGet'] });
+      queryClient.invalidateQueries({ queryKey: ['rate-card-entries-all'] });
       setAddModelOpen(false);
       setEditModel(null);
     },
@@ -84,57 +100,82 @@ export function RateCardsPage() {
     ...expireRateCardEntryApiV1AdminRateCardsExpireRateIdPostMutation(),
     onSuccess: () => {
       toast.success('Rate card entries expired');
-      queryClient.invalidateQueries({ queryKey: ['listRateCardEntriesApiV1AdminRateCardsGet'] });
+      queryClient.invalidateQueries({ queryKey: ['rate-card-entries-all'] });
     },
     onError: () => {
       toast.error('Failed to expire rate cards');
     },
   });
 
-  const entries = entriesData?.entries ?? [];
+  const allProviders = useMemo(
+    () => Array.from(new Set(entries.map((e: RateCardEntry) => e.provider))).sort(),
+    [entries],
+  );
 
-  // Get all available providers from unfiltered data
-  const allProviders = useMemo(() => {
-    const allEntries = allEntriesData?.entries ?? [];
-    return Array.from(new Set(allEntries.map((e: RateCardEntry) => e.provider))).sort();
-  }, [allEntriesData]);
-
-  // Group entries by model
+  // Group entries by model. Keep every entry (for expire-all on edit/delete) but build a deduped
+  // `latestEntries` (one per billing_unit, newest effective_from wins) for a clean display — the
+  // table can accumulate historical versions that all read as active.
   const groupedModels = useMemo(() => {
-    const groups = new Map<string, GroupedModel>();
-    
-    entries.forEach((entry: RateCardEntry) => {
+    const groups = new Map<string, GroupedModel & { _latest: Map<string, RateCardEntry> }>();
+
+    for (const entry of entries) {
       const key = `${entry.provider}::${entry.model_name}`;
-      
-      if (!groups.has(key)) {
-        groups.set(key, {
+      let group = groups.get(key);
+      if (!group) {
+        group = {
           provider: entry.provider,
           model_name: entry.model_name,
           model_name_pattern: entry.model_name_pattern ?? null,
           entries: [],
+          latestEntries: [],
           otherPrices: [],
-        });
+          _latest: new Map(),
+        };
+        groups.set(key, group);
       }
-      
-      const group = groups.get(key)!;;
       group.entries.push(entry);
-      
-      // Categorize prices by flow_direction
-      if (entry.flow_direction === 'input' && entry.billing_unit === 'base_input_tokens') {
-        group.inputPrice = parseFloat(entry.price_per_million);
-      } else if (entry.flow_direction === 'output' && entry.billing_unit === 'base_output_tokens') {
-        group.outputPrice = parseFloat(entry.price_per_million);
-      } else {
-        // All other billing unit types (cache_read_input_tokens, cache_creation_input_tokens, reasoning_tokens, etc.)
-        group.otherPrices.push({
-          billing_unit: entry.billing_unit,
-          price: parseFloat(entry.price_per_million),
-        });
-      }
-    });
-    
-    return Array.from(groups.values());
+      const prev = group._latest.get(entry.billing_unit);
+      if (!prev || entry.effective_from > prev.effective_from) group._latest.set(entry.billing_unit, entry);
+    }
+
+    return Array.from(groups.values())
+      .map((g) => {
+        const latest = Array.from(g._latest.values());
+        const input = g._latest.get('base_input_tokens');
+        const output = g._latest.get('base_output_tokens');
+        return {
+          provider: g.provider,
+          model_name: g.model_name,
+          model_name_pattern: g.model_name_pattern,
+          entries: g.entries,
+          latestEntries: latest,
+          inputPrice: input ? parseFloat(input.price_per_million) : undefined,
+          outputPrice: output ? parseFloat(output.price_per_million) : undefined,
+          otherPrices: latest
+            .filter((e) => e.billing_unit !== 'base_input_tokens' && e.billing_unit !== 'base_output_tokens')
+            .map((e) => ({ billing_unit: e.billing_unit, price: parseFloat(e.price_per_million) })),
+        } as GroupedModel;
+      })
+      .sort((a, b) => `${a.provider}/${a.model_name}`.localeCompare(`${b.provider}/${b.model_name}`));
   }, [entries]);
+
+  // Provider filter + free-text search (model name or provider), then paginate the model cards.
+  const filteredModels = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return groupedModels.filter(
+      (m) =>
+        (selectedProvider === 'all' || m.provider === selectedProvider) &&
+        (!q || m.model_name.toLowerCase().includes(q) || m.provider.toLowerCase().includes(q)),
+    );
+  }, [groupedModels, selectedProvider, search]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredModels.length / PAGE_SIZE));
+  const pageModels = filteredModels.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  // Snap back to a valid page when filters/search shrink the result set.
+  useEffect(() => {
+    if (page > totalPages) setPage(1);
+  }, [page, totalPages]);
 
   const handleExpireModel = (model: GroupedModel) => {
     const effectiveUntil = new Date().toISOString();
@@ -188,161 +229,83 @@ export function RateCardsPage() {
         </CardContent>
       </Card>
 
-      {/* Filters */}
-      <Card>
-        <CardHeader className="pb-4">
-          <CardTitle>Filters</CardTitle>
-          <CardDescription>Filter rate cards by provider</CardDescription>
-        </CardHeader>
-        <CardContent className="pb-6">
-          <div className="w-64">
-            <Label htmlFor="provider-filter">Provider</Label>
-            <Select value={selectedProvider} onValueChange={setSelectedProvider}>
-              <SelectTrigger id="provider-filter" className="mt-1.5">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All Providers</SelectItem>
-                {allProviders.map((p) => (
-                  <SelectItem key={p} value={p}>{p}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </CardContent>
-      </Card>
+      {/* Filters: free-text search + provider */}
+      <div className="flex flex-col sm:flex-row gap-3">
+        <div className="relative flex-1">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+          <Input
+            placeholder="Search by model or provider…"
+            value={search}
+            onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+            className="pl-9"
+          />
+        </div>
+        <div className="w-full sm:w-56">
+          <Select value={selectedProvider} onValueChange={(v) => { setSelectedProvider(v); setPage(1); }}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All providers</SelectItem>
+              {allProviders.map((p) => (
+                <SelectItem key={p} value={p}>{p}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
 
-      {/* Grouped Models */}
+      {/* Compact, collapsible model cards (paginated) */}
       {entriesLoading ? (
         <CardListSkeleton />
-      ) : groupedModels.length === 0 ? (
+      ) : filteredModels.length === 0 ? (
         <Card>
           <CardContent className="pt-6">
             <div className="text-center text-muted-foreground">
-              No rate cards found. Add a model to get started.
+              {groupedModels.length === 0
+                ? 'No rate cards found. Add a model to get started.'
+                : 'No models match your filters.'}
             </div>
           </CardContent>
         </Card>
       ) : (
-        <div className="space-y-4">
-          {groupedModels.map((model) => (
-            <Card key={`${model.provider}::${model.model_name}`}>
-              <CardHeader>
-                <div className="flex justify-between items-start">
-                  <div>
-                    <CardTitle className="flex items-center gap-2">
-                      <Badge variant="outline">{model.provider}</Badge>
-                      <span className="font-mono">{model.model_name}</span>
-                    </CardTitle>
-                    <CardDescription className="mt-2">
-                      {model.model_name_pattern ? (
-                        <div className="flex items-center gap-2">
-                          <span>Matches pattern:</span>
-                          <code className="text-xs bg-muted px-2 py-1 rounded">{model.model_name_pattern}</code>
-                        </div>
-                      ) : (
-                        <span>Active pricing configuration</span>
-                      )}
-                    </CardDescription>
-                  </div>
-                  <div className="flex gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => { setEditModel(model); setAddModelOpen(true); }}
-                    >
-                      <Edit2 className="w-4 h-4 mr-1" />
-                      Edit
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleCopyModel(model)}
-                    >
-                      <Copy className="w-4 h-4 mr-1" />
-                      Copy
-                    </Button>
-                    <Button
-                      variant="destructive"
-                      size="sm"
-                      onClick={() => handleExpireModel(model)}
-                    >
-                      <Trash2 className="w-4 h-4 mr-1" />
-                      Delete
-                    </Button>
-                  </div>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <div className="space-y-6">
-                  {/* Base Input/Output Prices */}
-                  <div>
-                    <div className="text-sm font-medium text-muted-foreground mb-3">Base Pricing</div>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      {/* Input Price */}
-                      <div className="border rounded-lg p-4 bg-blue-50/50 dark:bg-blue-950/20">
-                        <div className="text-sm font-medium text-blue-700 dark:text-blue-400 mb-1">Input</div>
-                        <div className="text-2xl font-bold text-blue-900 dark:text-blue-300">
-                          {model.inputPrice !== undefined 
-                            ? `$${model.inputPrice.toFixed(2)}`
-                            : <span className="text-muted-foreground text-base">Not set</span>
-                          }
-                        </div>
-                        <div className="text-xs text-muted-foreground mt-1">per 1M units</div>
-                      </div>
-
-                      {/* Output Price */}
-                      <div className="border rounded-lg p-4 bg-green-50/50 dark:bg-green-950/20">
-                        <div className="text-sm font-medium text-green-700 dark:text-green-400 mb-1">Output</div>
-                        <div className="text-2xl font-bold text-green-900 dark:text-green-300">
-                          {model.outputPrice !== undefined 
-                            ? `$${model.outputPrice.toFixed(2)}`
-                            : <span className="text-muted-foreground text-base">Not set</span>
-                          }
-                        </div>
-                        <div className="text-xs text-muted-foreground mt-1">per 1M units</div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Other Billing Unit Types - Separated by Input/Output */}
-                  {model.otherPrices.length > 0 && (
-                    <div>
-                      <div className="text-sm font-medium text-muted-foreground mb-3">Additional Unit Types</div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {model.entries
-                          .filter(entry => entry.billing_unit !== 'base_input_tokens' && entry.billing_unit !== 'base_output_tokens')
-                          .map((entry) => {
-                            const bgColor = entry.flow_direction === 'input' 
-                              ? 'bg-blue-50/50 dark:bg-blue-950/20 border-blue-200 dark:border-blue-800'
-                              : entry.flow_direction === 'output'
-                              ? 'bg-green-50/50 dark:bg-green-950/20 border-green-200 dark:border-green-800'
-                              : 'bg-gray-50/50 dark:bg-gray-950/20';
-                            
-                            const textColor = entry.flow_direction === 'input'
-                              ? 'text-blue-700 dark:text-blue-400'
-                              : entry.flow_direction === 'output'
-                              ? 'text-green-700 dark:text-green-400'
-                              : 'text-muted-foreground';
-                            
-                            return (
-                              <div key={entry.billing_unit} className={`border rounded-lg p-4 ${bgColor}`}>
-                                <div className={`text-sm font-medium mb-1 ${textColor}`}>
-                                  {entry.billing_unit.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
-                                </div>
-                                <div className="text-2xl font-bold">${parseFloat(entry.price_per_million).toFixed(2)}</div>
-                                <div className="text-xs text-muted-foreground mt-1">per 1M units</div>
-                              </div>
-                            );
-                          })}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
+        <>
+          <div className="text-xs text-muted-foreground">
+            {filteredModels.length} model{filteredModels.length === 1 ? '' : 's'}
+          </div>
+          <div className="space-y-2">
+            {pageModels.map((model) => (
+              <RateCardModelCard
+                key={`${model.provider}::${model.model_name}`}
+                model={model}
+                onEdit={() => { setEditModel(model); setAddModelOpen(true); }}
+                onCopy={() => handleCopyModel(model)}
+                onDelete={() => handleExpireModel(model)}
+              />
+            ))}
+          </div>
+          {totalPages > 1 && (
+            <div className="flex items-center justify-center gap-3 pt-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={page <= 1}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </Button>
+              <span className="text-sm text-muted-foreground">Page {page} of {totalPages}</span>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={page >= totalPages}
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              >
+                <ChevronRight className="w-4 h-4" />
+              </Button>
+            </div>
+          )}
+        </>
       )}
 
       {/* Add/Edit Model Dialog */}
@@ -377,6 +340,127 @@ export function RateCardsPage() {
   );
 }
 
+// A single compact, collapsible rate-card model row. Collapsed shows a one-line price summary;
+// expanded reveals the full base + additional-unit-type breakdown and (via the header) actions.
+function RateCardModelCard({
+  model,
+  onEdit,
+  onCopy,
+  onDelete,
+}: {
+  model: GroupedModel;
+  onEdit: () => void;
+  onCopy: () => void;
+  onDelete: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  const summary: string[] = [];
+  if (model.inputPrice !== undefined) summary.push(`in $${model.inputPrice.toFixed(2)}`);
+  if (model.outputPrice !== undefined) summary.push(`out $${model.outputPrice.toFixed(2)}`);
+  if (model.otherPrices.length) summary.push(`+${model.otherPrices.length} more`);
+
+  // Full version history per billing unit (newest first) for the expanded view. The current
+  // version of each unit is the one in `latestEntries` (latest effective_from); the rest are
+  // prior rates kept for historical billing.
+  const currentIds = new Set(model.latestEntries.map((e) => e.id));
+  const unitOrder = (u: string) => (u === 'base_input_tokens' ? 0 : u === 'base_output_tokens' ? 1 : 2);
+  const history = Array.from(
+    model.entries.reduce((map, e) => {
+      (map.get(e.billing_unit) ?? map.set(e.billing_unit, []).get(e.billing_unit)!).push(e);
+      return map;
+    }, new Map<string, RateCardEntry[]>()),
+  )
+    .map(([unit, versions]) => ({
+      unit,
+      flow: versions[0].flow_direction,
+      versions: [...versions].sort((a, b) => (a.effective_from < b.effective_from ? 1 : -1)),
+    }))
+    .sort((a, b) => unitOrder(a.unit) - unitOrder(b.unit) || a.unit.localeCompare(b.unit));
+
+  return (
+    <Card>
+      <Collapsible open={open} onOpenChange={setOpen}>
+        <div className="flex items-center justify-between gap-3 p-3">
+          <CollapsibleTrigger className="flex items-center gap-3 flex-1 min-w-0 text-left">
+            <ChevronDown
+              className={`w-4 h-4 shrink-0 text-muted-foreground transition-transform ${open ? '' : '-rotate-90'}`}
+            />
+            <Badge variant="outline" className="shrink-0">{model.provider}</Badge>
+            <span className="font-mono text-sm truncate">{model.model_name}</span>
+            {model.model_name_pattern && (
+              <Badge variant="secondary" className="shrink-0 text-[10px]">pattern</Badge>
+            )}
+            <span className="text-xs text-muted-foreground truncate ml-1">
+              {summary.join(' · ') || 'No pricing set'}
+            </span>
+          </CollapsibleTrigger>
+          <div className="flex gap-1 shrink-0">
+            <Button variant="ghost" size="sm" onClick={onEdit} aria-label="Edit"><Edit2 className="w-4 h-4" /></Button>
+            <Button variant="ghost" size="sm" onClick={onCopy} aria-label="Copy"><Copy className="w-4 h-4" /></Button>
+            <Button variant="ghost" size="sm" onClick={onDelete} aria-label="Delete">
+              <Trash2 className="w-4 h-4 text-destructive" />
+            </Button>
+          </div>
+        </div>
+        <CollapsibleContent>
+          <div className="border-t px-4 py-4 space-y-4">
+            {model.model_name_pattern && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <span>Matches pattern:</span>
+                <code className="text-xs bg-muted px-2 py-1 rounded">{model.model_name_pattern}</code>
+              </div>
+            )}
+            <div className="text-sm font-medium text-muted-foreground">Pricing history</div>
+            <div className="space-y-3">
+              {history.map(({ unit, flow, versions }) => {
+                const flowText =
+                  flow === 'input'
+                    ? 'text-blue-700 dark:text-blue-400'
+                    : flow === 'output'
+                    ? 'text-green-700 dark:text-green-400'
+                    : 'text-muted-foreground';
+                return (
+                  <div key={unit}>
+                    <div className={`text-xs font-medium mb-1 ${flowText}`}>{prettyUnit(unit)}</div>
+                    <div className="space-y-1">
+                      {versions.map((v) => {
+                        const isCurrent = currentIds.has(v.id);
+                        return (
+                          <div
+                            key={v.id}
+                            className={`flex items-center justify-between gap-3 rounded-md border px-3 py-1.5 text-sm ${
+                              isCurrent ? 'bg-muted/40' : 'opacity-60'
+                            }`}
+                          >
+                            <span className="font-mono">
+                              ${parseFloat(v.price_per_million).toFixed(2)}
+                              <span className="text-xs text-muted-foreground"> /1M</span>
+                            </span>
+                            <span className="flex-1 text-right text-xs text-muted-foreground">
+                              from {new Date(v.effective_from).toLocaleDateString()}
+                              {v.effective_until ? ` · until ${new Date(v.effective_until).toLocaleDateString()}` : ''}
+                            </span>
+                            {isCurrent ? (
+                              <Badge variant="secondary" className="shrink-0 text-[10px]">current</Badge>
+                            ) : (
+                              <span className="shrink-0 text-[10px] text-muted-foreground">superseded</span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+    </Card>
+  );
+}
+
 // Model Pricing Dialog Component - Handles both add and edit
 function ModelPricingDialog({ open, onOpenChange, onSubmit, existingModel }: {
   open: boolean;
@@ -404,8 +488,8 @@ function ModelPricingDialog({ open, onOpenChange, onSubmit, existingModel }: {
         const inputBreakdown: Array<{ billing_unit: string; price: string }> = [];
         const outputBreakdown: Array<{ billing_unit: string; price: string }> = [];
         
-        // Find entries by flow_direction from the full entries list
-        existingModel.entries.forEach(entry => {
+        // Deduped latest entries (the raw list can hold many historical versions per unit).
+        existingModel.latestEntries.forEach(entry => {
           // Skip base input/output prices as they're handled separately
           if (entry.billing_unit === 'base_input_tokens' || entry.billing_unit === 'base_output_tokens') {
             return;

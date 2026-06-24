@@ -109,6 +109,34 @@ class RateCardRepository(AuditedRepository):
         # Get or create rate_card
         rate_card_id = await self._get_or_create_rate_card_id(db, provider, model_name, model_name_pattern)
 
+        # No-op guard: if the current active rate for this card + billing unit already equals the
+        # new price, skip the write. Re-registering/saving a model with unchanged prices would
+        # otherwise insert an identical superseding version every time, bloating the history (the
+        # "current" rate is the latest effective_from, so duplicates are silent but accumulate).
+        current = await db.execute(
+            text("""
+                SELECT id, price_per_million
+                FROM rate_card_entries
+                WHERE rate_card_id = :rate_card_id
+                  AND billing_unit = :billing_unit
+                  AND effective_from <= :effective_from
+                  AND (effective_until IS NULL OR effective_until > :effective_from)
+                ORDER BY effective_from DESC
+                LIMIT 1
+            """),
+            {"rate_card_id": rate_card_id, "billing_unit": billing_unit, "effective_from": effective_from},
+        )
+        existing = current.mappings().first()
+        if existing is not None and Decimal(str(existing["price_per_million"])) == Decimal(str(price_per_million)):
+            logger.debug(
+                "Rate unchanged for %s/%s %s (%s) — skipping duplicate entry",
+                provider,
+                model_name,
+                billing_unit,
+                price_per_million,
+            )
+            return existing["id"]
+
         # Insert entry
         insert = text("""
             INSERT INTO rate_card_entries (

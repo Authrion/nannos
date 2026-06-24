@@ -16,6 +16,7 @@ import {
 import { toast } from 'sonner';
 
 import {
+  getGatewayConfig,
   listGatewayModels,
   listModelCatalog,
   registerGatewayModel,
@@ -42,6 +43,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { ConfirmDialog } from '@/components/admin/ConfirmDialog';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -132,6 +134,17 @@ function deriveAlias(modelId: string): string {
   return parts.join('.');
 }
 
+// The litellm provider family is the gateway model id prefix (the part before the first "/"),
+// e.g. "vertex_ai/gemini-embedding-2" → "vertex_ai", "bedrock/eu.anthropic.claude-…" → "bedrock".
+// This is exactly how the cost logger resolves provider for billing (custom_llm_provider, else
+// the deployment-id prefix), so deriving it here keeps the rate card keyed on the same provider
+// usage is logged under. Critically, it prevents a region/location (Vertex "eu"/"global") from
+// being typed into the free-text provider field and silently mis-keying billing to $0.
+// Empty when the id has no prefix (e.g. a bare Azure deployment name) — admin sets it then.
+function deriveProvider(modelId: string): string {
+  return modelId.includes('/') ? modelId.slice(0, modelId.indexOf('/')) : '';
+}
+
 const CATALOG_LIMIT = 50; // cap the rendered match list; the rest surface as you keep typing
 
 // Which default roles a model can hold: chat models → the standard chat default plus the
@@ -143,6 +156,13 @@ function defaultRolesFor(m: GatewayModel): DefaultRole[] {
   }
   return ['chat', 'chat:low', 'chat:premium'];
 }
+
+// An embedding model accepts images when LiteLLM lists a per-image input cost — the one
+// signal set across providers (Gemini, Vertex multimodalembedding, Bedrock Nova/Titan), even
+// where supports_vision/supported_modalities are absent. Drives the 'image' input mode, which
+// in turn unlocks the multimodal_embedding default (see defaultRolesFor).
+const embeddingInputModes = (entry?: CatalogModel): string[] =>
+  entry && (entry.input_cost_per_image ?? 0) > 0 ? ['text', 'image'] : ['text'];
 
 // Embedding-role switches trigger a re-index, so they go through a confirmation dialog;
 // chat/tier defaults apply immediately.
@@ -181,6 +201,8 @@ export function ModelGatewayPage() {
     role: DefaultRole;
     modelName: string;
   } | null>(null);
+  // Model pending removal, awaiting confirmation (shared ConfirmDialog, not a native confirm()).
+  const [pendingDelete, setPendingDelete] = useState<GatewayModel | null>(null);
 
   const { data: models = [], isLoading } = useQuery({
     queryKey: ['gateway-models'],
@@ -192,6 +214,16 @@ export function ModelGatewayPage() {
     queryKey: ['gateway-catalog'],
     queryFn: listModelCatalog,
   });
+
+  // Deployment defaults (env-driven). The Vertex serving region the proxy falls back to — shown
+  // as the location placeholder so the admin isn't nudged toward a wrong region.
+  const { data: gatewayConfig } = useQuery({
+    queryKey: ['gateway-config'],
+    queryFn: getGatewayConfig,
+  });
+  const defaultVertexLocation = gatewayConfig?.default_vertex_location || 'eu';
+  // Deployment project id (env-driven) as a placeholder hint — never a hardcoded project.
+  const defaultVertexProject = gatewayConfig?.default_vertex_project || 'my-gcp-project';
 
   // Picker matches: scoped to the chosen mode, substring-filtered on what's typed, capped.
   const q = form.litellm_model.trim().toLowerCase();
@@ -213,6 +245,7 @@ export function ModelGatewayPage() {
       ['base_output_tokens', perM(entry.output_cost_per_token)],
       ['cache_read_input_tokens', perM(entry.cache_read_input_token_cost)],
       ['cache_creation_input_tokens', perM(entry.cache_creation_input_token_cost)],
+      ['input_images', perM(entry.input_cost_per_image)],
     ];
     for (const [unit, val] of map) if (val) prices[unit] = val;
     const isEmbedding = entry.mode === 'embedding';
@@ -223,7 +256,7 @@ export function ModelGatewayPage() {
       model_name: !editingId && !aliasEdited ? deriveAlias(entry.model_id) : f.model_name,
       provider: entry.provider ?? f.provider,
       mode: isEmbedding ? 'embedding' : 'chat',
-      input_modes: isEmbedding ? ['text'] : modes,
+      input_modes: isEmbedding ? embeddingInputModes(entry) : modes,
       prices: { ...f.prices, ...prices },
     }));
   };
@@ -249,15 +282,20 @@ export function ModelGatewayPage() {
 
   const openEdit = async (m: GatewayModel) => {
     setEditingId(m.model_id ?? null);
-    setCredsOpen(false);
+    const awsRegion = m.aws_region_name ?? '';
+    const vertexLocation = m.vertex_location ?? '';
+    const vertexProject = m.vertex_project ?? '';
+    // Expand the Advanced section up front when the model carries routing params, so the admin
+    // sees the values that will round-trip (they're hidden behind the collapsible otherwise).
+    setCredsOpen(Boolean(awsRegion || vertexLocation || vertexProject));
     setAliasEdited(true); // existing alias is fixed (input is disabled on edit)
     setForm({
       model_name: m.model_name,
       litellm_model: m.litellm_model ?? '',
       provider: m.provider ?? '',
-      aws_region_name: '',
-      vertex_location: '',
-      vertex_project: '',
+      aws_region_name: awsRegion,
+      vertex_location: vertexLocation,
+      vertex_project: vertexProject,
       base_model: m.base_model ?? '',
       mode: m.mode === 'embedding' ? 'embedding' : 'chat',
       input_modes: m.input_modes && m.input_modes.length ? m.input_modes : ['text', 'image'],
@@ -405,6 +443,12 @@ export function ModelGatewayPage() {
       toast.error('Alias, gateway model id, and provider are required');
       return;
     }
+    // The rate card MUST be keyed on the same provider usage is billed under. The cost logger
+    // resolves provider from the model-id prefix, so when the id has one we take it as
+    // authoritative — overriding whatever is in the free-text field. This is what stops a Vertex
+    // location ("eu"/"global") in the provider field from creating an orphan rate card that never
+    // matches usage (→ silent $0 billing).
+    const provider = deriveProvider(form.litellm_model) || form.provider;
     // Embeddings bill input only; chat bills input/output (+ optional cache).
     const units =
       form.mode === 'embedding'
@@ -420,16 +464,16 @@ export function ModelGatewayPage() {
       return;
     }
     const litellm_params: Record<string, unknown> = { model: form.litellm_model, max_retries: 0 };
-    if (isVertexProvider(form.provider)) {
+    if (isVertexProvider(provider)) {
       if (form.vertex_location) litellm_params.vertex_location = form.vertex_location;
       if (form.vertex_project) litellm_params.vertex_project = form.vertex_project;
-    } else if (isBedrockProvider(form.provider) && form.aws_region_name) {
+    } else if (isBedrockProvider(provider) && form.aws_region_name) {
       litellm_params.aws_region_name = form.aws_region_name;
     }
 
     // base_model only matters when the routed model id isn't a known model (Azure deployments).
     const model_info: Record<string, unknown> = {};
-    if (isAzureProvider(form.provider) && form.base_model.trim()) {
+    if (isAzureProvider(provider) && form.base_model.trim()) {
       model_info.base_model = form.base_model.trim();
     }
 
@@ -439,7 +483,7 @@ export function ModelGatewayPage() {
       ...(Object.keys(model_info).length ? { model_info } : {}),
       mode: form.mode,
       input_modes: form.input_modes,
-      provider: form.provider,
+      provider,
       pricing,
     };
     saveMutation.mutate(body);
@@ -570,14 +614,7 @@ export function ModelGatewayPage() {
                       <Button
                         size="sm"
                         variant="ghost"
-                        onClick={() => {
-                          if (
-                            confirm(
-                              `Remove ${m.model_name} from the gateway? Its Rate Card is kept for historical billing.`,
-                            )
-                          )
-                            deleteMutation.mutate(m.model_id!);
-                        }}
+                        onClick={() => setPendingDelete(m)}
                       >
                         <Trash2 className="mr-1 h-3 w-3" /> Remove
                       </Button>
@@ -603,6 +640,30 @@ export function ModelGatewayPage() {
 
           <div className="space-y-4">
             <div className="grid gap-1.5">
+              <Label>Mode</Label>
+              <div className="flex gap-2">
+                {(['chat', 'embedding'] as const).map((mode) => (
+                  <Badge
+                    key={mode}
+                    variant={form.mode === mode ? 'default' : 'outline'}
+                    className="cursor-pointer"
+                    onClick={() =>
+                      setForm((f) => ({
+                        ...f,
+                        mode,
+                        input_modes:
+                          mode === 'embedding'
+                            ? embeddingInputModes(catalog.find((c) => c.model_id === f.litellm_model))
+                            : f.input_modes,
+                      }))
+                    }
+                  >
+                    {mode}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+            <div className="grid gap-1.5">
               <Label>Gateway model id{catalog.length > 0 ? ` (${form.mode} models — type to filter)` : ''}</Label>
               <div className="relative">
                 <Input
@@ -615,7 +676,10 @@ export function ModelGatewayPage() {
                     const v = e.target.value;
                     const entry = catalog.find((c) => c.model_id === v);
                     if (entry) applyCatalogEntry(entry);
-                    else setForm({ ...form, litellm_model: v });
+                    // No catalog match (e.g. local dev with an empty catalog): still derive the
+                    // provider from the id prefix so it stays correct without manual entry — a
+                    // region typed here is what mis-keyed billing before.
+                    else setForm({ ...form, litellm_model: v, provider: deriveProvider(v) || form.provider });
                   }}
                 />
                 {pickerOpen && catalog.length > 0 && visibleMatches.length > 0 && (
@@ -665,27 +729,6 @@ export function ModelGatewayPage() {
                 </p>
               )}
             </div>
-            <div className="grid gap-1.5">
-              <Label>Mode</Label>
-              <div className="flex gap-2">
-                {(['chat', 'embedding'] as const).map((mode) => (
-                  <Badge
-                    key={mode}
-                    variant={form.mode === mode ? 'default' : 'outline'}
-                    className="cursor-pointer"
-                    onClick={() =>
-                      setForm((f) => ({
-                        ...f,
-                        mode,
-                        input_modes: mode === 'embedding' ? ['text'] : f.input_modes,
-                      }))
-                    }
-                  >
-                    {mode}
-                  </Badge>
-                ))}
-              </div>
-            </div>
 
             <div className="grid gap-1.5">
               <Label>Provider (rate-card key)</Label>
@@ -734,18 +777,26 @@ export function ModelGatewayPage() {
                       <div className="grid gap-1.5">
                         <Label>Vertex location (optional)</Label>
                         <Input
-                          placeholder="europe-west4"
+                          placeholder={defaultVertexLocation}
                           value={form.vertex_location}
                           onChange={(e) => setForm({ ...form, vertex_location: e.target.value })}
                         />
+                        <p className="text-[11px] text-muted-foreground">
+                          Serving region, not the GCP project. Leave blank to use the deployment
+                          default ({defaultVertexLocation}). Some models (e.g. Gemini embeddings) 404
+                          outside it.
+                        </p>
                       </div>
                       <div className="grid gap-1.5">
                         <Label>Vertex project (optional)</Label>
                         <Input
-                          placeholder="rcplus-alloy-gcp"
+                          placeholder={defaultVertexProject}
                           value={form.vertex_project}
                           onChange={(e) => setForm({ ...form, vertex_project: e.target.value })}
                         />
+                        <p className="text-[11px] text-muted-foreground">
+                          GCP project id. Leave blank to use the proxy's default project.
+                        </p>
                       </div>
                     </div>
                   )}
@@ -843,6 +894,21 @@ export function ModelGatewayPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Remove a registered model — shared ConfirmDialog (consistent with other admin pages). */}
+      <ConfirmDialog
+        open={!!pendingDelete}
+        onOpenChange={(o) => !o && setPendingDelete(null)}
+        title={`Remove ${pendingDelete?.model_name ?? 'model'}?`}
+        description="This removes the model from the gateway. Its Rate Card is kept for historical billing."
+        confirmLabel="Remove"
+        variant="destructive"
+        isLoading={deleteMutation.isPending}
+        onConfirm={() => {
+          if (pendingDelete?.model_id) deleteMutation.mutate(pendingDelete.model_id);
+          setPendingDelete(null);
+        }}
+      />
     </div>
   );
 }

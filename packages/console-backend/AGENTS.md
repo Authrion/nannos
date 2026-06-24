@@ -418,6 +418,21 @@ has_access = await user_group_service.check_resource_permission(
 
 When sending a steering message via `_send_steering_message_to_agent()`, the code uses `break` after the first event from `a2a_client.send_message()` — NOT `pass` to drain. The agent-console shares the same A2A SDK `Client` instance between the primary stream (`_send_message_to_agent`) and steering. The A2A SDK's `EventQueue.tap()` creates a child queue that receives all parent events. If leaked parent events containing raw `Task` objects were consumed through the shared `Client`, its `ClientTaskManager` would raise "Task is already set" errors. The `break` takes only the ack event and lets SSE teardown close the child queue. Note: consuming from the child never removes events from the parent queue (they're independent `asyncio.Queue` instances). See the root copilot instructions "Continuous Interaction Turns" section for the full mechanism.
 
+### Rate-Card Provider Must Equal the litellm Provider Family (cost tracking ↔ rate cards)
+
+Rate cards key on `(provider, model_name=alias)`. Billing resolves provider in the cost logger
+(`litellm-proxy/custom_logger.py` `_build_record`): `custom_llm_provider`, else the gateway
+model-id prefix (`deployment_id.split("/")[0]`). The rate-card provider MUST equal that family
+(e.g. `vertex_ai`, `bedrock`) or usage never matches the rate card → the model silently bills
+**$0**. Usage logging only *reads* rate cards (`calculate_cost`) — it never creates them; only
+explicit register/edit (`admin_model_gateway_router`) and the Rate Cards page do.
+
+Footgun: a Vertex **location** (`vertex_location` `eu`/`global`) is not a provider. The console
+registration form's Provider field was free-text and a location was typed there, creating orphan
+`eu`/`global` rate cards. The frontend (`ModelGatewayPage.tsx` `deriveProvider`) now derives the
+provider from the model-id prefix and enforces it at submit, but any backend code that creates or
+looks up rate cards must preserve this provider==prefix invariant.
+
 ### Repository Pattern with Automatic Audit Logging (repositories/base.py)
 
 ALL database write operations (INSERT/UPDATE/DELETE) MUST use the repository pattern. The `AuditedRepository` base class automatically logs every mutation with before/after state. Direct SQL writes bypass the audit trail. Repositories call `audit_service.log_action()` automatically in `create()`, `update()`, and `delete()` methods.

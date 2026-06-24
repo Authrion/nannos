@@ -16,6 +16,24 @@ from ..config import config
 
 logger = logging.getLogger(__name__)
 
+
+def _provider_error_detail(resp: httpx.Response) -> str:
+    """Pull a concise, human-readable reason out of a LiteLLM/provider error response.
+
+    LiteLLM wraps provider errors as ``{"error": {"message": ...}}``; the message often quotes the
+    provider verbatim (e.g. a Vertex 404 naming the model + location). Returns a trimmed message,
+    or '' when none is parseable. Safe to surface to admins ONLY for calls that carry no credentials
+    (test/inference) — never for register/update, whose errors can echo the submitted secrets.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return resp.text.strip()[:300]
+    err = body.get("error", body) if isinstance(body, dict) else body
+    msg = err.get("message") if isinstance(err, dict) else None
+    return (msg or "").strip()[:300]
+
+
 # LiteLLM's bundled model catalog (cost + capabilities for 100+ models). Pin the ref
 # to the deployed proxy version for accuracy; overridable via env.
 _COSTMAP_REF = os.getenv("LITELLM_COSTMAP_REF", "main")
@@ -98,6 +116,7 @@ class ModelGatewayService:
         json: dict | None = None,
         timeout: float | None = None,
         optional: bool = False,
+        expose_error: bool = False,
     ) -> dict:
         """Call the gateway management API. ``optional=True`` marks an endpoint that may not
         exist on every proxy version (the caller has a fallback): its failures are logged at
@@ -107,7 +126,12 @@ class ModelGatewayService:
         aws_secret_access_key, vertex_credentials, …). LiteLLM validation errors can reflect the
         submitted payload, so whenever the request body carries ``litellm_params`` the response
         body is suppressed from logs — derived from the payload, not a per-call flag, so a future
-        credential-bearing endpoint is covered automatically and can't forget to opt in."""
+        credential-bearing endpoint is covered automatically and can't forget to opt in.
+
+        ``expose_error=True`` additionally returns the provider's error *message* in the raised
+        exception (for the admin UI). Only safe for calls whose request carries no credentials
+        AND whose error bodies are plain provider/inference errors (the model-test path) — it is
+        ignored for credential-bearing requests, which always stay opaque."""
         carries_credentials = isinstance(json, dict) and "litellm_params" in json
         try:
             client = self._get_client()
@@ -118,11 +142,18 @@ class ModelGatewayService:
             return resp.json() if resp.content else {}
         except httpx.HTTPStatusError as e:
             log = logger.debug if optional else logger.error
+            status = e.response.status_code
             if carries_credentials:
-                log("Gateway %s %s → %s (body suppressed: may echo credentials)", method, path, e.response.status_code)
-            else:
-                log("Gateway %s %s → %s: %s", method, path, e.response.status_code, e.response.text[:300])
-            raise ModelGatewayError(f"Gateway returned {e.response.status_code}") from e
+                # Register/update echo the submitted litellm_params (incl. secrets) on validation
+                # errors, so the body never reaches logs or the admin. Opaque, expose_error ignored.
+                log("Gateway %s %s → %s (body suppressed: may echo credentials)", method, path, status)
+                raise ModelGatewayError(f"Gateway returned {status}") from e
+            # No credentials in this request — log the truncated body for diagnosis (unchanged).
+            log("Gateway %s %s → %s: %s", method, path, status, e.response.text[:300])
+            # Surface the provider's reason to the admin only when the caller opted in (model test):
+            # those errors are plain inference failures (e.g. wrong vertex_location → 404), no secrets.
+            detail = _provider_error_detail(e.response) if expose_error else ""
+            raise ModelGatewayError(f"Gateway returned {status}" + (f": {detail}" if detail else "")) from e
         except httpx.HTTPError as e:
             log = logger.debug if optional else logger.error
             log("Gateway %s %s unreachable: %s", method, path, e)
@@ -235,6 +266,7 @@ class ModelGatewayService:
                     "provider": info.get("litellm_provider"),
                     "mode": mode,
                     "input_cost_per_token": info.get("input_cost_per_token"),
+                    "input_cost_per_image": info.get("input_cost_per_image"),
                     "output_cost_per_token": info.get("output_cost_per_token"),
                     "cache_read_input_token_cost": info.get("cache_read_input_token_cost"),
                     "cache_creation_input_token_cost": info.get("cache_creation_input_token_cost"),
@@ -270,10 +302,11 @@ class ModelGatewayService:
             body: dict = {"model": model_name, "input": ["ping"]}
             if profile_for(litellm_model, provider).send_dimensions:
                 body["dimensions"] = _DEFAULT_DIMENSION
-            return await self._request("POST", "/v1/embeddings", json=body, timeout=30.0)
+            return await self._request("POST", "/v1/embeddings", json=body, timeout=30.0, expose_error=True)
         return await self._request(
             "POST",
             "/v1/chat/completions",
             json={"model": model_name, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 4},
             timeout=30.0,
+            expose_error=True,
         )

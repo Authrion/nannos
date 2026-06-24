@@ -45,6 +45,12 @@ class GatewayModel(BaseModel):
     # Azure deployments map to a known model via model_info.base_model (cost/metadata). Surfaced
     # so the admin edit form can round-trip it instead of silently dropping it on update.
     base_model: str | None = None
+    # Routing params surfaced so the edit form round-trips them instead of dropping them on
+    # update (same rationale as base_model). NOT credentials — the proxy is the auth authority,
+    # so registrations carry no per-model creds (vertex_credentials/keys are never stored here).
+    vertex_location: str | None = None
+    vertex_project: str | None = None
+    aws_region_name: str | None = None
     input_cost_per_token: float | None = None
     output_cost_per_token: float | None = None
     supports_reasoning: bool | None = None
@@ -71,6 +77,10 @@ class CatalogModel(BaseModel):
     provider: str | None = None
     mode: str = "chat"
     input_cost_per_token: float | None = None
+    # Per-image input cost — the cross-provider signal that an embedding model accepts images
+    # (set for Gemini, Vertex multimodalembedding, Bedrock Nova/Titan even where the boolean
+    # capability flags are absent). The picker uses it to derive the 'image' input mode.
+    input_cost_per_image: float | None = None
     output_cost_per_token: float | None = None
     cache_read_input_token_cost: float | None = None
     cache_creation_input_token_cost: float | None = None
@@ -79,6 +89,17 @@ class CatalogModel(BaseModel):
     supports_reasoning: bool = False
     supports_audio_input: bool = False
     supports_pdf_input: bool = False
+
+
+class GatewayUiConfig(BaseModel):
+    """Deployment-specific defaults the registration UI needs (env-driven, read-only)."""
+
+    default_vertex_location: str = Field(
+        ..., description="Suggested Vertex serving region for new Vertex models (e.g. 'eu')"
+    )
+    default_vertex_project: str = Field(
+        "", description="Suggested GCP project id for new Vertex models; '' when unset (no hardcoded default)"
+    )
 
 
 class CostPrefill(BaseModel):
