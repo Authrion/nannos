@@ -2477,7 +2477,7 @@ wheels = [
 
 [[package]]
 name = "ringier-a2a-sdk"
-version = "0.15.2"
+version = "1.0.0"
 source = { editable = "../ringier-a2a-sdk" }
 dependencies = [
     { name = "a2a-sdk" },
