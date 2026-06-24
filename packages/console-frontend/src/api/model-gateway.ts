@@ -35,6 +35,9 @@ export interface GatewayModel {
   default_roles?: DefaultRole[];
   db_model?: boolean;
   base_model?: string | null;
+  vertex_location?: string | null;
+  vertex_project?: string | null;
+  aws_region_name?: string | null;
   input_cost_per_token?: number | null;
   output_cost_per_token?: number | null;
   supports_reasoning?: boolean | null;
@@ -69,6 +72,7 @@ export interface CatalogModel {
   provider?: string | null;
   mode: string;
   input_cost_per_token?: number | null;
+  input_cost_per_image?: number | null;
   output_cost_per_token?: number | null;
   cache_read_input_token_cost?: number | null;
   cache_creation_input_token_cost?: number | null;
@@ -146,6 +150,21 @@ export async function listModelCatalog(): Promise<CatalogModel[]> {
   const { data, error } = await (client as any).get({ url: `${BASE}/catalog` });
   if (error) throw error;
   return data as CatalogModel[];
+}
+
+export interface GatewayUiConfig {
+  /** Deployment default Vertex serving region (env-driven), suggested for new Vertex models. */
+  default_vertex_location: string;
+  /** Deployment default GCP project (env-driven); '' when unset. Placeholder hint only. */
+  default_vertex_project?: string;
+}
+
+/** Deployment defaults the registration form needs (env-driven). */
+export async function getGatewayConfig(): Promise<GatewayUiConfig> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { data, error } = await (client as any).get({ url: `${BASE}/config` });
+  if (error) throw error;
+  return data as GatewayUiConfig;
 }
 
 export async function listGatewayModels(): Promise<GatewayModel[]> {

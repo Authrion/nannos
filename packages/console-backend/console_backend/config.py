@@ -117,6 +117,18 @@ class ModelGatewayConfig(BaseModel):
 
     url: str = Field(default_factory=lambda: os.getenv("LLM_GATEWAY_URL", "http://litellm-proxy.nannos.svc"))
     master_key: SecretStr = Field(default_factory=lambda: SecretStr(os.getenv("LITELLM_MASTER_KEY", "")))
+    # Default Vertex AI *serving region* suggested for newly registered Vertex models — the region
+    # the model is served from (e.g. the `eu` multi-region endpoint), NOT the GCP project's home
+    # region (GCP_LOCATION) nor the project id (vertex_project). Mirrors the proxy's
+    # DEFAULT_VERTEXAI_LOCATION so the console suggests the same region the proxy falls back to for
+    # models that don't pin their own vertex_location. EU matches our data-residency posture; a
+    # wrong region makes some models (e.g. gemini embeddings) 404. Override per deployment.
+    default_vertex_location: str = Field(default_factory=lambda: os.getenv("DEFAULT_VERTEXAI_LOCATION", "eu"))
+    # Default GCP project suggested for new Vertex models (the deployment's project id, from
+    # GCP_PROJECT_ID). Only a UI placeholder hint — the proxy resolves the real project from its
+    # pod credentials (ADC), so this is normally left blank. Empty when unset; never hardcode a
+    # project id in code (it is deployment-specific).
+    default_vertex_project: str = Field(default_factory=lambda: os.getenv("GCP_PROJECT_ID", ""))
     # Providers this deployment has integrated (has credentials for on the proxy).
     # The model-catalog picker is pre-filtered to these litellm_provider values.
     # NOTE: LiteLLM tags a model by its *implementation*, so the same vendor spans

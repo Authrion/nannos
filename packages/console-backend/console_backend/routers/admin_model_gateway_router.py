@@ -8,15 +8,18 @@ never usable before it is billable. Master-key access stays server-side.
 
 import logging
 from decimal import Decimal
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from ..config import config
 from ..db.session import DbSession
 from ..dependencies import require_admin
 from ..models.model_gateway import (
     CatalogModel,
     CostPrefill,
     GatewayModel,
+    GatewayUiConfig,
     ModelRegistrationRequest,
     ModelRegistrationResponse,
     SetDefaultRequest,
@@ -32,27 +35,44 @@ router = APIRouter(prefix="/api/v1/admin/model-gateway", tags=["admin-model-gate
 
 # cost-per-token (gateway) → price-per-million (rate card), with the billing-unit
 # names the proxy CustomLogger emits.
-_COST_FIELD_TO_UNIT = {
+_FlowDir = Literal["input", "output", "other"]
+_COST_FIELD_TO_UNIT: dict[str, tuple[str, _FlowDir]] = {
     "input_cost_per_token": ("base_input_tokens", "input"),
     "output_cost_per_token": ("base_output_tokens", "output"),
     "cache_read_input_token_cost": ("cache_read_input_tokens", "input"),
     "cache_creation_input_token_cost": ("cache_creation_input_tokens", "input"),
+    "input_cost_per_image": ("input_images", "input"),
 }
 
+# billing_unit → flow_direction, for rate-card rows (which store only unit + price). Unknown
+# units default to "input" (the common case; only base_output_tokens is output-side).
+_UNIT_TO_FLOW = {unit: flow for (unit, flow) in _COST_FIELD_TO_UNIT.values()}
 
-def _with_provider_creds(litellm_params: dict) -> dict:
-    """Inject proxy-side credential refs the registration form doesn't supply.
 
-    Runtime-registered Vertex models must carry ``vertex_credentials`` so the proxy resolves
-    GCP creds from its ``GCP_KEY`` env — ADC is intentionally not wired (it hangs the proxy's
-    startup health check). Config-defined Vertex models already set this; the registration form
-    only sends vertex_location/vertex_project, so without this a runtime Vertex model falls back
-    to ADC and its test ping fails with "default credentials were not found".
+def _with_default_vertex_location(litellm_params: dict, provider: str) -> dict:
+    """Pin the deployment's default Vertex serving region when a Vertex model omits one.
+
+    LiteLLM resolves an unpinned vertex_location for DB-registered models to its own default
+    (us-central1) — NOT the proxy's DEFAULT_VERTEXAI_LOCATION — so a blank location silently routes
+    to the wrong region and 404s models served elsewhere (e.g. EU-only Gemini embeddings). Pinning
+    config.model_gateway.default_vertex_location (env DEFAULT_VERTEXAI_LOCATION) keeps the UI's
+    "leave blank → deployment default" promise true. A region, not a credential — safe to inject.
     """
-    params = dict(litellm_params)
-    if str(params.get("model", "")).startswith("vertex_ai/") and "vertex_credentials" not in params:
-        params["vertex_credentials"] = "os.environ/GCP_KEY"
-    return params
+    model = str(litellm_params.get("model") or "")
+    is_vertex = provider.startswith("vertex_ai") or model.startswith("vertex_ai/")
+    if is_vertex and not litellm_params.get("vertex_location"):
+        return {**litellm_params, "vertex_location": config.model_gateway.default_vertex_location}
+    return litellm_params
+
+
+# NOTE: Registrations carry NO per-model provider credentials. The proxy is the auth
+# authority for every provider: Vertex via pod ADC (GOOGLE_APPLICATION_CREDENTIALS, a file
+# projected from the GCP_KEY secret), Bedrock via the pod IAM role, Azure via the proxy's
+# AZURE_OPENAI_API_KEY env. In particular, do NOT inject vertex_credentials="os.environ/GCP_KEY":
+# DB-registered (runtime) models do not resolve os.environ/* refs (the proxy config is
+# settings-only, no model_list), so the literal string reaches json.loads() and fails with
+# "Unable to load vertex credentials ... JSONDecodeError". (Earlier code did this to work around
+# ADC not being wired; ADC is wired now — see gitops litellm-proxy.yaml.)
 
 
 def get_model_gateway_service(request: Request) -> ModelGatewayService:
@@ -91,6 +111,9 @@ async def list_models(request: Request, db: DbSession, user: User = Depends(requ
                 default_roles=alias_to_roles.get(name, []),
                 db_model=bool(info.get("db_model")),
                 base_model=info.get("base_model"),
+                vertex_location=params.get("vertex_location"),
+                vertex_project=params.get("vertex_project"),
+                aws_region_name=params.get("aws_region_name"),
                 input_cost_per_token=info.get("input_cost_per_token"),
                 output_cost_per_token=info.get("output_cost_per_token"),
                 supports_reasoning=info.get("supports_reasoning"),
@@ -98,6 +121,16 @@ async def list_models(request: Request, db: DbSession, user: User = Depends(requ
             )
         )
     return out
+
+
+@router.get("/config", response_model=GatewayUiConfig)
+async def gateway_ui_config(user: User = Depends(require_admin)):
+    """Deployment defaults the registration form needs (env-driven). Keeps the UI's suggested
+    Vertex region in sync with the proxy's DEFAULT_VERTEXAI_LOCATION instead of hardcoding it."""
+    return GatewayUiConfig(
+        default_vertex_location=config.model_gateway.default_vertex_location,
+        default_vertex_project=config.model_gateway.default_vertex_project,
+    )
 
 
 @router.get("/catalog", response_model=list[CatalogModel])
@@ -112,17 +145,37 @@ async def model_catalog(request: Request, user: User = Depends(require_admin)):
 
 
 @router.get("/models/{model_name}/cost-prefill", response_model=CostPrefill)
-async def cost_prefill(model_name: str, request: Request, user: User = Depends(require_admin)):
-    """Seed the rate-card form from the gateway's known cost (best-effort).
+async def cost_prefill(model_name: str, request: Request, db: DbSession, user: User = Depends(require_admin)):
+    """Seed the rate-card form (best-effort).
 
-    Returns empty pricing when the gateway doesn't know the model (bleeding-edge) —
-    the admin then enters rates manually.
+    Prefers the model's stored rate card so EDITING a model starts from its real, previously-saved
+    rates (they live in the rate card, not the gateway's model_info). Falls back to the gateway's
+    known cost for models we don't bill yet (fresh registration). Empty when neither knows the
+    model — the admin then enters rates manually.
     """
     try:
         model = await get_model_gateway_service(request).get_model(model_name)
     except ModelGatewayError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     info = (model or {}).get("model_info") or {}
+    params = (model or {}).get("litellm_params") or {}
+
+    # 1. Stored rate card — authoritative for already-billed models (the edit path). Keyed on the
+    #    same provider family billing uses (see AGENTS.md provider-keying note).
+    provider = info.get("litellm_provider") or params.get("custom_llm_provider")
+    if provider:
+        rates = await request.app.state.rate_card_service.repository.get_all_active_rates(
+            db=db, provider=provider, model_name=model_name
+        )
+        rate_pricing = {
+            unit: RateCardPricingEntry(price_per_million=price, flow_direction=_UNIT_TO_FLOW.get(unit, "input"))
+            for unit, price in rates.items()
+            if price and price > 0
+        }
+        if rate_pricing:
+            return CostPrefill(pricing=rate_pricing, source="rate_card")
+
+    # 2. Fallback: the gateway's known cost (fresh registration, model not yet billed).
     pricing: dict[str, RateCardPricingEntry] = {}
     for cost_field, (unit, flow) in _COST_FIELD_TO_UNIT.items():
         val = info.get(cost_field)
@@ -164,8 +217,9 @@ async def register_model(
     # model declares its accepted payloads (orchestrator/sub-agents depend on it),
     # mode so chat vs embedding is explicit (the chat picker filters on mode=chat).
     model_info = {**body.model_info, "input_modes": body.input_modes, "mode": body.mode}
+    litellm_params = _with_default_vertex_location(body.litellm_params, body.provider)
     try:
-        result = await svc.register_model(body.model_name, _with_provider_creds(body.litellm_params), model_info)
+        result = await svc.register_model(body.model_name, litellm_params, model_info)
     except ModelGatewayError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -209,8 +263,9 @@ async def edit_model(
     await db.commit()
 
     model_info = {**body.model_info, "input_modes": body.input_modes, "mode": body.mode}
+    litellm_params = _with_default_vertex_location(body.litellm_params, body.provider)
     try:
-        await svc.update_model(model_id, _with_provider_creds(body.litellm_params), model_info)
+        await svc.update_model(model_id, litellm_params, model_info)
     except ModelGatewayError as e:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
