@@ -1,67 +1,31 @@
 import logging
 import os
 from enum import Enum
-from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-# Model type literal for type safety
-ModelType = Literal[
-    "gpt-4o",
-    "gpt-4o-mini",
-    "claude-sonnet-4.5",
-    "claude-sonnet-4.6",
-    "claude-haiku-4-5",
-    "gemini-3.1-pro-preview",
-    "gemini-3-flash-preview",
-    "local",
-]
+# Model aliases are owned by the Model Gateway — the single source of truth for
+# which models exist and what they can do. The app keeps NO static enumeration: `ModelType`
+# is just a readable name for "a gateway model alias". Validity is checked against the live
+# gateway (is_valid_model / resolve_chat_model) and per-model behavior is derived from the
+# gateway's model_info (get_model_provider / capabilities), never from the alias string.
+ModelType = str
 
 
-# Thinking level literal for extended thinking configuration
+# Thinking level literal for extended thinking configuration.
+# Mirrors LiteLLM's reasoning_effort vocabulary (minus "none", which the
+# enable-thinking toggle covers). Per-model support is read from the gateway.
 class ThinkingLevel(str, Enum):
     minimal = "minimal"
     low = "low"
     medium = "medium"
     high = "high"
+    xhigh = "xhigh"
 
 
-def _resolve_default_model() -> ModelType:
-    """Resolve the default model, falling back if the configured model is unavailable.
-
-    Imports MODEL_CONFIG lazily to avoid circular imports.
-    """
-    from agent_common.core.model_factory import MODEL_CONFIG
-
-    configured: str = os.getenv("DEFAULT_MODEL", "claude-sonnet-4.5")
-    if configured in MODEL_CONFIG:
-        return configured  # type: ignore[return-value]
-
-    if MODEL_CONFIG:
-        fallback = next(iter(MODEL_CONFIG))
-        logger.warning(
-            "DEFAULT_MODEL '%s' is not available (no credentials). Falling back to '%s'.",
-            configured,
-            fallback,
-        )
-        return fallback  # type: ignore[return-value]
-
-    raise RuntimeError(
-        f"DEFAULT_MODEL '{configured}' is not available and no other models have credentials configured. "
-        "Set OPENAI_COMPATIBLE_BASE_URL for a local model, or provide cloud credentials."
-    )
-
-
-# Lazy default model — resolved on first access via _resolve_default_model()
-_default_model: ModelType | None = None
-
-
-def get_resolved_default_model() -> ModelType:
-    """Get the default model, resolving lazily on first call."""
-    global _default_model
-    if _default_model is None:
-        _default_model = _resolve_default_model()
-    return _default_model
+# There is no env var or hardcoded default model alias. The fleet default chat model is
+# owned entirely by the Model Gateway / console model_defaults store (the "chat" role) and
+# resolved at runtime via model_factory.get_default_model() / require_default_model().
 
 
 DEFAULT_THINKING_LEVEL: ThinkingLevel | None = (

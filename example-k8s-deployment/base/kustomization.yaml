@@ -4,11 +4,11 @@ kind: Kustomization
 resources:
   - ./namespace.yaml
   - ./gateway.yaml
-  - ./agent-creator.yaml
   - ./agent-runner.yaml
   - ./catalog-worker.yaml
   - ./console.yaml
   - ./orchestrator.yaml
+  - ./litellm-proxy.yaml
   - ./client-slack.yaml
   - ./client-email.yaml
   - ./client-google-chat.yaml

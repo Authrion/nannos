@@ -160,7 +160,7 @@ export type AuditAction = 'create' | 'update' | 'delete' | 'approve' | 'reject' 
  *
  * Audit entity type enum.
  */
-export type AuditEntityType = 'user' | 'group' | 'sub_agent' | 'session' | 'secret' | 'rate_card' | 'scheduled_job' | 'delivery_channel' | 'catalog' | 'bug_report' | 'scim_token' | 'outbound_scim_endpoint' | 'skill' | 'tool_risk_score';
+export type AuditEntityType = 'user' | 'group' | 'sub_agent' | 'session' | 'secret' | 'rate_card' | 'scheduled_job' | 'delivery_channel' | 'catalog' | 'bug_report' | 'scim_token' | 'outbound_scim_endpoint' | 'skill' | 'tool_risk_score' | 'model_default' | 'budget_setting';
 
 /**
  * AuditLog
@@ -223,7 +223,11 @@ export type AutomatedSubAgentConfig = {
      * Short description of the sub-agent's skill, max 200 chars.
      */
     description: string;
-    model: ModelEnum;
+    /**
+     * Model
+     */
+    model?: string | null;
+    model_tier?: ModelTier | null;
     /**
      * System Prompt
      *
@@ -245,8 +249,6 @@ export type AutomatedSubAgentConfig = {
 
 /**
  * AvailableModel
- *
- * A model available on the orchestrator.
  */
 export type AvailableModel = {
     /**
@@ -273,6 +275,14 @@ export type AvailableModel = {
      * Is Default
      */
     is_default?: boolean;
+    /**
+     * Input Price Per Million
+     */
+    input_price_per_million?: number | null;
+    /**
+     * Output Price Per Million
+     */
+    output_price_per_million?: number | null;
 };
 
 /**
@@ -327,6 +337,111 @@ export type BodyUploadFilesApiV1FilesUploadPost = {
      * Conversation Id
      */
     conversation_id?: string | null;
+};
+
+/**
+ * BudgetSettings
+ *
+ * Current Budget Guard configuration (the single `budget_settings` row).
+ */
+export type BudgetSettings = {
+    /**
+     * Enabled
+     */
+    enabled: boolean;
+    /**
+     * Monthly Limit Usd
+     */
+    monthly_limit_usd: string;
+    /**
+     * Warning Thresholds
+     */
+    warning_thresholds: Array<number>;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
+ * BudgetSettingsUpdate
+ *
+ * Partial update to the Budget Guard configuration (admin-only).
+ *
+ * Every field is optional so the admin form can PATCH-style update a subset.
+ */
+export type BudgetSettingsUpdate = {
+    /**
+     * Enabled
+     */
+    enabled?: boolean | null;
+    /**
+     * Monthly Limit Usd
+     *
+     * Monthly spend ceiling in USD
+     */
+    monthly_limit_usd?: number | string | null;
+    /**
+     * Warning Thresholds
+     *
+     * Fractions of the limit (0..1] at which to warn, e.g. [0.8, 0.9, 0.95]
+     */
+    warning_thresholds?: Array<number> | null;
+};
+
+/**
+ * BudgetStatus
+ *
+ * Live budget snapshot: month-to-date spend vs limit, plus the lock decision.
+ *
+ * Served to both the admin page (to render the gauge) and the orchestrator poll (to
+ * drive enforcement). `is_locked` is the single source of truth for enforcement.
+ */
+export type BudgetStatus = {
+    /**
+     * Enabled
+     */
+    enabled: boolean;
+    /**
+     * Spend Usd
+     *
+     * Month-to-date global spend in USD
+     */
+    spend_usd: string;
+    /**
+     * Limit Usd
+     */
+    limit_usd: string;
+    /**
+     * Usage Percentage
+     *
+     * spend / limit as a percentage
+     */
+    usage_percentage: number;
+    /**
+     * Is Locked
+     *
+     * True when enabled and spend >= limit (fail-closed)
+     */
+    is_locked: boolean;
+    /**
+     * Warnings
+     *
+     * Warning thresholds crossed at the current spend
+     */
+    warnings?: Array<number>;
+    /**
+     * Period Start
+     *
+     * Start of the current calendar month (UTC)
+     */
+    period_start: string;
+    /**
+     * Period End
+     *
+     * When this snapshot was computed (UTC)
+     */
+    period_end: string;
 };
 
 /**
@@ -776,6 +891,62 @@ export type CatalogListResponse = {
 };
 
 /**
+ * CatalogModel
+ *
+ * An entry from LiteLLM's known-model catalog (for the registration picker).
+ */
+export type CatalogModel = {
+    /**
+     * Model Id
+     */
+    model_id: string;
+    /**
+     * Provider
+     */
+    provider?: string | null;
+    /**
+     * Mode
+     */
+    mode?: string;
+    /**
+     * Input Cost Per Token
+     */
+    input_cost_per_token?: number | null;
+    /**
+     * Output Cost Per Token
+     */
+    output_cost_per_token?: number | null;
+    /**
+     * Cache Read Input Token Cost
+     */
+    cache_read_input_token_cost?: number | null;
+    /**
+     * Cache Creation Input Token Cost
+     */
+    cache_creation_input_token_cost?: number | null;
+    /**
+     * Max Input Tokens
+     */
+    max_input_tokens?: number | null;
+    /**
+     * Supports Vision
+     */
+    supports_vision?: boolean;
+    /**
+     * Supports Reasoning
+     */
+    supports_reasoning?: boolean;
+    /**
+     * Supports Audio Input
+     */
+    supports_audio_input?: boolean;
+    /**
+     * Supports Pdf Input
+     */
+    supports_pdf_input?: boolean;
+};
+
+/**
  * CatalogOwner
  *
  * Owner information for catalog responses.
@@ -1174,6 +1345,29 @@ export type CostOverTimeResponse = {
 };
 
 /**
+ * CostPrefill
+ *
+ * Provider base cost the gateway already knows, as per-million rate-card units.
+ *
+ * Best-effort seed for the registration form; null when the gateway doesn't know
+ * the model (bleeding-edge), in which case the admin enters rates manually.
+ */
+export type CostPrefill = {
+    /**
+     * Pricing
+     */
+    pricing?: {
+        [key: string]: RateCardPricingEntryOutput;
+    };
+    /**
+     * Source
+     *
+     * Where the seed came from
+     */
+    source?: string;
+};
+
+/**
  * CostSummary
  *
  * Summary of cost metrics.
@@ -1427,6 +1621,147 @@ export type FeedbackRating = 'positive' | 'negative';
  * Foundry API scopes for OAuth2 authentication.
  */
 export type FoundryScope = 'api:use-ontologies-read' | 'api:use-ontologies-write' | 'api:use-aip-agents-read' | 'api:use-aip-agents-write' | 'api:use-mediasets-read' | 'api:use-mediasets-write';
+
+/**
+ * GatewayModel
+ *
+ * A model deployment as reported by the gateway's /model/info.
+ */
+export type GatewayModel = {
+    /**
+     * Model Name
+     */
+    model_name: string;
+    /**
+     * Model Id
+     */
+    model_id?: string | null;
+    /**
+     * Provider
+     */
+    provider?: string | null;
+    /**
+     * Litellm Model
+     */
+    litellm_model?: string | null;
+    /**
+     * Mode
+     */
+    mode?: string | null;
+    /**
+     * Input Modes
+     */
+    input_modes?: Array<string>;
+    /**
+     * Default Roles
+     */
+    default_roles?: Array<string>;
+    /**
+     * Db Model
+     */
+    db_model?: boolean;
+    /**
+     * Base Model
+     */
+    base_model?: string | null;
+    /**
+     * Input Cost Per Token
+     */
+    input_cost_per_token?: number | null;
+    /**
+     * Output Cost Per Token
+     */
+    output_cost_per_token?: number | null;
+    /**
+     * Supports Reasoning
+     */
+    supports_reasoning?: boolean | null;
+    /**
+     * Supports Vision
+     */
+    supports_vision?: boolean | null;
+};
+
+/**
+ * GatewayUsageLogBatchCreate
+ *
+ * Batch of gateway-attributed usage logs.
+ */
+export type GatewayUsageLogBatchCreate = {
+    /**
+     * Logs
+     *
+     * Up to 500 logs per batch
+     */
+    logs: Array<GatewayUsageLogCreate>;
+};
+
+/**
+ * GatewayUsageLogCreate
+ *
+ * A usage log posted by the Model Gateway (trusted service).
+ *
+ * Unlike UsageLogCreate (where the endpoint derives the user from the caller's
+ * token), the gateway batches across many users, so each record carries its own
+ * pre-attributed `user_sub`. `invoked_at` is optional (defaults to now) since the
+ * proxy callback doesn't always have it.
+ */
+export type GatewayUsageLogCreate = {
+    /**
+     * Conversation Id
+     */
+    conversation_id?: string | null;
+    /**
+     * Sub Agent Id
+     */
+    sub_agent_id?: number | null;
+    /**
+     * Sub Agent Config Version Id
+     */
+    sub_agent_config_version_id?: number | null;
+    /**
+     * Scheduled Job Id
+     */
+    scheduled_job_id?: number | null;
+    /**
+     * Catalog Id
+     */
+    catalog_id?: string | null;
+    /**
+     * Provider
+     */
+    provider?: string | null;
+    /**
+     * Model Name
+     */
+    model_name?: string | null;
+    /**
+     * Billing Unit Breakdown
+     *
+     * Mapping of billing_unit to count (only non-zero values)
+     */
+    billing_unit_breakdown: {
+        [key: string]: number;
+    };
+    /**
+     * Langsmith Run Id
+     */
+    langsmith_run_id?: string | null;
+    /**
+     * Langsmith Trace Id
+     */
+    langsmith_trace_id?: string | null;
+    /**
+     * Invoked At
+     */
+    invoked_at?: string;
+    /**
+     * User Sub
+     *
+     * Stable user id this usage is attributed to
+     */
+    user_sub: string;
+};
 
 /**
  * GenerateWatchParamsRequest
@@ -2342,6 +2677,101 @@ export type MessageFeedbackResponse = {
 };
 
 /**
+ * ModelRegistrationRequest
+ *
+ * Register a model: routing/capability go to the gateway, billing to the Rate Card.
+ *
+ * The Rate Card is written first (a model must be billable before
+ * it is usable), then the deployment is registered on the gateway.
+ */
+export type ModelRegistrationRequest = {
+    /**
+     * Model Name
+     *
+     * Public alias apps request (e.g. 'claude-sonnet-4.6')
+     */
+    model_name: string;
+    /**
+     * Litellm Params
+     *
+     * Gateway routing (model id, region/creds refs, timeouts)
+     */
+    litellm_params: {
+        [key: string]: unknown;
+    };
+    /**
+     * Model Info
+     *
+     * Capability + cost metadata stored on the gateway
+     */
+    model_info?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Mode
+     *
+     * 'chat' or 'embedding' (written to model_info.mode)
+     */
+    mode?: string;
+    /**
+     * Input Modes
+     *
+     * Content types the model accepts (text/image/audio/video/file)
+     */
+    input_modes?: Array<string>;
+    /**
+     * Provider
+     *
+     * Rate-card provider key (matches what the proxy reports at runtime)
+     */
+    provider: string;
+    /**
+     * Pricing
+     *
+     * billing_unit → price; the billed rate
+     */
+    pricing: {
+        [key: string]: RateCardPricingEntryInput;
+    };
+    /**
+     * Model Name Pattern
+     */
+    model_name_pattern?: string | null;
+};
+
+/**
+ * ModelRegistrationResponse
+ */
+export type ModelRegistrationResponse = {
+    /**
+     * Model Name
+     */
+    model_name: string;
+    /**
+     * Rate Card Entry Ids
+     */
+    rate_card_entry_ids: Array<number>;
+    /**
+     * Gateway Model Id
+     */
+    gateway_model_id?: string | null;
+    /**
+     * Status
+     */
+    status?: string;
+};
+
+/**
+ * ModelTier
+ *
+ * Capability tier a sub-agent binds to instead of a concrete model alias. Resolves to
+ * the chat:<tier> model_defaults slot at read time ('standard' → the plain 'chat' default),
+ * so retiring/upgrading a model is one slot repoint. Mutually exclusive with an
+ * explicit model.
+ */
+export type ModelTier = 'low' | 'standard' | 'premium';
+
+/**
  * NotificationListResponse
  *
  * Response model for listing notifications.
@@ -2371,9 +2801,9 @@ export type NotificationType = 'agent_activated' | 'agent_deactivated' | 'agent_
 /**
  * OrchestratorThinkingLevel
  *
- * Thinking depth level for extended thinking mode.
+ * Reasoning effort (LiteLLM convention). Per-model support comes from the gateway.
  */
-export type OrchestratorThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
+export type OrchestratorThinkingLevel = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 
 /**
  * OutboundScimEndpoint
@@ -2886,7 +3316,7 @@ export type RateCardModelCreate = {
      * Mapping of billing_unit to pricing details (price and flow_direction)
      */
     pricing: {
-        [key: string]: RateCardPricingEntry;
+        [key: string]: RateCardPricingEntryInput;
     };
 };
 
@@ -2895,13 +3325,28 @@ export type RateCardModelCreate = {
  *
  * Pricing entry for a specific billing unit.
  */
-export type RateCardPricingEntry = {
+export type RateCardPricingEntryInput = {
     /**
      * Price Per Million
      *
      * Price per million units in USD
      */
     price_per_million: number | string;
+    flow_direction: FlowDirectionEnum;
+};
+
+/**
+ * RateCardPricingEntry
+ *
+ * Pricing entry for a specific billing unit.
+ */
+export type RateCardPricingEntryOutput = {
+    /**
+     * Price Per Million
+     *
+     * Price per million units in USD
+     */
+    price_per_million: string;
     flow_direction: FlowDirectionEnum;
 };
 
@@ -3835,6 +4280,20 @@ export type SecretPermissionsUpdate = {
 export type SecretType = 'foundry_client_secret';
 
 /**
+ * SetDefaultRequest
+ *
+ * Mark a model as the fleet default for a role (graceful degradation when an alias retires).
+ */
+export type SetDefaultRequest = {
+    /**
+     * Role
+     *
+     * One of: chat, chat:low, chat:premium, embedding, multimodal_embedding
+     */
+    role: string;
+};
+
+/**
  * SkillActivationListResponse
  *
  * Response for listing activations for an agent.
@@ -4754,6 +5213,7 @@ export type SubAgentConfigVersion = {
      * Model
      */
     model?: string | null;
+    model_tier?: ModelTier | null;
     /**
      * System Prompt
      */
@@ -4850,6 +5310,14 @@ export type SubAgentConfigVersion = {
      * Skills
      */
     skills?: Array<SkillDefinition>;
+    /**
+     * Model Retired
+     */
+    model_retired?: boolean;
+    /**
+     * Effective Model
+     */
+    effective_model?: string | null;
 };
 
 /**
@@ -4886,6 +5354,7 @@ export type SubAgentConfigVersionSummary = {
      * Model
      */
     model?: string | null;
+    model_tier?: ModelTier | null;
     /**
      * System Prompt
      */
@@ -5006,7 +5475,8 @@ export type SubAgentCreate = {
     /**
      * Model
      */
-    model?: ModelEnum | null;
+    model?: string | null;
+    model_tier?: ModelTier | null;
     /**
      * System Prompt
      */
@@ -5325,7 +5795,8 @@ export type SubAgentUpdate = {
     /**
      * Model
      */
-    model?: ModelEnum | null;
+    model?: string | null;
+    model_tier?: ModelTier | null;
     /**
      * System Prompt
      */
@@ -5412,9 +5883,9 @@ export type SubAgentVersionApproval = {
 /**
  * ThinkingLevel
  *
- * Thinking depth level for extended thinking mode.
+ * Reasoning effort (LiteLLM convention). Per-model support comes from the gateway.
  */
-export type ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
+export type ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 
 /**
  * TimeSeriesPoint
@@ -6226,6 +6697,14 @@ export type UserSettings = {
      */
     preferred_model?: string | null;
     /**
+     * Preferred Model Retired
+     */
+    preferred_model_retired?: boolean;
+    /**
+     * Effective Preferred Model
+     */
+    effective_preferred_model?: string | null;
+    /**
      * Enable Thinking
      */
     enable_thinking?: boolean | null;
@@ -6529,11 +7008,6 @@ export type GranularityEnum2 = 'day' | 'week' | 'month';
  * 'personal' or 'group'
  */
 export type ScopeEnum = 'personal' | 'group' | 'sub-agent';
-
-/**
- * Model
- */
-export type ModelEnum = 'gpt-4o' | 'gpt-4o-mini' | 'claude-sonnet-4.5' | 'claude-sonnet-4.6' | 'claude-haiku-4-5' | 'gemini-3.1-pro-preview' | 'gemini-3-flash-preview';
 
 /**
  * Action
@@ -6891,6 +7365,10 @@ export type GetConversationsByUserApiV1ConversationsGetData = {
          * Exclude Playground
          */
         exclude_playground?: boolean;
+        /**
+         * Search
+         */
+        search?: string | null;
     };
     url: '/api/v1/conversations/';
 };
@@ -9065,6 +9543,35 @@ export type LogUsageApiV1UsageLogPostResponses = {
     201: unknown;
 };
 
+export type GatewayBatchLogUsageApiV1UsageGatewayBatchLogPostData = {
+    body: GatewayUsageLogBatchCreate;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/v1/usage/gateway-batch-log';
+};
+
+export type GatewayBatchLogUsageApiV1UsageGatewayBatchLogPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GatewayBatchLogUsageApiV1UsageGatewayBatchLogPostError = GatewayBatchLogUsageApiV1UsageGatewayBatchLogPostErrors[keyof GatewayBatchLogUsageApiV1UsageGatewayBatchLogPostErrors];
+
+export type GatewayBatchLogUsageApiV1UsageGatewayBatchLogPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: unknown;
+};
+
 export type BatchLogUsageApiV1UsageBatchLogPostData = {
     body: UsageLogBatchCreate;
     path?: never;
@@ -9705,23 +10212,347 @@ export type GetModelRatesApiV1AdminRateCardsModelProviderModelNameGetResponses =
 
 export type GetModelRatesApiV1AdminRateCardsModelProviderModelNameGetResponse = GetModelRatesApiV1AdminRateCardsModelProviderModelNameGetResponses[keyof GetModelRatesApiV1AdminRateCardsModelProviderModelNameGetResponses];
 
-export type ListAvailableModelsApiV1ModelsGetData = {
+export type ListModelsApiV1AdminModelGatewayModelsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/model-gateway/models';
+};
+
+export type ListModelsApiV1AdminModelGatewayModelsGetResponses = {
+    /**
+     * Response List Models Api V1 Admin Model Gateway Models Get
+     *
+     * Successful Response
+     */
+    200: Array<GatewayModel>;
+};
+
+export type ListModelsApiV1AdminModelGatewayModelsGetResponse = ListModelsApiV1AdminModelGatewayModelsGetResponses[keyof ListModelsApiV1AdminModelGatewayModelsGetResponses];
+
+export type RegisterModelApiV1AdminModelGatewayModelsPostData = {
+    body: ModelRegistrationRequest;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/model-gateway/models';
+};
+
+export type RegisterModelApiV1AdminModelGatewayModelsPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type RegisterModelApiV1AdminModelGatewayModelsPostError = RegisterModelApiV1AdminModelGatewayModelsPostErrors[keyof RegisterModelApiV1AdminModelGatewayModelsPostErrors];
+
+export type RegisterModelApiV1AdminModelGatewayModelsPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: ModelRegistrationResponse;
+};
+
+export type RegisterModelApiV1AdminModelGatewayModelsPostResponse = RegisterModelApiV1AdminModelGatewayModelsPostResponses[keyof RegisterModelApiV1AdminModelGatewayModelsPostResponses];
+
+export type ModelCatalogApiV1AdminModelGatewayCatalogGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/model-gateway/catalog';
+};
+
+export type ModelCatalogApiV1AdminModelGatewayCatalogGetResponses = {
+    /**
+     * Response Model Catalog Api V1 Admin Model Gateway Catalog Get
+     *
+     * Successful Response
+     */
+    200: Array<CatalogModel>;
+};
+
+export type ModelCatalogApiV1AdminModelGatewayCatalogGetResponse = ModelCatalogApiV1AdminModelGatewayCatalogGetResponses[keyof ModelCatalogApiV1AdminModelGatewayCatalogGetResponses];
+
+export type CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetData = {
+    body?: never;
+    path: {
+        /**
+         * Model Name
+         */
+        model_name: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/model-gateway/models/{model_name}/cost-prefill';
+};
+
+export type CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetError = CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetErrors[keyof CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetErrors];
+
+export type CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: CostPrefill;
+};
+
+export type CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetResponse = CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetResponses[keyof CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetResponses];
+
+export type DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteData = {
+    body?: never;
+    path: {
+        /**
+         * Model Id
+         */
+        model_id: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/model-gateway/models/{model_id}';
+};
+
+export type DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteError = DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteErrors[keyof DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteErrors];
+
+export type DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteResponses = {
+    /**
+     * Successful Response
+     */
+    204: void;
+};
+
+export type DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteResponse = DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteResponses[keyof DeleteModelApiV1AdminModelGatewayModelsModelIdDeleteResponses];
+
+export type EditModelApiV1AdminModelGatewayModelsModelIdPutData = {
+    body: ModelRegistrationRequest;
+    path: {
+        /**
+         * Model Id
+         */
+        model_id: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/model-gateway/models/{model_id}';
+};
+
+export type EditModelApiV1AdminModelGatewayModelsModelIdPutErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type EditModelApiV1AdminModelGatewayModelsModelIdPutError = EditModelApiV1AdminModelGatewayModelsModelIdPutErrors[keyof EditModelApiV1AdminModelGatewayModelsModelIdPutErrors];
+
+export type EditModelApiV1AdminModelGatewayModelsModelIdPutResponses = {
+    /**
+     * Successful Response
+     */
+    200: ModelRegistrationResponse;
+};
+
+export type EditModelApiV1AdminModelGatewayModelsModelIdPutResponse = EditModelApiV1AdminModelGatewayModelsModelIdPutResponses[keyof EditModelApiV1AdminModelGatewayModelsModelIdPutResponses];
+
+export type TestModelApiV1AdminModelGatewayModelsModelNameTestPostData = {
+    body?: never;
+    path: {
+        /**
+         * Model Name
+         */
+        model_name: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/model-gateway/models/{model_name}/test';
+};
+
+export type TestModelApiV1AdminModelGatewayModelsModelNameTestPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type TestModelApiV1AdminModelGatewayModelsModelNameTestPostError = TestModelApiV1AdminModelGatewayModelsModelNameTestPostErrors[keyof TestModelApiV1AdminModelGatewayModelsModelNameTestPostErrors];
+
+export type TestModelApiV1AdminModelGatewayModelsModelNameTestPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type SetDefaultApiV1AdminModelGatewayModelsModelIdDefaultPostData = {
+    body: SetDefaultRequest;
+    path: {
+        /**
+         * Model Id
+         */
+        model_id: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/model-gateway/models/{model_id}/default';
+};
+
+export type SetDefaultApiV1AdminModelGatewayModelsModelIdDefaultPostErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SetDefaultApiV1AdminModelGatewayModelsModelIdDefaultPostError = SetDefaultApiV1AdminModelGatewayModelsModelIdDefaultPostErrors[keyof SetDefaultApiV1AdminModelGatewayModelsModelIdDefaultPostErrors];
+
+export type SetDefaultApiV1AdminModelGatewayModelsModelIdDefaultPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type GetBudgetSettingsApiV1AdminBudgetSettingsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/budget/settings';
+};
+
+export type GetBudgetSettingsApiV1AdminBudgetSettingsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: BudgetSettings;
+};
+
+export type GetBudgetSettingsApiV1AdminBudgetSettingsGetResponse = GetBudgetSettingsApiV1AdminBudgetSettingsGetResponses[keyof GetBudgetSettingsApiV1AdminBudgetSettingsGetResponses];
+
+export type UpdateBudgetSettingsApiV1AdminBudgetSettingsPutData = {
+    body: BudgetSettingsUpdate;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/budget/settings';
+};
+
+export type UpdateBudgetSettingsApiV1AdminBudgetSettingsPutErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type UpdateBudgetSettingsApiV1AdminBudgetSettingsPutError = UpdateBudgetSettingsApiV1AdminBudgetSettingsPutErrors[keyof UpdateBudgetSettingsApiV1AdminBudgetSettingsPutErrors];
+
+export type UpdateBudgetSettingsApiV1AdminBudgetSettingsPutResponses = {
+    /**
+     * Successful Response
+     */
+    200: BudgetSettings;
+};
+
+export type UpdateBudgetSettingsApiV1AdminBudgetSettingsPutResponse = UpdateBudgetSettingsApiV1AdminBudgetSettingsPutResponses[keyof UpdateBudgetSettingsApiV1AdminBudgetSettingsPutResponses];
+
+export type GetBudgetStatusApiV1AdminBudgetStatusGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/budget/status';
+};
+
+export type GetBudgetStatusApiV1AdminBudgetStatusGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: BudgetStatus;
+};
+
+export type GetBudgetStatusApiV1AdminBudgetStatusGetResponse = GetBudgetStatusApiV1AdminBudgetStatusGetResponses[keyof GetBudgetStatusApiV1AdminBudgetStatusGetResponses];
+
+export type GetSystemStatusApiV1AdminSystemStatusGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/system-status';
+};
+
+export type GetSystemStatusApiV1AdminSystemStatusGetResponses = {
+    /**
+     * Response Get System Status Api V1 Admin System Status Get
+     *
+     * Successful Response
+     */
+    200: {
+        [key: string]: unknown;
+    };
+};
+
+export type GetSystemStatusApiV1AdminSystemStatusGetResponse = GetSystemStatusApiV1AdminSystemStatusGetResponses[keyof GetSystemStatusApiV1AdminSystemStatusGetResponses];
+
+export type ConsoleListModelsData = {
     body?: never;
     path?: never;
     query?: never;
     url: '/api/v1/models';
 };
 
-export type ListAvailableModelsApiV1ModelsGetResponses = {
+export type ConsoleListModelsResponses = {
     /**
-     * Response List Available Models Api V1 Models Get
+     * Response Console List Models
      *
      * Successful Response
      */
     200: Array<AvailableModel>;
 };
 
-export type ListAvailableModelsApiV1ModelsGetResponse = ListAvailableModelsApiV1ModelsGetResponses[keyof ListAvailableModelsApiV1ModelsGetResponses];
+export type ConsoleListModelsResponse = ConsoleListModelsResponses[keyof ConsoleListModelsResponses];
+
+export type ModelDefaultsApiV1ModelsDefaultsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/models/defaults';
+};
+
+export type ModelDefaultsApiV1ModelsDefaultsGetResponses = {
+    /**
+     * Response Model Defaults Api V1 Models Defaults Get
+     *
+     * Successful Response
+     */
+    200: {
+        [key: string]: string;
+    };
+};
+
+export type ModelDefaultsApiV1ModelsDefaultsGetResponse = ModelDefaultsApiV1ModelsDefaultsGetResponses[keyof ModelDefaultsApiV1ModelsDefaultsGetResponses];
+
+export type EmbeddingStatusApiV1ModelsEmbeddingsStatusGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/models/embeddings/status';
+};
+
+export type EmbeddingStatusApiV1ModelsEmbeddingsStatusGetResponses = {
+    /**
+     * Response Embedding Status Api V1 Models Embeddings Status Get
+     *
+     * Successful Response
+     */
+    200: {
+        [key: string]: unknown;
+    };
+};
+
+export type EmbeddingStatusApiV1ModelsEmbeddingsStatusGetResponse = EmbeddingStatusApiV1ModelsEmbeddingsStatusGetResponses[keyof EmbeddingStatusApiV1ModelsEmbeddingsStatusGetResponses];
 
 export type GetNotificationsApiV1NotificationsGetData = {
     body?: never;

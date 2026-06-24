@@ -20,6 +20,8 @@ from .repositories.bug_report_repository import BugReportRepository
 from .repositories.catalog_repository import CatalogRepository
 from .repositories.delivery_channel_repository import DeliveryChannelRepository
 from .repositories.feedback_repository import FeedbackRepository
+from .repositories.budget_settings_repository import BudgetSettingsRepository
+from .repositories.model_defaults_repository import ModelDefaultsRepository
 from .repositories.rate_card_repository import RateCardRepository
 from .repositories.scheduled_job_repository import ScheduledJobRepository
 from .repositories.secrets_repository import SecretsRepository
@@ -44,6 +46,9 @@ from .services.notification_service import NotificationService
 from .services.outbound_scim_endpoint_service import OutboundScimEndpointService
 from .services.outbound_scim_push_service import OutboundScimPushService
 from .services.playbook_service import PlaybookService
+from .services.budget_service import BudgetService
+from .services.model_defaults_service import ModelDefaultsService
+from .services.model_gateway_service import ModelGatewayService
 from .services.rate_card_service import RateCardService
 from .services.scheduler_engine import SchedulerEngine
 from .services.scheduler_service import SchedulerService
@@ -201,9 +206,30 @@ async def initialize_services(app: "FastAPI") -> None:
     app.state.rate_card_service = RateCardService()
     app.state.rate_card_service.set_repository(app.state.rate_card_repository)
 
+    # Model Gateway management client (runtime model registration)
+    app.state.model_gateway_service = ModelGatewayService()
+    # Sub-agent writes consult the gateway for live thinking-capability (created above,
+    # before the gateway client existed — inject now).
+    app.state.sub_agent_service.set_model_gateway_service(app.state.model_gateway_service)
+
+    # Per-role default model aliases (graceful degradation). Writes go through the
+    # audited repository so "set fleet default model" is recorded automatically.
+    app.state.model_defaults_repository = ModelDefaultsRepository()
+    app.state.model_defaults_repository.set_audit_service(app.state.audit_service)
+    app.state.model_defaults_service = ModelDefaultsService()
+    app.state.model_defaults_service.set_repository(app.state.model_defaults_repository)
+
     app.state.usage_service = UsageService()
     app.state.usage_service.set_repository(app.state.usage_repository)
     app.state.usage_service.set_rate_card_service(app.state.rate_card_service)
+
+    # Budget Guard config + live spend/lock decision. Writes go through the audited
+    # repository; status reuses usage_service for month-to-date global spend.
+    app.state.budget_settings_repository = BudgetSettingsRepository()
+    app.state.budget_settings_repository.set_audit_service(app.state.audit_service)
+    app.state.budget_service = BudgetService()
+    app.state.budget_service.set_repository(app.state.budget_settings_repository)
+    app.state.budget_service.set_usage_service(app.state.usage_service)
 
     app.state.analytics_service = AnalyticsService()
 
@@ -352,6 +378,9 @@ async def cleanup_services(app: "FastAPI") -> None:
     """
     if hasattr(app.state, "oauth_service") and app.state.oauth_service is not None:
         await app.state.oauth_service.close()
+
+    if hasattr(app.state, "model_gateway_service") and app.state.model_gateway_service is not None:
+        await app.state.model_gateway_service.aclose()
 
 
 __all__ = [

@@ -10,8 +10,9 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from console_backend.models.scheduled_job import (
     JobRunStatus,
@@ -521,3 +522,64 @@ class TestFinalizeJobState:
         socket_manager.send_notification.assert_awaited_once()
         call_args = socket_manager.send_notification.call_args
         assert call_args[0][0] == "notify-user"  # correct user_id
+
+
+class TestDispatchErrorHandling:
+    """A dispatch error from agent-runner must finalize the run as FAILED (not leave it stuck).
+
+    The transport is the native a2a-sdk client (dispatch_streaming); we assert the engine's
+    error handling at that seam rather than the old hand-rolled SSE.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_records_failure_on_http_error(self):
+        """An HTTP error from agent-runner must be finalized as FAILED with the status code
+        and body surfaced in the error message."""
+        repo = AsyncMock(spec=ScheduledJobRepository)
+        repo.create_run = AsyncMock(return_value=99)
+        repo.complete_run = AsyncMock()
+        repo.complete_job = AsyncMock()
+        token_service = AsyncMock(spec=SchedulerTokenService)
+        token_service.get_access_token = AsyncMock(return_value="token-xyz")
+
+        engine = _make_engine(repo=repo, token_service=token_service)
+
+        http_error = httpx.HTTPStatusError(
+            "404",
+            request=httpx.Request("POST", "http://agent-runner:8000/"),
+            response=httpx.Response(404, text="Not Found"),
+        )
+        with patch(
+            "console_backend.services.scheduler_engine.dispatch_streaming",
+            new=AsyncMock(side_effect=http_error),
+        ):
+            await engine._dispatch_job(_make_job(), run_id=99)
+
+        repo.complete_run.assert_awaited_once()
+        kwargs = repo.complete_run.await_args.kwargs
+        assert kwargs["status"] == JobRunStatus.FAILED
+        assert "404" in (kwargs["error_message"] or "")
+        assert "Not Found" in (kwargs["error_message"] or "")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_records_failure_on_generic_error(self):
+        """A non-HTTP dispatch error (e.g. transport/JSON-RPC) must still finalize FAILED."""
+        repo = AsyncMock(spec=ScheduledJobRepository)
+        repo.create_run = AsyncMock(return_value=99)
+        repo.complete_run = AsyncMock()
+        repo.complete_job = AsyncMock()
+        token_service = AsyncMock(spec=SchedulerTokenService)
+        token_service.get_access_token = AsyncMock(return_value="token-xyz")
+
+        engine = _make_engine(repo=repo, token_service=token_service)
+
+        with patch(
+            "console_backend.services.scheduler_engine.dispatch_streaming",
+            new=AsyncMock(side_effect=RuntimeError("assessor exploded")),
+        ):
+            await engine._dispatch_job(_make_job(), run_id=99)
+
+        repo.complete_run.assert_awaited_once()
+        kwargs = repo.complete_run.await_args.kwargs
+        assert kwargs["status"] == JobRunStatus.FAILED
+        assert "assessor exploded" in (kwargs["error_message"] or "")

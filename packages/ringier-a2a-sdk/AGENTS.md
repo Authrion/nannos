@@ -46,6 +46,26 @@ NEVER use heredoc (`cat << EOF`) to write files - causes fatal errors. Use incre
 
 ## Architecture Patterns
 
+### Layering: this SDK is the lowest shared layer
+
+`agent-common` and all the apps (orchestrator, agent-runner, console-backend) depend on
+this SDK — **never the reverse**. The SDK must not import `agent_common.*` (or any app
+package). A violation isn't just stylistic: console-backend uses the SDK without installing
+agent-common, so an upward import crashes it at runtime (e.g. a `ModuleNotFoundError` in the
+catalog re-index embedding path). When the SDK needs something currently sitting in
+agent-common, move the canonical copy down here and let agent-common re-export or import it.
+
+### Model Gateway / cost cluster lives here by design
+
+`cost_tracking/` (logger, callback), `embeddings.py` (`GatewayEmbeddings`), and
+`cost_tracking/attribution.py` (spend-logs ContextVars + `attribution_header` /
+`build_attribution_http_client`) are part of the SDK on purpose, not internal code that
+leaked in: remote/external agents can opt into routing LLM + embedding traffic through the
+Model Gateway to get spend-logs attribution (and, later, extra-cost reporting). This
+is why they sit behind the `google-embeddings` / `langgraph` extras rather than the core
+deps. Don't propose extracting this cluster out of the SDK. Attribution's single canonical
+import path is `ringier_a2a_sdk.cost_tracking.attribution`.
+
 ### Agent Base Class Hierarchy
 
 The SDK provides a base agent class for building A2A agents:
@@ -90,7 +110,7 @@ LangGraph-based agents support two credential injection strategies for MCP tool 
 - Used when credentials need to be exchanged for a different audience/client
 - Performs RFC 8693 OIDC token exchange at request time
 - Preserves user identity through exchange
-- Example: agent-creator exchanges user token for gatana token at tool-call time
+- Example: an agent exchanges the user token for a gatana token at tool-call time
 
 Both injectors:
 - Automatically handle credential injection at tool-call time via interceptor pipeline
@@ -121,7 +141,7 @@ LangGraph state is persisted by `PostgreSQLCheckpointerMixin`
   `checkpoints`, `checkpoint_blobs`, `checkpoint_writes`, `checkpoint_migrations`.
 - **Thread IDs.** A top-level agent checkpoints under the bare `context_id` (empty
   `checkpoint_ns`); a sub-agent checkpoints under `{context_id}::{agent-name}` (e.g.
-  `…::agent-creator`). Each hop resumes its own checkpoint in its own namespace.
+  `…::voice-agent`). Each hop resumes its own checkpoint in its own namespace.
 - **MemorySaver fallback.** When `POSTGRES_HOST` is unset the mixin falls back to an in-memory
   saver — **local dev only**. A fallback in a real environment silently drops persisted state
   (and any pending HITL decision), so it is gated by `CHECKPOINT_ALLOW_MEMORY` outside local.

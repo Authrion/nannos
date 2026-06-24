@@ -1,8 +1,8 @@
 """Agent Runner A2A Server - Entry point for executing scheduled sub-agent jobs.
 
 This service is called by the agent-console scheduler engine to execute
-automated sub-agent jobs. It follows the same A2A pattern as agent-creator and
-alloy-agent for consistency and zero-trust security.
+automated sub-agent jobs. It follows the same A2A pattern as the other A2A
+agents (e.g. alloy-agent) for consistency and zero-trust security.
 """
 
 import logging
@@ -35,7 +35,6 @@ from a2a.types import (
     StringList,
 )
 from dotenv import load_dotenv
-from starlette.applications import Starlette
 from langsmith.middleware import TracingMiddleware
 from rcplus_alloy_common.logging import configure_existing_logger, configure_logger
 from ringier_a2a_sdk.middleware import (
@@ -45,6 +44,7 @@ from ringier_a2a_sdk.middleware import (
 )
 from ringier_a2a_sdk.server.context_builder import AuthRequestContextBuilder
 from ringier_a2a_sdk.server.executor import BaseAgentExecutor
+from starlette.applications import Starlette
 
 from agent import AgentRunner
 
@@ -66,6 +66,19 @@ async def lifespan(app) -> AsyncIterator[None]:
     await agent.setup_checkpointer()
     await agent.ensure_store_setup()
     await agent.init_sandbox_pool()
+
+    # Prewarm the gateway model cache at startup (best-effort). The cold-path resolution does a
+    # blocking urllib fetch; warming it here keeps that off the event loop on the first real
+    # request (agent-runner has no other prewarm, unlike the orchestrator's create_app).
+    try:
+        from agent_common.core.model_factory import get_available_models
+
+        available = get_available_models()
+        if available:
+            logger.info("Prewarmed gateway models: %s", ", ".join(available))
+    except Exception as e:
+        logger.debug("Could not prewarm gateway models at startup: %s", e)
+
     logger.info("Application startup complete")
 
     yield
@@ -144,6 +157,10 @@ def create_app():
 
     # Build the Starlette app with A2A routes (A2A v1.0+ replaces A2AFastAPIApplication;
     # a2a-sdk no longer pulls FastAPI, and the route factories return Starlette routes).
+    # agent-runner speaks native a2a-sdk v1.1.0 only — all its callers (the console-backend
+    # scheduler engine, debug-agent, and skill-security services) dispatch via the a2a SDK
+    # client (SendStreamingMessage), so no v0.3 backward-compat shim is needed here. (The
+    # orchestrator still enables it for the external slack/google-chat/email clients.)
     app = Starlette(
         routes=[
             *create_agent_card_routes(agent_card),

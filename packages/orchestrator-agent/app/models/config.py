@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from agent_common.a2a.models import LocalSubAgentConfig
-from agent_common.models.base import ModelType, ThinkingLevel
+from agent_common.models.base import ThinkingLevel
 from deepagents import CompiledSubAgent
 from langchain_core.messages import ContentBlock
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SecretStr
@@ -313,8 +313,9 @@ class AgentSettings:
     TOOL_SELECTION_THRESHOLD = int(os.getenv("TOOL_SELECTION_THRESHOLD", "20"))
     """Trigger tool-level LLM selection (Phase 2) in ToolsetSelectorMiddleware when remaining tools exceed this."""
 
-    TOOLSET_SELECTION_MODEL: ModelType = os.getenv("TOOLSET_SELECTION_MODEL", "gpt-4o-mini")  # type: ignore
-    """Model to use for server and tool selection (fast, cheap model preferred)."""
+    # Tool/server selection runs on the fleet's cheap chat tier, resolved at runtime via
+    # model_factory.get_default_fast_model() (see ToolsetSelectorMiddleware._create_selection_model).
+    # No env var or hardcoded alias: models are registered at runtime.
 
     # Cache configuration.
     # Per-user discovery + registry cache TTL (seconds). Kept well below a typical realm
@@ -590,43 +591,18 @@ class AgentSettings:
         """Get Okta/Keycloak issuer URL (None when not configured)."""
         return os.environ.get("OIDC_ISSUER")
 
-    @classmethod
-    def get_bedrock_region(cls) -> str:
-        """Get AWS Bedrock region."""
-        return os.environ.get("AWS_REGION", "eu-central-1")
-
-    # Budget guard configuration
-    @classmethod
-    def get_budget_enabled(cls) -> bool:
-        """Check if budget enforcement is enabled."""
-        return os.environ.get("BUDGET_ENABLED", "true").lower() == "true"
-
-    @classmethod
-    def get_budget_monthly_token_limit(cls) -> int:
-        """Get monthly token limit for budget enforcement.
-
-        Default: 100 million tokens (~$300 for Claude on Bedrock)
-        """
-        return int(os.environ.get("BUDGET_MONTHLY_TOKEN_LIMIT", "100000000"))
-
+    # Budget guard configuration.
+    #
+    # The budget — monthly USD limit, warning thresholds, AND the enforcement on/off switch
+    # — lives entirely in console-backend's admin-editable `budget_settings` (toggled from
+    # the console UI) and is computed from the gateway usage logs. The orchestrator polls
+    # GET /api/v1/admin/budget/status and enforces the returned lock; there is deliberately
+    # no env override for enabling/disabling it. The only local knob is how often to poll.
+    # Console URL/client-id reuse CONSOLE_BACKEND_URL / CONSOLE_BACKEND_CLIENT_ID.
     @classmethod
     def get_budget_check_interval(cls) -> int:
-        """Get budget check interval in seconds.
+        """Get budget poll interval in seconds.
 
         Default: 300 seconds (5 minutes)
         """
         return int(os.environ.get("BUDGET_CHECK_INTERVAL_SECONDS", "300"))
-
-    @classmethod
-    def get_budget_warning_thresholds(cls) -> tuple[float, ...]:
-        """Get warning thresholds as percentages (0.0-1.0).
-
-        Default: 80%, 90%, 95%
-        """
-        thresholds_str = os.environ.get("BUDGET_WARNING_THRESHOLDS", "0.80,0.90,0.95")
-        return tuple(float(t.strip()) for t in thresholds_str.split(","))
-
-    @classmethod
-    def get_langsmith_project(cls) -> str:
-        """Get LangSmith project name for budget tracking."""
-        return os.environ.get("LANGSMITH_PROJECT", "dev-nannos-agent-framework")

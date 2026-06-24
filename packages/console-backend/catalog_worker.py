@@ -42,6 +42,18 @@ HEARTBEAT_PATH = "/tmp/worker-heartbeat"
 _cost_logger = None
 
 
+def _embedding_block_error(reason: str | None) -> str:
+    """Job-failure message when embeddings aren't ready (see resolve_embedding_readiness).
+
+    `reason` already names the specific problem (no default set, or the set default isn't
+    registered on the gateway); append the consistent remediation."""
+    return (
+        f"{reason or 'Embeddings are not ready.'} An administrator must set a registered "
+        "default embedding model in the console (Admin → Model Gateway) before catalogs can "
+        "be indexed."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -208,14 +220,40 @@ async def _execute_sync(catalog_id: str, sync_job_id: str) -> None:
             )
         return
 
+    # Embedding-dependent: block up front unless a default embedding model is set AND
+    # registered on the gateway — the same readiness check the System Status page makes, so a
+    # retired/unregistered default fails cleanly here instead of mid-sync at the gateway.
+    status, embedding_alias, reason = await pipeline.resolve_embedding_readiness()
+    if status != "ready":
+        logger.warning("Sync job %s blocked: %s", sync_job_id, reason)
+        async with session_factory() as db:
+            await pipeline._update_sync_job(
+                db,
+                sync_job_id,
+                status="failed",
+                completed_at=datetime.now(timezone.utc),
+                error_details={"error": _embedding_block_error(reason)},
+            )
+        return
+
     # Set up progress callback (HTTP webhook to console-backend)
     progress_callback = _make_progress_callback(catalog_id, sync_job_id, catalog.owner_user_id)
+
+    # Resolve the summarization model once per job from the chat:low/chat fleet default
+    # (best-effort: None degrades to a filename-only summary, never blocks the sync).
+    summarization_alias = await pipeline.resolve_summarization_alias()
+    # Provider family of the embedding alias → picks the request profile (Gemini prefixes/fusion
+    # vs generic). None (unknown) degrades to the generic profile, never blocks the sync.
+    embedding_provider = await pipeline.resolve_embedding_provider(embedding_alias)
 
     pipeline.setup_job(
         sync_job_id=sync_job_id,
         user_sub=catalog.owner_user_id,
         catalog_id=catalog_id,
         progress_callback=progress_callback,
+        embedding_model=embedding_alias,
+        embedding_provider=embedding_provider,
+        summarization_model=summarization_alias,
     )
 
     try:
@@ -321,12 +359,33 @@ async def _execute_reindex(catalog_id: str, sync_job_id: str) -> None:
         cost_logger=_cost_logger,
     )
 
+    # Embedding-dependent: block up front unless a default embedding model is set AND
+    # registered on the gateway (same readiness check as the sync path / System Status).
+    status, embedding_alias, reason = await pipeline.resolve_embedding_readiness()
+    if status != "ready":
+        logger.warning("Reindex job %s blocked: %s", sync_job_id, reason)
+        async with session_factory() as db:
+            await pipeline._update_sync_job(
+                db,
+                sync_job_id,
+                status="failed",
+                completed_at=datetime.now(timezone.utc),
+                error_details={"error": _embedding_block_error(reason)},
+            )
+        return
+
     progress_callback = _make_reindex_progress_callback(catalog_id, sync_job_id, catalog.owner_user_id)
+
+    summarization_alias = await pipeline.resolve_summarization_alias()
+    embedding_provider = await pipeline.resolve_embedding_provider(embedding_alias)
 
     pipeline.setup_job(
         sync_job_id=sync_job_id,
         user_sub=catalog.owner_user_id,
         catalog_id=catalog_id,
+        embedding_model=embedding_alias,
+        embedding_provider=embedding_provider,
+        summarization_model=summarization_alias,
     )
 
     try:

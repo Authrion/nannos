@@ -18,28 +18,51 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.tools import BaseTool, StructuredTool
 from langsmith import traceable
-from ringier_a2a_sdk.embeddings import GeminiEmbeddings
+from ringier_a2a_sdk.embeddings import GatewayEmbeddings
 
 logger = logging.getLogger(__name__)
 
 _AWS_REGION = os.environ.get("AWS_REGION", "eu-central-1")
 
 
-# Module-level singletons (created once, reused across calls)
+# Module-level singletons (created once, reused across calls); rebuilt if the configured
+# default embedding alias changes (model_factory's defaults cache refreshes ~every 60s).
 _query_embeddings: Embeddings | None = None
+_query_embeddings_alias: str | None = None
 
 
 def _get_query_embeddings(
     cost_logger: Any | None = None,
 ) -> Embeddings:
-    """Lazy-init query embedding singleton (Gemini Embedding 2, query role).
+    """Lazy-init query embedding singleton (gateway-backed, query role).
+
+    Resolves the SAME default embedding alias the indexing side uses
+    (CatalogSyncPipeline.resolve_embedding_readiness / get_default_embedding_model), so query
+    vectors are produced by the model the index was built with. A hardcoded alias here would
+    silently mismatch the index once an admin changes the default → meaningless similarity
+    (or a gateway 400 on a retired alias). When no default is configured the catalog feature
+    is disabled, so this raises rather than guessing a model — callers reach it only via the
+    catalog_search tool, which is gated off in that case.
 
     If cost_logger is provided on the first call, cost tracking is enabled.
     user_sub is read from ContextVar at invoke time.
     """
-    global _query_embeddings
-    if _query_embeddings is None:
-        _query_embeddings = GeminiEmbeddings(role="query", cost_logger=cost_logger)
+    global _query_embeddings, _query_embeddings_alias
+    from agent_common.core.model_factory import get_default_embedding_model, get_model_provider
+
+    alias = get_default_embedding_model(multimodal=True)
+    if not alias:
+        raise RuntimeError(
+            "Catalog search requires a default embedding model, but none is configured "
+            "(Admin → Model Gateway). The catalog_search tool should have been disabled."
+        )
+    if _query_embeddings is None or alias != _query_embeddings_alias:
+        # Provider family selects the request profile (must match the indexing side so query
+        # vectors are shaped like the index's). Read from the cached gateway registry.
+        _query_embeddings = GatewayEmbeddings(
+            role="query", model_id=alias, provider=get_model_provider(alias), cost_logger=cost_logger
+        )
+        _query_embeddings_alias = alias
     return _query_embeddings
 
 
@@ -161,9 +184,19 @@ def create_catalog_search_tool(
         vector_store_backend: Vector store backend type.
 
     Returns:
-        BaseTool instance, or None if user has no accessible catalogs.
+        BaseTool instance, or None if the user has no accessible catalogs or no default
+        embedding model is configured (the catalog feature is disabled in that case).
     """
     if not accessible_catalog_ids:
+        return None
+
+    # Catalog search embeds the query through the configured default model. With none set,
+    # the feature is disabled fleet-wide (matches indexing being blocked and the console UI),
+    # so don't offer the tool rather than embedding with a guessed model.
+    from agent_common.core.model_factory import is_embeddings_configured
+
+    if not is_embeddings_configured(multimodal=True):
+        logger.info("catalog_search tool disabled: no default embedding model configured")
         return None
 
     @traceable(run_type="retriever")

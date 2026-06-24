@@ -110,18 +110,12 @@ class CostTrackingMixin:
 
         # Note: Worker will be started lazily on first request (when event loop is running)
 
-        # Try to create LangChain callback if langchain_core is available
-        # This uses lazy import to avoid forcing langchain_core dependency
-        try:
-            from ..cost_tracking import CostTrackingCallback
-
-            self._langchain_callbacks = [CostTrackingCallback(self._cost_logger, sub_agent_id=sub_agent_id)]
-            logger.info(
-                f"Cost tracking enabled with LangChain auto-instrumentation ({log_context}, sub_agent_id={sub_agent_id})"
-            )
-        except ImportError as e:
-            logger.info(f"Cost tracking enabled with manual instrumentation only (langchain_core not available: {e})")
-            self._langchain_callbacks = []
+        # No in-app LangChain cost callback: all LLM traffic goes through the Model
+        # Gateway, whose proxy-side CostLogger is the single source of cost.
+        # Attaching CostTrackingCallback here would double-count every sub-agent call
+        # (once proxy-side with the real provider, once in-app mislabeled as "openai").
+        self._langchain_callbacks = []
+        logger.info(f"Cost tracking via Model Gateway (proxy-side); in-app callback disabled ({log_context})")
 
         # Always enable cost tracking if CostLogger initialized successfully
         self._cost_tracking_enabled = True
@@ -245,7 +239,7 @@ class CostTrackingMixin:
             user_sub: User sub for cost attribution
             conversation_id: Conversation ID for cost attribution and tool result scoping
             thread_id: Thread ID for checkpointing (defaults to conversation_id)
-            checkpoint_ns: Checkpoint namespace for isolation (e.g., "agent-creator")
+            checkpoint_ns: Checkpoint namespace for isolation (e.g., "voice-agent")
             checkpointer: Checkpointer instance (for __pregel_checkpointer)
             scheduled_job_id: Optional scheduled job ID — adds "scheduled_job:{id}" tag for cost attribution
             sub_agent_id: Optional sub-agent ID for cost attribution (explicit override;
@@ -263,7 +257,7 @@ class CostTrackingMixin:
                 user_sub=user_config.user_sub,
                 conversation_id=task.context_id,
                 thread_id=task.context_id,
-                checkpoint_ns="agent-creator",
+                checkpoint_ns="voice-agent",
                 checkpointer=self._checkpointer,
                 user_id=user.id,  # For user-scoped files
             )

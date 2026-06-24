@@ -17,6 +17,9 @@ import {
   BookOpen,
   Package,
   BarChart3,
+  Cpu,
+  Wallet,
+  Activity,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
@@ -84,6 +87,11 @@ export const groupManagerNavItems: NavItem[] = [
 
 export const adminNavItems: NavItem[] = [
   {
+    title: 'System Status',
+    url: '/app/admin/system-status',
+    icon: Activity,
+  },
+  {
     title: 'Analytics',
     url: '/app/admin/analytics',
     icon: BarChart3,
@@ -107,6 +115,16 @@ export const adminNavItems: NavItem[] = [
     title: 'Rate Cards',
     url: '/app/admin/rate-cards',
     icon: CreditCard,
+  },
+  {
+    title: 'Model Gateway',
+    url: '/app/admin/model-gateway',
+    icon: Cpu,
+  },
+  {
+    title: 'Budget Guard',
+    url: '/app/admin/budget-guard',
+    icon: Wallet,
   },
   {
     title: 'Bug Reports',

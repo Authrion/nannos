@@ -79,9 +79,17 @@ class TestPlaybookReaderService:
         mock_result.key = "/test-agent/skills/incident_triage/SKILL.md"
         mock_store.asearch.return_value = [mock_result]
 
-        # Mock aget to return skill content
+        # Mock aget to return skill content (SKILL.md with YAML frontmatter per spec)
         mock_item = MagicMock()
-        mock_item.value = {"content": "# Incident Triage\n\nHandle production incidents step by step.\n\n## Steps\n..."}
+        mock_item.value = {
+            "content": (
+                "---\n"
+                "name: incident_triage\n"
+                "description: Handle production incidents step by step.\n"
+                "---\n"
+                "# Incident Triage\n\n## Steps\n..."
+            )
+        }
 
         async def mock_aget(namespace, key):
             if "incident_triage" in key:

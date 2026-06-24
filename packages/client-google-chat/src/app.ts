@@ -20,10 +20,15 @@ import { HandlerDependencies } from './handlers/types.js';
 import { AppCommand, handleAppCommand } from './handlers/commandHandler.js';
 import { ButtonClickedPayload, handleButtonClicked } from './handlers/buttonClickedHandler.js';
 import { handleA2ANotification } from './handlers/a2aNotificationHandler.js';
+import { patchGaxiosToUseNativeFetch } from './utils/gaxiosNativeFetch.js';
 import { Task } from '@a2a-js/sdk';
 
 // Initialize logger early
 const logger = Logger.getLogger('app');
+
+// Force googleapis/google-auth-library off the broken bundled node-fetch and
+// onto native fetch (undici). Must run before any Google API call. See module docs.
+patchGaxiosToUseNativeFetch();
 
 process.setMaxListeners(20);
 

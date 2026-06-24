@@ -5,7 +5,7 @@ Supports all sub-agent types:
 - **foundry**: Palantir Foundry query-API agents
 - **remote**: A2A protocol agents at external URLs
 
-Follows the same A2A pattern as agent-creator and alloy-agent:
+Follows the same A2A pattern as the other A2A agents (e.g. alloy-agent):
 - Extends BaseAgent and implements _stream_impl()
 - JWT authentication enforced at the middleware layer
 - Result is returned as JSON-encoded text in the artifact (for scheduler engine parsing)
@@ -38,11 +38,16 @@ from agent_common.a2a.models import LocalFoundrySubAgentConfig
 from agent_common.a2a.stream_events import ArtifactUpdate, ErrorEvent, TaskResponseData, TaskUpdate
 from agent_common.a2a.structured_response import A2A_PROTOCOL_ADDENDUM, SubAgentResponseSchema, get_response_format
 from agent_common.agents.foundry_agent import create_foundry_local_subagent
-from agent_common.core.cost_tracking_embeddings import CostTrackingBedrockEmbeddings
 from agent_common.core.document_store_tools import create_document_store_tools
 from agent_common.core.graph_utils import build_sub_agent_graph
-from agent_common.core.model_factory import _has_aws_credentials, create_model, is_valid_model
-from agent_common.models.base import get_resolved_default_model
+from agent_common.core.model_factory import (
+    create_model,
+    get_default_fast_model,
+    get_default_model,
+    is_valid_model,
+    require_default_model,
+)
+from agent_common.core.stream_watchdog import watch_stream
 from google.protobuf.json_format import ParseDict
 from object_storage import get_object_storage_service
 
@@ -284,57 +289,120 @@ class AgentRunner(BaseAgent):
 
         # Document store (PostgreSQL + pgvector) — optional, shared with orchestrator.
         # Disabled when POSTGRES_HOST is not configured.
+        #
+        # Embeddings are resolved LAZILY (see _resolve_store_mode / ensure_store_ready), NOT
+        # here: at construction the gateway/console caches can be cold (pod boots before they
+        # are reachable), and resolving eagerly would latch the store off for the whole
+        # process lifetime on a transient cold-start failure. The store self-heals instead —
+        # it retries a cold gateway and upgrades to a semantic index once an embedding default
+        # is configured, without a restart.
         self._postgres_conn: str | None = _build_postgres_conn()
         self._store: AsyncPostgresStore | None = None
         self._connection_pool: AsyncConnectionPool | None = None
-        if self._postgres_conn:
-            if _has_aws_credentials():
-                self._embeddings_model = CostTrackingBedrockEmbeddings(
-                    model_id="amazon.titan-embed-text-v2:0",
-                    region_name=os.getenv("AWS_BEDROCK_REGION", "eu-central-1"),
-                    cost_logger=getattr(self, "_cost_logger", None),
-                )
-                logger.info("AgentRunner: document store configured (PostgreSQL)")
-            else:
-                self._embeddings_model = None
-                self._postgres_conn = None
-                logger.warning("AgentRunner: document store disabled (no AWS credentials for embeddings)")
-        else:
-            self._embeddings_model = None
+        self._embeddings_model = None
+        # Store readiness state: None = undecided/transient (retry), "absent" = no embedding
+        # default configured (stable, store-less, watched for one), "indexed" = embeddings
+        # resolved (terminal).
+        self._store_mode: str | None = None
+        self._store_setup_complete = False
+        if not self._postgres_conn:
             logger.info("AgentRunner: document store disabled (POSTGRES_HOST not set)")
+
+    def _resolve_store_mode(self) -> None:
+        """Lazily resolve the embedding model that backs the document store's semantic index.
+
+        Sets self._store_mode to one of:
+          - "indexed": a default embedding model resolved → semantic index available (terminal).
+          - "absent":  the defaults endpoint answered and no embedding default is set — a
+                       stable, supported state. Cacheable, but ensure_store_ready() upgrades it
+                       to "indexed" if an admin sets one later.
+          - None:      transient/cold (gateway or console not reachable yet) — the caller must
+                       NOT build a store and should retry on the next readiness check.
+
+        This turns a cold-start hiccup into a retry instead of a process-lifetime latch."""
+        if self._store_mode == "indexed":
+            return
+        from agent_common.core.model_factory import (
+            EmbeddingModelNotConfigured,
+            create_embeddings,
+            embedding_default_known_absent,
+        )
+
+        try:
+            self._embeddings_model = create_embeddings()
+            self._store_mode = "indexed"
+            logger.info("AgentRunner: gateway embeddings resolved; document store semantic index enabled")
+        except EmbeddingModelNotConfigured:
+            if embedding_default_known_absent():
+                if self._store_mode != "absent":
+                    logger.info(
+                        "AgentRunner: no default embedding model configured; semantic index disabled until one is set"
+                    )
+                self._store_mode = "absent"
+            else:
+                self._store_mode = None  # transient/cold — retry later
+        except Exception as e:
+            self._store_mode = None  # transient (gateway unreachable, etc.) — retry later
+            logger.debug("AgentRunner: embeddings not resolvable yet (%s); will retry", e)
+
+    def _reset_store(self) -> None:
+        """Drop the cached store so the next readiness check rebuilds with a semantic index.
+        Used when an embedding default appears after we settled store-less. The connection
+        pool is index-agnostic and is reused."""
+        self._store = None
+        self._store_mode = None
+        self._store_setup_complete = False
+        self._embeddings_model = None
 
     @property
     def store(self) -> AsyncPostgresStore | None:
         """Lazy-initialise the shared AsyncPostgresStore.
 
-        Returns None when POSTGRES_HOST is not configured so the graph runs
-        without a persistent store (tools that rely on docstore simply won't
-        be available).
+        Returns None when POSTGRES_HOST is not configured, AND when embeddings are still
+        resolving on a cold start (transient) — in that case nothing is built, so a later
+        access (driven by ensure_store_ready) retries. Builds the store once the mode is
+        decided ("indexed" → with semantic index, "absent" → store-less).
         """
         if not self._postgres_conn:
             return None
-        if self._store is None:
-            if self._connection_pool is None:
-                self._connection_pool = AsyncConnectionPool(
-                    self._postgres_conn,
-                    min_size=1,
-                    max_size=5,
-                    open=False,
-                    kwargs={
-                        "autocommit": True,
-                        "prepare_threshold": 0,
-                        "row_factory": dict_row,
-                    },
-                )
-            self._store = AsyncPostgresStore(
-                conn=self._connection_pool,
-                index={
-                    "dims": 1024,  # Titan Embeddings V2
-                    "embed": self._embeddings_model,
-                    "fields": ["contextualized_content"],  # description + chunk text combined, ≤50k chars
+        if self._store is not None:
+            return self._store
+
+        if self._store_mode not in ("indexed", "absent"):
+            self._resolve_store_mode()
+        if self._store_mode is None:
+            return None  # transient — don't build; ensure_store_ready() retries
+
+        if self._connection_pool is None:
+            self._connection_pool = AsyncConnectionPool(
+                self._postgres_conn,
+                min_size=1,
+                max_size=5,
+                open=False,
+                kwargs={
+                    "autocommit": True,
+                    "prepare_threshold": 0,
+                    "row_factory": dict_row,
                 },
             )
-            logger.info("Initialised AsyncPostgresStore (Titan Embeddings V2, 1024 dims)")
+        from agent_common.core.model_factory import get_embedding_dimension
+        from langgraph.store.postgres.base import PostgresIndexConfig
+
+        index_config: PostgresIndexConfig | None = None
+        if self._embeddings_model is not None:
+            index_config = {
+                # Single source of truth: same dimension create_embeddings() requests,
+                # so the index and the produced vectors always agree.
+                "dims": get_embedding_dimension(),
+                "embed": self._embeddings_model,
+                "fields": ["contextualized_content"],  # description + chunk text combined, ≤50k chars
+            }
+
+        self._store = AsyncPostgresStore(conn=self._connection_pool, index=index_config)
+        if index_config is not None:
+            logger.info("Initialised AsyncPostgresStore (gateway embeddings, %d dims)", get_embedding_dimension())
+        else:
+            logger.info("Initialised AsyncPostgresStore without semantic indexing (no embedding default)")
         return self._store
 
     async def setup_checkpointer(self) -> None:
@@ -383,13 +451,39 @@ class AgentRunner(BaseAgent):
             logger.info("Closed checkpoint connection pool")
 
     async def ensure_store_setup(self) -> None:
-        """Open the connection pool and run store schema migrations.
+        """Startup hook: best-effort document-store setup before serving requests.
 
-        Safe to call multiple times — subsequent calls are no-ops.
-        Should be called once from the application lifespan before serving requests.
+        If the gateway/console is cold at boot the store stays unready and ensure_store_ready()
+        (called per request) retries it. Safe to call multiple times.
+        """
+        await self.ensure_store_ready()
+
+    async def ensure_store_ready(self) -> None:
+        """Per-request, idempotent document-store readiness check. Cheap once set up.
+
+        Makes the store self-heal without a restart:
+          - a transient cold-start (gateway/console unreachable at boot) leaves the mode
+            undecided, so this is a no-op now and retried on the next request;
+          - if we settled store-less because no embedding default was configured, but an admin
+            has since set one, the cached store is dropped and rebuilt with a semantic index.
         """
         if not self._postgres_conn:
             return
+
+        from agent_common.core.model_factory import is_embeddings_configured
+
+        # Self-heal: an embedding default appeared after we settled store-less → rebuild indexed.
+        if self._store_mode == "absent" and is_embeddings_configured():
+            logger.info("AgentRunner: embedding default now configured; rebuilding store with semantic index")
+            self._reset_store()
+
+        if self._store_setup_complete:
+            return
+
+        self._resolve_store_mode()
+        if self._store_mode is None:
+            return  # transient/cold — retry on the next request
+
         store = self.store
         if store is None:
             return
@@ -398,7 +492,8 @@ class AgentRunner(BaseAgent):
             logger.info("Opened AsyncConnectionPool for document store")
         try:
             await store.setup()
-            logger.info("Document store schema ready")
+            self._store_setup_complete = True
+            logger.info("Document store ready (mode=%s)", self._store_mode)
         except Exception as exc:
             logger.warning(f"Document store setup failed (continuing without): {exc}")
 
@@ -720,9 +815,9 @@ class AgentRunner(BaseAgent):
 
             # Evaluate condition: LLM takes precedence if provided
             if llm_condition:
-                # Use LLM-based evaluation with GPT-4o-mini
+                # Use LLM-based evaluation on the fleet's cheap/fast chat tier
                 try:
-                    llm = create_model("gpt-4o-mini").bind(temperature=0)
+                    llm = create_model(get_default_fast_model() or require_default_model()).bind(temperature=0)
                     structured_llm = llm.with_structured_output(ConditionEvaluationResult)
 
                     system_prompt = (
@@ -789,7 +884,9 @@ Evaluate whether the condition is met and provide brief reasoning."""
             Generated notification message string.
         """
         try:
-            llm = create_model("gpt-4o-mini").bind(temperature=0.7)  # Slightly creative for message generation
+            llm = create_model(get_default_fast_model() or require_default_model()).bind(
+                temperature=0.7
+            )  # Slightly creative for message generation
             structured_llm = llm.with_structured_output(GeneratedMessage)
 
             # Cost tracking callback (if cost logger is available)
@@ -853,7 +950,10 @@ Create a brief, actionable message (1-2 sentences) that a user would want to rec
             "description": cfg_version.get("description", ""),
             "system_prompt": cfg_version.get("system_prompt", ""),
             "mcp_tools": cfg_version.get("mcp_tools") or [],
-            "model": cfg_version.get("model") or get_resolved_default_model(),
+            # Prefer effective_model: the backend (annotate_models) resolves a tier-bound config
+            # (model is None, model_tier set) to its current alias here, so a tier-bound sub-agent
+            # honors its tier instead of silently falling back to the standard default.
+            "model": cfg_version.get("effective_model") or cfg_version.get("model") or require_default_model(),
             "agent_url": cfg_version.get("agent_url"),
             "enable_thinking": cfg_version.get("enable_thinking", False),
             "thinking_level": cfg_version.get("thinking_level"),
@@ -962,15 +1062,27 @@ Create a brief, actionable message (1-2 sentences) that a user would want to rec
         Returns:
             agent_message (str | None)
         """
+        # Ensure the document store is ready before building the graph (which binds self.store).
+        # Idempotent and cheap once set up; on a cold start it retries until the gateway/embedding
+        # default resolves, so semantic memory self-heals without a restart.
+        await self.ensure_store_ready()
+
         system_prompt: str = sub_agent_cfg["system_prompt"]
         mcp_tool_names: list[str] = sub_agent_cfg["mcp_tools"]
         model_name: str = sub_agent_cfg["model"]
 
         # Validate and create LLM via agent-common model factory
         if not is_valid_model(model_name):
+            default_model = get_default_model()
+            if not default_model:
+                raise ValueError(
+                    f"Invalid model '{model_name}' in sub-agent config for job {scheduled_job_id} "
+                    "and no chat default is configured on the gateway to fall back to.",
+                )
             logger.warning(
-                f"Invalid model '{model_name}' in sub-agent config for job {scheduled_job_id} — defaulting to {get_resolved_default_model()}",
+                f"Invalid model '{model_name}' in sub-agent config for job {scheduled_job_id} — defaulting to {default_model}",
             )
+            model_name = default_model
 
         # Determine thinking level
         thinking_level = None
@@ -1022,8 +1134,8 @@ Create a brief, actionable message (1-2 sentences) that a user would want to rec
                     base_backend=StateBackend(),
                 )
 
-            # Determine structured output strategy (mutates tools in-place for Bedrock+thinking)
-            response_format = get_response_format(llm, tools, thinking_enabled=bool(thinking_level))
+            # Determine structured output strategy (mutates tools in-place for Bedrock/Anthropic+thinking)
+            response_format = get_response_format(model_name, tools, thinking_enabled=bool(thinking_level))
 
             graph = build_sub_agent_graph(
                 model=llm,
@@ -1070,7 +1182,10 @@ Create a brief, actionable message (1-2 sentences) that a user would want to rec
             #   {"type": "values", "ns": (), "data": <state snapshot>}
             # We consume all and use the final state.
             final_state = None
-            async for part in graph.astream({"messages": messages}, config=config, stream_mode="values", version="v2"):
+            async for part in watch_stream(
+                graph.astream({"messages": messages}, config=config, stream_mode="values", version="v2"),
+                label="agent-runner",
+            ):
                 if part["type"] == "values":
                     final_state = part["data"]
                 # Future: could yield progress events here for streaming execution

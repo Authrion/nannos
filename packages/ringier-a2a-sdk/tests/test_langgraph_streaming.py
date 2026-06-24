@@ -139,7 +139,7 @@ class TestStreamImplRegularTextStreaming:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [final_msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_messages_part(chunk1)
@@ -183,7 +183,7 @@ class TestStreamImplRegularTextStreaming:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [final_msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_messages_part(chunk)
@@ -220,7 +220,7 @@ class TestStreamImplFinalResponseSchema:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [final_msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_updates_part("model", {"messages": [final_msg]})
@@ -266,7 +266,7 @@ class TestStreamImplFinalResponseSchema:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [final_msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_messages_part(tc_chunk_1)
@@ -301,7 +301,7 @@ class TestStreamImplFinalResponseSchema:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [final_msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_updates_part("model", {"messages": [final_msg]})
@@ -337,7 +337,7 @@ class TestStreamImplFinalResponseSchema:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [regular_msg, final_msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             # Only yield a regular message, no FinalResponseSchema in stream
@@ -379,7 +379,7 @@ class TestStreamImplTodos:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [final_msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_updates_part("tools", todo_data)
@@ -411,7 +411,7 @@ class TestStreamImplInterrupts:
         state = MagicMock()
         state.interrupts = [MagicMock()]  # Non-empty → interrupt
         state.values = {}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             return
@@ -439,7 +439,7 @@ class TestStreamImplContentFallback:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_updates_part("model", {"messages": [msg]})
@@ -461,7 +461,7 @@ class TestStreamImplContentFallback:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": []}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             return
@@ -523,7 +523,7 @@ class TestStreamImplErrorHandling:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [msg_with_schema]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_updates_part("model", {"messages": [msg_with_schema]})
@@ -559,7 +559,7 @@ class TestStreamImplBufferFlush:
         state = MagicMock()
         state.interrupts = []
         state.values = {"messages": [final_msg]}
-        graph.get_state.return_value = state
+        graph.aget_state = AsyncMock(return_value=state)
 
         async def fake_astream(*a, **kw):
             yield _v2_messages_part(chunk)

@@ -13,6 +13,7 @@ Graph creation with actual models should be tested in integration tests.
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from agent_common.middleware.prompt_caching import LiteLLMPromptCachingMiddleware
 from agent_common.middleware.storage_paths_middleware import StoragePathsInstructionMiddleware
 from langchain.agents.middleware import ToolRetryMiddleware
 from langchain_aws import ChatBedrockConverse
@@ -45,7 +46,6 @@ def mock_config():
     config.POSTGRES_PORT = "5432"
     config.POSTGRES_SCHEMA = "public"
     config.POSTGRES_DB = "testdb"
-    config.get_bedrock_region = Mock(return_value="eu-central-1")
     # Add missing method mocks
     config.get_azure_deployment = Mock(return_value="gpt-4o")
     config.get_azure_model_name = Mock(return_value="gpt-4o")
@@ -117,7 +117,10 @@ class TestMiddlewareStack:
         assert stack[0].__class__.__name__ == "ConversationContextToolsMiddleware"
         assert isinstance(stack[1], DynamicToolDispatchMiddleware)
         assert isinstance(stack[2], StoragePathsInstructionMiddleware)
-        assert isinstance(stack[3], BedrockPromptCachingMiddleware)
+        # Provider-agnostic caching under the gateway: the cache breakpoint
+        # is injected as an OpenAI-format cache_control block that LiteLLM translates
+        # per provider, replacing the old Bedrock-only BedrockPromptCachingMiddleware.
+        assert isinstance(stack[3], LiteLLMPromptCachingMiddleware)
         # stack[4] = SteeringMiddleware (from ringier_a2a_sdk)
         assert stack[4].__class__.__name__ == "SteeringMiddleware"
         assert isinstance(stack[5], UserPreferencesMiddleware)
@@ -142,19 +145,27 @@ class TestMiddlewareStack:
 
     @patch("app.core.graph_factory._has_aws_credentials", return_value=True)
     @patch("langgraph.store.postgres.aio.AsyncPostgresStore")
-    def test_middleware_stack_excludes_bedrock_caching_for_non_bedrock_models(
-        self, mock_pg_store, _mock_creds, mock_config
-    ):
-        """BedrockPromptCachingMiddleware must NOT be attached for non-Bedrock models."""
+    def test_middleware_stack_caching_is_provider_agnostic(self, mock_pg_store, _mock_creds, mock_config):
+        """Caching is provider-agnostic under the gateway: the LiteLLM caching middleware
+        is attached for every model (no Bedrock gate), and the legacy Bedrock-only
+        middleware is gone.
+
+        The cache marker is an OpenAI-format cache_control block that LiteLLM translates
+        to the provider's native format (or ignores for non-caching providers),
+        so the stack is identical regardless of model type.
+        """
         factory = GraphFactory(config=mock_config)
 
         # Non-Bedrock model (e.g. OpenAI / Gemini): plain Mock that is NOT a ChatBedrockConverse
         non_bedrock_model = Mock()
         stack = factory._create_middleware_stack(model=non_bedrock_model)
 
+        # The legacy Bedrock-only caching middleware must be fully removed.
         assert not any(isinstance(m, BedrockPromptCachingMiddleware) for m in stack)
-        # One fewer middleware than the Bedrock case (cache middleware skipped)
-        assert len(stack) == 16
+        # LiteLLM caching is present even for non-Bedrock models...
+        assert any(isinstance(m, LiteLLMPromptCachingMiddleware) for m in stack)
+        # ...and the stack matches the Bedrock case (no provider-conditional branch).
+        assert len(stack) == 17
 
     @patch("app.core.graph_factory._has_aws_credentials", return_value=True)
     @patch("langgraph.store.postgres.aio.AsyncPostgresStore")
@@ -220,3 +231,92 @@ class TestStaticTools:
         assert "generate_presigned_url" in tool_names
         assert "get_current_time" in tool_names
         assert "copy_file" in tool_names
+
+
+class TestStoreSelfHeal:
+    """The document store resolves embeddings lazily and self-heals instead of latching off
+    on a cold start (see GraphFactory._resolve_store_mode / ensure_store_ready / get_graph)."""
+
+    _MF = "agent_common.core.model_factory"
+
+    def test_resolve_mode_indexed_when_embeddings_available(self, mock_config):
+        factory = GraphFactory(config=mock_config)
+        with patch(f"{self._MF}.create_embeddings", return_value=Mock()):
+            factory._resolve_store_mode()
+        assert factory._store_mode == "indexed"
+        assert factory._embeddings_model is not None
+
+    def test_resolve_mode_absent_when_no_default_configured(self, mock_config):
+        from agent_common.core.model_factory import EmbeddingModelNotConfigured
+
+        factory = GraphFactory(config=mock_config)
+        with (
+            patch(f"{self._MF}.create_embeddings", side_effect=EmbeddingModelNotConfigured("none")),
+            patch(f"{self._MF}.embedding_default_known_absent", return_value=True),
+        ):
+            factory._resolve_store_mode()
+        assert factory._store_mode == "absent"  # stable, cacheable
+
+    def test_resolve_mode_transient_on_cold_fetch(self, mock_config):
+        from agent_common.core.model_factory import EmbeddingModelNotConfigured
+
+        factory = GraphFactory(config=mock_config)
+        # EmbeddingModelNotConfigured but the defaults fetch hasn't confirmed absence → transient.
+        with (
+            patch(f"{self._MF}.create_embeddings", side_effect=EmbeddingModelNotConfigured("cold")),
+            patch(f"{self._MF}.embedding_default_known_absent", return_value=False),
+        ):
+            factory._resolve_store_mode()
+        assert factory._store_mode is None  # retry, do not latch
+
+    def test_transient_store_returns_none_without_building(self, mock_config):
+        factory = GraphFactory(config=mock_config)
+        with patch.object(factory, "_resolve_store_mode"):  # leaves _store_mode None
+            assert factory.store is None
+        assert factory._store is None  # nothing cached on a transient miss
+
+    def test_get_graph_does_not_cache_when_store_transient(self, mock_config):
+        factory = GraphFactory(config=mock_config)
+        factory._store_mode = None  # transient
+        sentinel = Mock()
+        with patch.object(factory, "_create_graph", return_value=sentinel) as mk:
+            g = factory.get_graph("claude-sonnet-4.5")
+        assert g is sentinel
+        assert factory._graphs == {}  # not cached → rebuilt once the store resolves
+        # A second call rebuilds rather than serving a stale store-less graph.
+        with patch.object(factory, "_create_graph", return_value=sentinel) as mk2:
+            factory.get_graph("claude-sonnet-4.5")
+        assert mk.called and mk2.called
+
+    def test_get_graph_caches_when_store_decided(self, mock_config):
+        factory = GraphFactory(config=mock_config)
+        factory._store_mode = "absent"  # decided & stable
+        sentinel = Mock()
+        with patch.object(factory, "_create_graph", return_value=sentinel):
+            factory.get_graph("claude-sonnet-4.5")
+        assert ("claude-sonnet-4.5", None) in factory._graphs
+
+    @pytest.mark.asyncio
+    async def test_ensure_store_ready_rebuilds_when_default_appears(self, mock_config):
+        """absent → indexed self-heal: when an embedding default is configured later,
+        the cached store-less store and graphs are dropped so the next build is indexed."""
+        from agent_common.core.model_factory import EmbeddingModelNotConfigured
+
+        factory = GraphFactory(config=mock_config)
+        factory._store_mode = "absent"
+        factory._store_setup_complete = True
+        factory._store = Mock()
+        factory._graphs[("claude-sonnet-4.5", None)] = Mock()
+
+        with (
+            patch(f"{self._MF}.is_embeddings_configured", return_value=True),
+            # After the reset, resolution is still mid-flight here → returns before touching the DB.
+            patch(f"{self._MF}.create_embeddings", side_effect=EmbeddingModelNotConfigured("racing")),
+            patch(f"{self._MF}.embedding_default_known_absent", return_value=False),
+        ):
+            await factory.ensure_store_ready()
+
+        assert factory._graphs == {}  # cache busted
+        assert factory._store is None
+        assert factory._store_setup_complete is False
+        assert factory._store_mode is None

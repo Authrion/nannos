@@ -16,7 +16,7 @@ set -euo pipefail
 #
 # Flags:
 #   --debug   Start Python services with debugpy for VS Code debugging
-#             (ports: backend=5678, orchestrator=5679, creator=5680,
+#             (ports: backend=5678, orchestrator=5679,
 #              runner=5682, voice-agent=5683)
 #
 # The base URL should point to the root of your LLM server — /v1 is appended
@@ -36,7 +36,7 @@ set -euo pipefail
 #
 # Cloud LLM providers (fetched from SSM when AWS_PROFILE is set):
 #   AZURE_OPENAI_API_KEY     - Azure OpenAI API key
-#   AZURE_OPENAI_ENDPOINT    - Azure OpenAI endpoint URL
+#   AZURE_API_BASE    - Azure OpenAI endpoint URL
 #   GCP_KEY                  - GCP service account key JSON (Vertex AI / Gemini)
 #   GCP_PROJECT_ID           - GCP project ID (defaults to "rcplus-alloy-gcp")
 #   GCP_LOCATION             - GCP region (defaults to "global")
@@ -215,6 +215,7 @@ printf "${CYAN}│${RESET}                                                      
 printf "${CYAN}│${RESET}  Infrastructure:                                       ${CYAN}│${RESET}\n"
 printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} PostgreSQL (console)       ${DIM}(Docker, localhost:5401)${RESET}\n"
 printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} PostgreSQL (docstore)      ${DIM}(Docker, localhost:5402; also holds checkpoints)${RESET}\n"
+printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} Model Gateway   ${DIM}(LiteLLM proxy, Docker, localhost:${LLM_GATEWAY_PORT:-4000}; tab + logs/litellm.log)${RESET}\n"
 if [[ "$_OIDC_MODE" == "local" ]]; then
   printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} Keycloak        ${DIM}(Docker, localhost:8180)${RESET}\n"
 else
@@ -231,7 +232,7 @@ printf "${CYAN}│${RESET}                                                      
 if [[ -n "$_DEBUG_MODE" ]]; then
   printf "${CYAN}│${RESET}  Debugging:                                            ${CYAN}│${RESET}\n"
   printf "${CYAN}│${RESET}    ${GREEN}✓${RESET} debugpy enabled ${DIM}(attach via VS Code launch.json)${RESET}\n"
-  printf "${CYAN}│${RESET}    ${DIM}  backend=5678 orchestrator=5679 creator=5680${RESET}\n"
+  printf "${CYAN}│${RESET}    ${DIM}  backend=5678 orchestrator=5679${RESET}\n"
   printf "${CYAN}│${RESET}    ${DIM}  runner=5682 voice-agent=5683${RESET}\n"
   printf "${CYAN}│${RESET}                                                        ${CYAN}│${RESET}\n"
 fi
@@ -337,7 +338,7 @@ fi
 
 # ── AWS secrets & cloud providers ──
 AZURE_OPENAI_API_KEY="${AZURE_OPENAI_API_KEY:-}"
-AZURE_OPENAI_ENDPOINT="${AZURE_OPENAI_ENDPOINT:-}"
+AZURE_API_BASE="${AZURE_API_BASE:-}"
 AWS_BEDROCK_REGION="${AWS_BEDROCK_REGION:-}"
 GCP_KEY="${GCP_KEY:-}"
 GCP_PROJECT_ID="${GCP_PROJECT_ID:-}"
@@ -360,7 +361,7 @@ if [[ "$_HAS_AWS" == true ]]; then
   log "Fetching secrets from AWS SSM (profile: $AWS_PROFILE)..."
 
   if AZURE_OPENAI_API_KEY=$(aws ssm get-parameter --name /nannos/openai-api-key-chatgpt-4o --output json --with-decryption 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['Parameter']['Value'])" 2>/dev/null); then
-    AZURE_OPENAI_ENDPOINT="https://rcplus-alloy-eu-prod.openai.azure.com"
+    AZURE_API_BASE="https://rcplus-alloy-eu-prod.openai.azure.com"
     ok "Azure OpenAI configured"
   else
     warn "Could not fetch AZURE_OPENAI_API_KEY from SSM — Azure OpenAI disabled"
@@ -441,7 +442,6 @@ fi
 _OIDC_ISSUER="http://localhost:8180/realms/nannos"
 _OIDC_SECRET_BACKEND="local-secret"
 _OIDC_SECRET_ORCHESTRATOR="local-secret"
-_OIDC_SECRET_CREATOR="local-secret"
 _OIDC_SECRET_ADMIN="local-secret"
 _OIDC_SECRET_AGENT_RUNNER="local-secret"
 _KC_BASE_URL="http://localhost:8180"
@@ -464,12 +464,6 @@ if [[ "$_OIDC_MODE" == "remote-ssm" ]]; then
     _OIDC_SECRET_ORCHESTRATOR="$_secret"
   else
     err "Failed to fetch orchestrator OIDC secret from SSM"
-  fi
-
-  if _secret=$(aws ssm get-parameter --name /nannos/keycloak/agent-creator-secret --output json --with-decryption 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['Parameter']['Value'])" 2>/dev/null); then
-    _OIDC_SECRET_CREATOR="$_secret"
-  else
-    err "Failed to fetch agent-creator OIDC secret from SSM"
   fi
 
   if _secret=$(aws ssm get-parameter --name /nannos/keycloak/nannos-admin-secret --output json --with-decryption 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['Parameter']['Value'])" 2>/dev/null); then
@@ -500,7 +494,6 @@ elif [[ "$_OIDC_MODE" == "remote-manual" ]]; then
   fi
   _OIDC_SECRET_BACKEND="$_shared_secret"
   _OIDC_SECRET_ORCHESTRATOR="$_shared_secret"
-  _OIDC_SECRET_CREATOR="$_shared_secret"
   _OIDC_SECRET_ADMIN="$_shared_secret"
   _OIDC_SECRET_AGENT_RUNNER="$_shared_secret"
   ok "OIDC configured with shared secret"
@@ -645,7 +638,7 @@ if [[ -z "$KC_ADMIN_TOKEN" ]]; then
   err "Failed to obtain Keycloak admin token after retries. Check: docker compose logs keycloak"
 fi
 
-for CLIENT_ID in agent-console orchestrator agent-creator nannos-admin; do
+for CLIENT_ID in agent-console orchestrator nannos-admin; do
   # Get the internal UUID for this client
   CLIENT_UUID=$(curl -sf -H "Authorization: Bearer $KC_ADMIN_TOKEN" \
     "http://localhost:8180/admin/realms/nannos/clients?clientId=$CLIENT_ID" \
@@ -708,7 +701,7 @@ log "Installing Python dependencies..."
 cd "$ROOT_DIR"
 
 # Sync all Python packages in parallel
-for pkg in orchestrator-agent agent-creator agent-runner console-backend soffice-worker; do
+for pkg in orchestrator-agent agent-runner console-backend soffice-worker; do
   (cd "packages/$pkg" && uv sync --quiet) &
 done
 (cd "packages/voice-agent" && uv sync --quiet) &
@@ -719,6 +712,147 @@ log "Installing frontend dependencies..."
 cd "$ROOT_DIR/packages/console-frontend"
 npm install --silent 2>/dev/null
 ok "Frontend dependencies installed"
+
+# ─── 7b. Local Model Gateway (LiteLLM proxy) ───────────────────────
+# Gateway-only architecture: all LLM calls route through the proxy,
+# there is no per-provider fallback. Auto-launch a local proxy fronting whatever
+# creds / local LLM are available, and point the services at it.
+LLM_GATEWAY_PORT="${LLM_GATEWAY_PORT:-4000}"
+export LLM_GATEWAY_URL="http://localhost:${LLM_GATEWAY_PORT}"
+export LLM_GATEWAY_API_KEY="sk-nannos-local"
+# Master key for the proxy management API (/model/*). Locally it equals the app key;
+# in real envs they differ (master key only on proxy + console-backend).
+# Exported so console-backend (launched via mprocs below) can register/list models.
+export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-nannos-local}"
+# Shared secret for proxy → console-backend cost ingestion. Exported so console-backend
+# (launched via mprocs below) accepts it on /api/v1/usage/gateway-batch-log.
+export GATEWAY_INGEST_TOKEN="${GATEWAY_INGEST_TOKEN:-sk-nannos-local-ingest}"
+# Pinned to match the prod base image (packages/litellm-proxy/Dockerfile) so local
+# reproduces prod's Vertex region-resolution behavior. Override with LITELLM_IMAGE.
+_LITELLM_IMAGE="${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.89.2@sha256:713e2a036aecc8f2cb24cdf0bdeffd893b4f37190d4b21eb9e26ac648939c67a}"
+_GW_CONTAINER="nannos-litellm-proxy-local"
+
+log "Starting local Model Gateway (LiteLLM proxy) on :${LLM_GATEWAY_PORT}..."
+
+# Local gateway DB: reuse the console Postgres with a dedicated `litellm` schema
+# (mirrors the prod shared-RDS pattern). store_model_in_db lets the console register
+# models at runtime — without it /model/new returns "No DB Connected". The container
+# reaches the host Postgres (published on :5401) via host.docker.internal.
+export LITELLM_DATABASE_URL="${LITELLM_DATABASE_URL:-postgresql://postgres:password@host.docker.internal:5401/console?schema=litellm}"
+# Run from $LOCAL_DEV_DIR — that's where the compose project lives (cwd has since
+# moved to a package dir, so `docker compose` must be pointed back at it).
+( cd "$LOCAL_DEV_DIR" && docker compose exec -T postgres-console psql -U postgres -d console \
+  -c "CREATE SCHEMA IF NOT EXISTS litellm;" ) >/dev/null 2>&1 \
+  && ok "Gateway DB schema 'litellm' ready (console Postgres)" \
+  || warn "Could not pre-create the litellm schema; the proxy will attempt it on boot"
+
+# Generate the local gateway config on the fly (ephemeral, never committed —
+# config is deployment-specific). The settings block (callbacks, store_model_in_db,
+# db, master key) is always managed here; the model_list is stack-specific so it's
+# sourced from $LITELLM_LOCAL_MODELS_FILE when set, else a built-in dev default.
+_GW_CONFIG=$(mktemp /tmp/nannos-litellm-XXXXXX).yaml
+cat > "$_GW_CONFIG" <<'EOF'
+litellm_settings:
+  callbacks: custom_logger.proxy_handler_instance
+  # Total per-request bound for non-streaming calls; streaming hangs are caught by the
+  # client-side inter-chunk watchdog (Bedrock ignores stream_timeout).
+  request_timeout: 600
+  drop_params: true
+  # Gateway-native retries on transient failures/timeouts, replacing the
+  # per-call boto3 retries dropped in the migration. Matches the k8s ConfigMap.
+  num_retries: 2
+  # Emit structured (JSON) logs instead of colorized text, so the proxy's output
+  # is parseable by log aggregators (matches the k8s ConfigMap).
+  json_logs: true
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  store_model_in_db: true
+  database_url: os.environ/LITELLM_DATABASE_URL
+EOF
+
+# model_list: deployment-specific (model ids, regions, provider deployments), so it lives in
+# a gitignored YAML file rather than this committed script. Resolution order:
+#   1. $LITELLM_LOCAL_MODELS_FILE if set, else ./litellm-local-models.yaml (gitignored)
+#   2. ./litellm-local-models.example.yaml (committed template) as a fallback
+#   3. empty model_list (register models at runtime via the Model Gateway admin UI)
+_LITELLM_MODELS_FILE="${LITELLM_LOCAL_MODELS_FILE:-$ROOT_DIR/litellm-local-models.yaml}"
+if [[ -f "$_LITELLM_MODELS_FILE" ]]; then
+  cat "$_LITELLM_MODELS_FILE" >> "$_GW_CONFIG"
+  ok "Gateway model_list from ${_LITELLM_MODELS_FILE}"
+elif [[ -f "$ROOT_DIR/litellm-local-models.example.yaml" ]]; then
+  cat "$ROOT_DIR/litellm-local-models.example.yaml" >> "$_GW_CONFIG"
+  warn "No litellm-local-models.yaml — using the example template. Copy it and customize:"
+  warn "  cp litellm-local-models.example.yaml litellm-local-models.yaml"
+else
+  printf 'model_list: []\n' >> "$_GW_CONFIG"
+  warn "No local model_list — register models at runtime via the Model Gateway admin UI."
+fi
+if [[ "$_HAS_LOCAL_LLM" == true ]]; then
+  # The container reaches the host LLM server via host.docker.internal.
+  _GW_LOCAL_BASE="${OPENAI_COMPATIBLE_BASE_URL//localhost/host.docker.internal}"
+  _GW_LOCAL_BASE="${_GW_LOCAL_BASE//127.0.0.1/host.docker.internal}"
+  _GW_LOCAL_BASE="${_GW_LOCAL_BASE%/}"
+  [[ "$_GW_LOCAL_BASE" == */v1 ]] || _GW_LOCAL_BASE="${_GW_LOCAL_BASE}/v1"
+  cat >> "$_GW_CONFIG" <<EOF
+  - model_name: local
+    litellm_params:
+      model: openai/${OPENAI_COMPATIBLE_MODEL:-default}
+      api_base: ${_GW_LOCAL_BASE}
+      api_key: ${OPENAI_COMPATIBLE_API_KEY:-not-needed}
+      max_retries: 0
+EOF
+  ok "Gateway: local model '${OPENAI_COMPATIBLE_MODEL:-default}' → ${_GW_LOCAL_BASE}"
+fi
+
+# When using an AWS profile, export its (temporary) credentials so the container
+# can reach Bedrock — the SDK profile/SSO chain isn't visible inside the container.
+_GW_AWS_ENV=()
+if [[ "$_HAS_AWS" == true ]]; then
+  if _CREDS=$(aws configure export-credentials --profile "$AWS_PROFILE" --format env 2>/dev/null); then
+    eval "$_CREDS"
+    _GW_AWS_ENV=(-e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN)
+  else
+    warn "Could not export AWS credentials for the gateway — Bedrock models may not work locally"
+  fi
+fi
+
+docker rm -f "$_GW_CONTAINER" >/dev/null 2>&1 || true
+docker run -d --name "$_GW_CONTAINER" \
+  -p "${LLM_GATEWAY_PORT}:4000" \
+  --add-host=host.docker.internal:host-gateway \
+  -v "$_GW_CONFIG:/etc/litellm/config.yaml:ro" \
+  -v "$ROOT_DIR/packages/litellm-proxy/custom_logger.py:/etc/litellm/custom_logger.py:ro" \
+  -e PYTHONPATH=/etc/litellm \
+  -e LITELLM_MASTER_KEY="$LLM_GATEWAY_API_KEY" \
+  -e LITELLM_DATABASE_URL="$LITELLM_DATABASE_URL" \
+  -e UI_USERNAME="${LITELLM_UI_USERNAME:-admin}" \
+  -e UI_PASSWORD="${LITELLM_UI_PASSWORD:-sk-nannos-local}" \
+  -e AWS_BEDROCK_REGION="${AWS_BEDROCK_REGION:-eu-central-1}" \
+  -e AWS_REGION="${AWS_BEDROCK_REGION:-eu-central-1}" \
+  "${_GW_AWS_ENV[@]}" \
+  -e AZURE_API_BASE="${AZURE_API_BASE:-}" \
+  -e AZURE_OPENAI_API_KEY="${AZURE_OPENAI_API_KEY:-}" \
+  -e AZURE_AI_API_BASE="${AZURE_AI_API_BASE:-}" \
+  -e AZURE_AI_API_KEY="${AZURE_AI_API_KEY:-}" \
+  -e GCP_PROJECT_ID="${GCP_PROJECT_ID:-}" \
+  -e GCP_KEY="${GCP_KEY:-}" \
+  -e DEFAULT_VERTEXAI_LOCATION="${DEFAULT_VERTEXAI_LOCATION:-eu}" \
+  -e CONSOLE_BACKEND_URL="http://host.docker.internal:5001" \
+  -e GATEWAY_INGEST_TOKEN="$GATEWAY_INGEST_TOKEN" \
+  "$_LITELLM_IMAGE" --config /etc/litellm/config.yaml --port 4000 >/dev/null
+
+# Wait for the gateway to come up.
+for _i in $(seq 1 30); do
+  if curl -sf "http://localhost:${LLM_GATEWAY_PORT}/health/liveliness" >/dev/null 2>&1; then
+    ok "Model Gateway ready at $LLM_GATEWAY_URL"
+    ok "  LiteLLM admin UI: ${LLM_GATEWAY_URL}/ui (user: ${LITELLM_UI_USERNAME:-admin} / pass: ${LITELLM_UI_PASSWORD:-sk-nannos-local})"
+    break
+  fi
+  if [[ "$_i" == "30" ]]; then
+    err "Model Gateway did not become ready. Check: docker logs $_GW_CONTAINER"
+  fi
+  sleep 2
+done
 
 # ─── 8. Launch services via mprocs ─────────────────────────────────
 
@@ -732,8 +866,11 @@ _LOG_DIR="$ROOT_DIR/logs"
 mkdir -p "$_LOG_DIR"
 
 # ── Resolve optional env vars ──
-export OPENAI_COMPATIBLE_BASE_URL="${OPENAI_COMPATIBLE_BASE_URL:-}"
-export OPENAI_COMPATIBLE_MODEL="${OPENAI_COMPATIBLE_MODEL:-}"
+# OPENAI_COMPATIBLE_* are gateway-config inputs only (a `local` model_list alias, see
+# above) — they're NOT exported to the services, which reach the local model through the
+# gateway like any other provider. Kept as plain shell vars for the status line.
+OPENAI_COMPATIBLE_BASE_URL="${OPENAI_COMPATIBLE_BASE_URL:-}"
+OPENAI_COMPATIBLE_MODEL="${OPENAI_COMPATIBLE_MODEL:-}"
 export MCP_GATEWAY_URL="${MCP_GATEWAY_URL:-}"
 export MCP_GATEWAY_CLIENT_ID="${MCP_GATEWAY_CLIENT_ID:-gatana}"
 export LANGSMITH_TRACING="${LANGSMITH_TRACING:-false}"
@@ -800,7 +937,6 @@ if [[ -n "$_DEBUG_MODE" ]]; then
   _DEBUG_LINES="  Debugging (debugpy):
     backend .......... localhost:5678
     orchestrator ..... localhost:5679
-    creator .......... localhost:5680
     runner ........... localhost:5682
     voice-agent ...... localhost:5683
 "
@@ -829,10 +965,10 @@ cat <<'EOF'
     Console ........... http://localhost:5173
     Backend API ....... http://localhost:5001
     Orchestrator ...... http://localhost:10001
-    Agent Creator ..... http://localhost:8080
     Agent Runner ...... http://localhost:5005
     Voice Agent ....... http://localhost:8002
     soffice-worker .... http://localhost:8090
+    Model Gateway ..... $LLM_GATEWAY_URL  (LiteLLM proxy — see the 'litellm' tab)
     Keycloak .......... $_KC_BASE_URL
     PostgreSQL (console)       localhost:5401
     PostgreSQL (docstore)      localhost:5402  (also holds checkpoints)
@@ -874,9 +1010,16 @@ procs:
     shell: "bash $_INFO_SCRIPT"
     stop: "SIGKILL"
 
+  litellm:
+    # The Model Gateway runs as a detached Docker container (started in §7b),
+    # so it has no foreground process of its own. Stream its container logs into
+    # a tab + logs/litellm.log so it's visible alongside the other services.
+    shell: "docker logs -f $_GW_CONTAINER 2>&1 | tee $_LOG_DIR/litellm.log"
+    stop: "SIGKILL"
+
   console-backend:
     cwd: "$ROOT_DIR/packages/console-backend"
-    shell: "uv run python${_DEBUG_MODE:+ -m debugpy --listen 0.0.0.0:5678} -m uvicorn app:asgi_app --host 127.0.0.1 --port 5001 --reload 2>&1 | tee $_LOG_DIR/console-backend.log"
+    shell: "uv run python${_DEBUG_MODE:+ -m debugpy --listen 0.0.0.0:5678} -m uvicorn app:asgi_app --host 0.0.0.0 --port 5001 --reload 2>&1 | tee $_LOG_DIR/console-backend.log"
     env:
       FIRST_USER_IS_ADMIN: "true"
       OIDC_ISSUER: "$_OIDC_ISSUER"
@@ -900,26 +1043,21 @@ procs:
       SCHEDULER_CLAIM_LIMIT: "10"
       AGENT_RUNNER_URL: "http://localhost:5005"
       LOG_LEVEL: "INFO"
-      OPENAI_COMPATIBLE_BASE_URL: "$OPENAI_COMPATIBLE_BASE_URL"
       AZURE_OPENAI_API_KEY: "$AZURE_OPENAI_API_KEY"
-      AZURE_OPENAI_ENDPOINT: "$AZURE_OPENAI_ENDPOINT"
-      BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+      AZURE_API_BASE: "$AZURE_API_BASE"
       AWS_BEDROCK_REGION: "$AWS_BEDROCK_REGION"
       FILES_S3_BUCKET: "$FILES_S3_BUCKET"
       OBJECT_STORAGE_TYPE: "$OBJECT_STORAGE_TYPE"
       LOCAL_STORAGE_BASE_URL: "$LOCAL_STORAGE_BASE_URL"
       LOCAL_STORAGE_PATH: "$LOCAL_STORAGE_PATH"
       VOICE_AGENT_URL: "http://localhost:8002"
-      AGENT_CREATOR_URL: "http://localhost:8080"
       CATALOG_VECTOR_BUCKET_NAME: "$CATALOG_VECTOR_BUCKET_NAME"
       CATALOG_THUMBNAILS_S3_BUCKET: "$CATALOG_THUMBNAILS_S3_BUCKET"
       CATALOG_VECTOR_STORE_BACKEND: "s3_vectors"
-      CATALOG_SUMMARIZATION_MODEL_ID: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+      CATALOG_SUMMARIZATION_MODEL_ID: "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
       GOOGLE_OAUTH_CLIENT_ID: "$GOOGLE_OAUTH_CLIENT_ID"
       GOOGLE_OAUTH_CLIENT_SECRET: "$GOOGLE_OAUTH_CLIENT_SECRET"
       GOOGLE_OAUTH_REDIRECT_URI: "http://localhost:5001/api/v1/catalogs/connect/callback"
-      GCP_KEY: '$GCP_KEY'
-      GCP_PROJECT_ID: "$GCP_PROJECT_ID"
       TWILIO_ACCOUNT_SID: "$TWILIO_ACCOUNT_SID"
       TWILIO_VERIFY_SERVICE_SID: "$TWILIO_VERIFY_SERVICE_SID"
       TWILIO_VERIFY_API_KEY: "$TWILIO_VERIFY_API_KEY"
@@ -949,7 +1087,7 @@ procs:
       CATALOG_VECTOR_BUCKET_NAME: "$CATALOG_VECTOR_BUCKET_NAME"
       CATALOG_THUMBNAILS_S3_BUCKET: "$CATALOG_THUMBNAILS_S3_BUCKET"
       CATALOG_VECTOR_STORE_BACKEND: "s3_vectors"
-      CATALOG_SUMMARIZATION_MODEL_ID: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+      CATALOG_SUMMARIZATION_MODEL_ID: "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
       CATALOG_AUTO_SYNC_ENABLED: "true"
       CATALOG_SYNC_INTERVAL_SECONDS: "86400"
       CATALOG_SYNC_TICK_INTERVAL_SECONDS: "300"
@@ -957,13 +1095,9 @@ procs:
       CATALOG_WORKER_POLL_INTERVAL: "5"
       GOOGLE_OAUTH_CLIENT_ID: "$GOOGLE_OAUTH_CLIENT_ID"
       GOOGLE_OAUTH_CLIENT_SECRET: "$GOOGLE_OAUTH_CLIENT_SECRET"
-      GCP_KEY: '$GCP_KEY'
-      GCP_PROJECT_ID: "$GCP_PROJECT_ID"
       AZURE_OPENAI_API_KEY: "$AZURE_OPENAI_API_KEY"
-      AZURE_OPENAI_ENDPOINT: "$AZURE_OPENAI_ENDPOINT"
+      AZURE_API_BASE: "$AZURE_API_BASE"
       AWS_BEDROCK_REGION: "$AWS_BEDROCK_REGION"
-      BEDROCK_MODEL_ID: "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-      OPENAI_COMPATIBLE_BASE_URL: "$OPENAI_COMPATIBLE_BASE_URL"
       LOG_LEVEL: "INFO"
 
   soffice-worker:
@@ -981,7 +1115,6 @@ procs:
       OIDC_CLIENT_ID: "orchestrator"
       OIDC_CLIENT_SECRET: "$_OIDC_SECRET_ORCHESTRATOR"
       ORCHESTRATOR_CLIENT_ID: "orchestrator"
-      AGENT_CLIENT_ID: "agent-creator"
       AGENT_ID: "1"
       AGENT_BASE_URL: "http://localhost:10001"
       CONSOLE_BACKEND_URL: "http://localhost:5001"
@@ -992,8 +1125,6 @@ procs:
       POSTGRES_USER: "postgres"
       POSTGRES_PASSWORD: "password"
       POSTGRES_SCHEMA: "public"
-      OPENAI_COMPATIBLE_BASE_URL: "$OPENAI_COMPATIBLE_BASE_URL"
-      OPENAI_COMPATIBLE_MODEL: "$OPENAI_COMPATIBLE_MODEL"
       MCP_GATEWAY_URL: "$MCP_GATEWAY_URL"
       MCP_GATEWAY_CLIENT_ID: "$MCP_GATEWAY_CLIENT_ID"
       LANGSMITH_TRACING: "$LANGSMITH_TRACING"
@@ -1001,14 +1132,11 @@ procs:
       LANGSMITH_PROJECT: "$LANGSMITH_PROJECT"
       LANGSMITH_ENDPOINT: "$LANGSMITH_ENDPOINT"
       LOG_LEVEL: "INFO"
-      BUDGET_ENABLED: "false"
       USE_SHORT_PROMPTS: "true"
       AZURE_OPENAI_API_KEY: "$AZURE_OPENAI_API_KEY"
-      AZURE_OPENAI_ENDPOINT: "$AZURE_OPENAI_ENDPOINT"
+      AZURE_API_BASE: "$AZURE_API_BASE"
       AWS_BEDROCK_REGION: "$AWS_BEDROCK_REGION"
-      BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
       GCP_KEY: '$GCP_KEY'
-      GCP_PROJECT_ID: "$GCP_PROJECT_ID"
       GCP_LOCATION: "$GCP_LOCATION"
       # Checkpointer reuses the POSTGRES_* connection above (docstore DB / public schema)
       CHECKPOINT_S3_BUCKET_NAME: "$CHECKPOINT_S3_BUCKET_NAME"
@@ -1025,39 +1153,6 @@ procs:
       GATANA_API_KEY: "${GATANA_API_KEY:-}"
       GATANA_ORG_CAPACITY: "${GATANA_ORG_CAPACITY:-}"
 
-  creator:
-    cwd: "$ROOT_DIR/packages/agent-creator"
-    shell: "uv run python${_DEBUG_MODE:+ -m debugpy --listen 0.0.0.0:5680} main.py --host 0.0.0.0 --port 8080 --reload 2>&1 | tee $_LOG_DIR/creator.log"
-    env:
-      OIDC_ISSUER: "$_OIDC_ISSUER"
-      OIDC_CLIENT_ID: "agent-creator"
-      OIDC_CLIENT_SECRET: "$_OIDC_SECRET_CREATOR"
-      ORCHESTRATOR_CLIENT_ID: "orchestrator"
-      AGENT_CLIENT_ID: "agent-creator"
-      AGENT_ID: "1"
-      AGENT_BASE_URL: "http://localhost:8080"
-      CONSOLE_BACKEND_URL: "http://localhost:5001"
-      CONSOLE_FRONTEND_URL: "http://localhost:5173"
-      OPENAI_COMPATIBLE_BASE_URL: "$OPENAI_COMPATIBLE_BASE_URL"
-      OPENAI_COMPATIBLE_MODEL: "$OPENAI_COMPATIBLE_MODEL"
-      LANGSMITH_TRACING: "$LANGSMITH_TRACING"
-      LANGSMITH_API_KEY: "$LANGSMITH_API_KEY"
-      LANGSMITH_PROJECT: "$LANGSMITH_PROJECT"
-      LANGSMITH_ENDPOINT: "$LANGSMITH_ENDPOINT"
-      LOG_LEVEL: "DEBUG"
-      AZURE_OPENAI_API_KEY: "$AZURE_OPENAI_API_KEY"
-      AZURE_OPENAI_ENDPOINT: "$AZURE_OPENAI_ENDPOINT"
-      AWS_BEDROCK_REGION: "$AWS_BEDROCK_REGION"
-      BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-      # Checkpointer reuses POSTGRES_* (docstore DB / public schema), like the other agents
-      POSTGRES_HOST: "localhost"
-      POSTGRES_PORT: "5402"
-      POSTGRES_DB: "docstore"
-      POSTGRES_USER: "postgres"
-      POSTGRES_PASSWORD: "password"
-      POSTGRES_SCHEMA: "public"
-      CHECKPOINT_S3_BUCKET_NAME: "$CHECKPOINT_S3_BUCKET_NAME"
-
   runner:
     cwd: "$ROOT_DIR/packages/agent-runner"
     shell: "uv run python${_DEBUG_MODE:+ -m debugpy --listen 0.0.0.0:5682} main.py --host 0.0.0.0 --port 5005 --reload 2>&1 | tee $_LOG_DIR/runner.log"
@@ -1073,8 +1168,6 @@ procs:
       POSTGRES_USER: "postgres"
       POSTGRES_PASSWORD: "password"
       POSTGRES_SCHEMA: "public"
-      OPENAI_COMPATIBLE_BASE_URL: "$OPENAI_COMPATIBLE_BASE_URL"
-      OPENAI_COMPATIBLE_MODEL: "$OPENAI_COMPATIBLE_MODEL"
       MCP_GATEWAY_URL: "$MCP_GATEWAY_URL"
       MCP_GATEWAY_CLIENT_ID: "$MCP_GATEWAY_CLIENT_ID"
       LANGSMITH_TRACING: "$LANGSMITH_TRACING"
@@ -1083,11 +1176,9 @@ procs:
       LANGSMITH_ENDPOINT: "$LANGSMITH_ENDPOINT"
       LOG_LEVEL: "INFO"
       AZURE_OPENAI_API_KEY: "$AZURE_OPENAI_API_KEY"
-      AZURE_OPENAI_ENDPOINT: "$AZURE_OPENAI_ENDPOINT"
+      AZURE_API_BASE: "$AZURE_API_BASE"
       AWS_BEDROCK_REGION: "$AWS_BEDROCK_REGION"
-      BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
       GCP_KEY: '$GCP_KEY'
-      GCP_PROJECT_ID: "$GCP_PROJECT_ID"
       GCP_LOCATION: "$GCP_LOCATION"
       # Checkpointer reuses the POSTGRES_* connection above (docstore DB / public schema)
       CHECKPOINT_S3_BUCKET_NAME: "$CHECKPOINT_S3_BUCKET_NAME"
