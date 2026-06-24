@@ -188,6 +188,24 @@ Sandbox-enabled agents call `_build_graph()` in every `_astream_impl()` call wit
 
 When a sub-agent has resolved skills AND an inherited backend factory (from orchestrator), the code must **add or replace** the `/skills/` route with the sub-agent's own `SkillsStoreBackend`. The orchestrator's `CompositeBackend` has no `/skills/` route (it doesn't use skills), so this effectively adds the route. This ensures each sub-agent reads its own resolved skills in isolation.
 
+### `_GatewayChatOpenAI` preserves `reasoning_content` (core/model_factory.py)
+
+`create_model()` returns a `ChatOpenAI` **subclass**, not plain `ChatOpenAI`. Reason: `langchain_openai` >= 1.2 targets the official OpenAI spec only and **silently drops** non-standard streaming delta fields — notably `reasoning_content` (and `thinking_blocks`), which our LiteLLM gateway emits for extended-thinking models. Without the subclass the model genuinely reasons (the gateway streams it; LiteLLM spend logs show `reasoning_tokens > 0`) but the reasoning never reaches the app, so no thinking is ever surfaced (the `AIMessageChunk`s are plain `content=str`, `additional_kwargs={}`). See langchain issues #34328 / #35059 — the maintainers' recommended fix is a provider-specific subclass.
+
+`_gateway_chat_openai_cls()` overrides `_convert_chunk_to_generation_chunk` to graft the per-chunk `reasoning_content` back into `additional_kwargs` (additive only; base content/tool-call/usage conversion is untouched). The orchestrator then emits it as a thinking block (orchestrator-agent `agent.py`, reading `additional_kwargs["reasoning_content"]` — NOT the content-block path, since the gateway delivers reasoning as a string delta, not a content block).
+
+**Do NOT** "fix" missing thinking by extracting reasoning from message *content* — it isn't there. And keep the `langchain-openai` pin from floating: the loose `>=0.1.0` constraint is what let `uv` resolve 1.2.x and regress this in the first place.
+
+### Structured-output / tool-call streaming is buffered at the gateway (not token-by-token)
+
+Plain assistant `content` (and `reasoning_content`, via the subclass above) **streams incrementally**. Structured output does **not**: when the final answer is delivered through a structured-response **tool call** (`SubAgentResponseSchema` / `FinalResponseSchema`) or `response_format`/json_schema, the provider/proxy **buffers the entire `tool_use` input and flushes it in one burst** when the call completes. Measured directly against the gateway: 478 tool-argument deltas all arrived in a ~0.2s burst after ~22s of generation with nothing streamed. The app's `StructuredResponseStreamer` + `StreamBuffer` then replay that burst as ~40-char chunks, so the UI shows the answer appear ~all-at-once after a long pause — it only *looks* like streaming.
+
+This is **server-side**, upstream of any client, and confirmed by open upstream issues:
+- LiteLLM [#7374](https://github.com/BerriAI/litellm/issues/7374) — `response_format` streaming returns empty/buffered vs native.
+- langchain [#34328](https://github.com/langchain-ai/langchain/issues/34328) / [#35059](https://github.com/langchain-ai/langchain/issues/35059) — `ChatOpenAI` drops non-standard streamed fields; its converter also ignores the beta `content.delta` structured-stream events (`if chunk.get("type") == "content.delta": return None`).
+
+**Switching langchain client does not help.** A different client (e.g. `langchain-litellm`) pointed at the same proxy receives the same bursted SSE — it can only assemble the deltas the gateway sends, and the gateway sends them all at once. (`langchain-litellm` *would* extract `reasoning_content` natively — a drop-in alternative to `_GatewayChatOpenAI` — but that's a reasoning cleanup, not a streaming fix, and adopting it conflicts with the proxy-routing/cost-attribution design.) The only way to get genuine token-by-token streaming of the final answer is to deliver it as plain `content` instead of a structured-response tool-call field, carrying `task_state`/`include_subagent_output` on a side channel — a deferred protocol change, not a gateway/client tweak.
+
 ## Testing
 
 **Prefer the runTests MCP tool over terminal commands when running tests.**
