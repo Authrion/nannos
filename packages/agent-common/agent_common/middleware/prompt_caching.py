@@ -22,8 +22,23 @@ appends *per-request / per-user* content (user preferences, playbooks). The
 breakpoint lands at the end of the cacheable prefix; volatile content appended
 afterwards stays outside the cache, preserving the prefix match across turns.
 
-The marker is applied to the per-call ``ModelRequest`` only (via
-``request.override``) — it never touches the persisted messages, so
+In addition to the system prefix, this middleware places a **second breakpoint on
+the last message of the conversation** (``cache_conversation``, on by default).
+The system breakpoint alone only caches the static prefix (~a few thousand tokens),
+leaving the growing conversation history — frequently 10k–20k tokens/turn on this
+orchestrator — reprocessed uncached on every turn. The conversation breakpoint
+caches that history incrementally: each turn reads the prior turn's cached prefix
+and writes only the delta, which is the dominant time-to-first-token lever (warm
+TTFT tracks cache coverage almost linearly — ~50% cached ≈ 5s, ~90% cached ≈ 2s).
+This is safe because ``request.messages`` is an append-only prefix here: the
+post-cache middlewares (user-preferences, playbook) append to the *system message*,
+and steering appends persisted ``HumanMessage``s — none rewrite earlier history, so
+the cached prefix stays byte-identical across turns. Because this middleware runs
+before steering, the conversation breakpoint lands on stable pre-steering history;
+anything appended afterwards simply stays outside the cache and is cached next turn.
+
+The markers are applied to the per-call ``ModelRequest`` only (via
+``request.override``) — they never touch the persisted messages, so
 ``cache_control`` does not accumulate in the checkpoint across turns.
 """
 
@@ -60,6 +75,7 @@ class LiteLLMPromptCachingMiddleware(AgentMiddleware):
         *,
         ttl: Literal["5m", "1h"] = "5m",
         min_messages_to_cache: int = 0,
+        cache_conversation: bool = True,
     ) -> None:
         """Initialize the middleware.
 
@@ -69,9 +85,14 @@ class LiteLLMPromptCachingMiddleware(AgentMiddleware):
                 ``ttl`` field (note: Bedrock cachePoint ignores TTL).
             min_messages_to_cache: Minimum message count (system message included)
                 before a breakpoint is injected. ``0`` always caches.
+            cache_conversation: When ``True`` (default), also tag the last message of
+                the conversation so the append-only history is cached incrementally,
+                not just the static system prefix. Providers that don't support
+                multiple cache points silently ignore the extra marker.
         """
         self.ttl = ttl
         self.min_messages_to_cache = min_messages_to_cache
+        self.cache_conversation = cache_conversation
 
     @property
     def _cache_control(self) -> dict[str, str]:
@@ -89,11 +110,20 @@ class LiteLLMPromptCachingMiddleware(AgentMiddleware):
         return len(request.messages) + 1 >= self.min_messages_to_cache
 
     def _apply_caching(self, request: ModelRequest) -> ModelRequest:
-        tagged = _tag_system_message(request.system_message, self._cache_control)
-        if tagged is request.system_message:
-            return request  # nothing to tag (empty/None/unrecognized) or already tagged
-        logger.debug("Injected cache_control breakpoint on system prefix (ttl=%s)", self.ttl)
-        return request.override(system_message=tagged)
+        new_request = request
+
+        tagged_system = _tag_system_message(request.system_message, self._cache_control)
+        if tagged_system is not request.system_message:
+            new_request = new_request.override(system_message=tagged_system)
+            logger.debug("Injected cache_control breakpoint on system prefix (ttl=%s)", self.ttl)
+
+        if self.cache_conversation and request.messages:
+            tagged_messages = _tag_last_message(request.messages, self._cache_control)
+            if tagged_messages is not request.messages:
+                new_request = new_request.override(messages=tagged_messages)
+                logger.debug("Injected cache_control breakpoint on last conversation message")
+
+        return new_request
 
     def wrap_model_call(
         self,
@@ -114,39 +144,63 @@ class LiteLLMPromptCachingMiddleware(AgentMiddleware):
         return await handler(self._apply_caching(request))
 
 
+def _tag_last_block(content: Any, cache_control: dict[str, str]) -> list[Any] | None:
+    """Return new message content with ``cache_control`` on its last block.
+
+    Returns ``None`` (a no-op signal) when there is nothing to tag: empty content,
+    an already-identical marker on the last block, or an unrecognized content shape.
+    A plain-string content is normalized to a single text block carrying the marker.
+    """
+    if isinstance(content, str):
+        if not content:
+            return None
+        return [{"type": "text", "text": content, "cache_control": cache_control}]
+    if isinstance(content, list):
+        if not content:
+            return None
+        last = content[-1]
+        if isinstance(last, dict):
+            if last.get("cache_control") == cache_control:
+                return None  # idempotent: already tagged this turn
+            return [*content[:-1], {**last, "cache_control": cache_control}]
+        if isinstance(last, str):
+            return [
+                *content[:-1],
+                {"type": "text", "text": last, "cache_control": cache_control},
+            ]
+    return None  # unrecognized block shape — leave untouched
+
+
 def _tag_system_message(system_message: Any, cache_control: dict[str, str]) -> Any:
     """Tag the last content block of a system message with ``cache_control``.
 
     Returns the original ``system_message`` unchanged when there is nothing to tag
-    (None, empty content, an already-identical marker, or an unrecognized content
-    shape) so callers can cheaply detect a no-op by identity.
+    so callers can cheaply detect a no-op by identity.
     """
     if system_message is None:
         return system_message
-
-    content = system_message.content
-    if isinstance(content, str):
-        if not content:
-            return system_message
-        new_content: list[Any] = [
-            {"type": "text", "text": content, "cache_control": cache_control}
-        ]
-    elif isinstance(content, list):
-        if not content:
-            return system_message
-        last = content[-1]
-        if isinstance(last, dict):
-            if last.get("cache_control") == cache_control:
-                return system_message  # idempotent: already tagged this turn
-            new_content = [*content[:-1], {**last, "cache_control": cache_control}]
-        elif isinstance(last, str):
-            new_content = [
-                *content[:-1],
-                {"type": "text", "text": last, "cache_control": cache_control},
-            ]
-        else:
-            return system_message  # unrecognized block shape — leave untouched
-    else:
+    new_content = _tag_last_block(system_message.content, cache_control)
+    if new_content is None:
         return system_message
-
     return SystemMessage(content=new_content)
+
+
+def _tag_last_message(messages: list[Any], cache_control: dict[str, str]) -> list[Any]:
+    """Tag the last content block of the conversation's last message.
+
+    Reconstructs only that one message via ``model_copy`` (preserving its type,
+    tool calls, ids, etc.) and returns a new list. Returns the original list
+    unchanged (same identity) when the last message has nothing taggable — e.g. a
+    tool-call-only assistant message with empty content — so the caller can detect a
+    no-op by identity. At model-call time the last message is normally a human turn
+    or a tool result (both carry content), so a breakpoint is placed on virtually
+    every turn.
+    """
+    if not messages:
+        return messages
+    new_content = _tag_last_block(messages[-1].content, cache_control)
+    if new_content is None:
+        return messages
+    new_messages = list(messages)
+    new_messages[-1] = messages[-1].model_copy(update={"content": new_content})
+    return new_messages
