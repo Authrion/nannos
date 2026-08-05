@@ -34,18 +34,13 @@ _CACHE_TTL_SECONDS = 6 * 3600
 _cache: dict[str, tuple[float, set[str] | None]] = {}
 
 
-def _cached(region: str) -> set[str] | None | bool:
+async def _region_model_ids(region: str) -> set[str] | None:
+    """Every model id callable in this region — foundation models plus inference profiles."""
+    # A cached None ("we couldn't read this region") is a real answer and is honoured for the TTL,
+    # so the freshness check has to gate on the ENTRY, never on the value inside it.
     entry = _cache.get(region)
     if entry and time.monotonic() - entry[0] < _CACHE_TTL_SECONDS:
         return entry[1]
-    return False  # distinct from a cached None ("read failed"), which is worth honouring for the TTL
-
-
-async def _region_model_ids(region: str) -> set[str] | None:
-    """Every model id callable in this region — foundation models plus inference profiles."""
-    cached = _cached(region)
-    if cached is not False:
-        return cached  # type: ignore[return-value]
 
     ids: set[str] | None
     try:

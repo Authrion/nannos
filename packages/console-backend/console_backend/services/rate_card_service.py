@@ -115,31 +115,18 @@ def is_catalog_tag_vocabulary(provider: str) -> bool:
     return provider in _TAG_TO_FAMILY or provider.startswith(f"{_VERTEX_TAG_PREFIX}-")
 
 
-def assert_billable_provider(provider: str, *, derived_from_deployment: bool = False) -> None:
-    """Reject a rate-card provider key the runtime never stamps (raises ValueError).
+# Every rate-card write must satisfy one invariant: the card is keyed on the value the cost logger
+# emits at call time. How much can be VERIFIED depends on where the value came from, and the two
+# cases share no logic — hence two functions rather than one with a mode flag.
 
-    Every rate-card write must satisfy the same invariant: the card is keyed on the value the cost
-    logger emits at call time. But how much we can *verify* depends on where the value came from:
 
-    - admin-typed (the Rate Cards page): checked against ``runtime_provider_families()``. A typo or a
-      wrong vocabulary (`bedrock-anthropic`, `eu`, `bedrock_converse`) is indistinguishable from a
-      vendor we simply haven't integrated, so the allowlist is the only guard available.
-    - ``derived_from_deployment=True`` (register/edit): the value IS the deployment's own route — its
-      model-id prefix or explicit ``custom_llm_provider`` — which is by construction what
-      ``get_llm_provider`` routes on and what the cost logger stamps. Applying the family allowlist
-      here rejected legitimately routable vendors (`anthropic/…`, `groq/…`, `deepseek/…`) with "not a
-      runtime billing provider" immediately after the sibling error told the admin to add that very
-      prefix. Only the tag vocabulary is refused; an unroutable prefix is caught by the mandatory
-      post-registration test call, which rolls the registration back.
+def assert_billable_provider(provider: str) -> None:
+    """Reject an admin-typed rate-card provider key (raises ValueError).
+
+    Checked against ``runtime_provider_families()``, because a typo and a wrong vocabulary
+    (`bedrock-anthropic`, `eu`, `bedrock_converse`) are indistinguishable from a vendor we simply
+    haven't integrated — the allowlist is the only guard available on a hand-entered value.
     """
-    if derived_from_deployment:
-        if is_catalog_tag_vocabulary(provider):
-            raise ValueError(
-                f"'{provider}' is a LiteLLM cost-map tag, not a provider route: it is not a routable "
-                "model-id prefix and the cost logger never reports it, so the model would bill $0. "
-                f"Use the route family it normalizes to ('{route_family(provider)}')."
-            )
-        return
     families = runtime_provider_families()
     if provider not in families:
         raise ValueError(
@@ -148,6 +135,25 @@ def assert_billable_provider(provider: str, *, derived_from_deployment: bool = F
             "catalog tags (e.g. 'bedrock_converse') and Vertex locations (e.g. 'eu') never match "
             "usage, so the model would silently bill $0. To bill another vendor, add its route to "
             "LLM_GATEWAY_PROVIDERS, or register the model so the route is derived from it."
+        )
+
+
+def assert_routable_provider(provider: str) -> None:
+    """Reject a deployment-derived rate-card provider key (raises ValueError).
+
+    Only the tag vocabulary is refused here. The value IS the deployment's own route — its model-id
+    prefix or explicit ``custom_llm_provider`` — which is by construction what ``get_llm_provider``
+    routes on and what the cost logger stamps, so any routable vendor is billable. Applying the
+    family allowlist instead rejected legitimate `anthropic/…`, `groq/…`, `deepseek/…` with "not a
+    runtime billing provider" immediately after the sibling error told the admin to add that very
+    prefix. An unroutable prefix is caught by the mandatory post-registration test call, which rolls
+    the registration back.
+    """
+    if is_catalog_tag_vocabulary(provider):
+        raise ValueError(
+            f"'{provider}' is a LiteLLM cost-map tag, not a provider route: it is not a routable "
+            "model-id prefix and the cost logger never reports it, so the model would bill $0. "
+            f"Use the route family it normalizes to ('{route_family(provider)}')."
         )
 
 
@@ -468,8 +474,8 @@ class RateCardService:
             effective_from: When rates become effective (defaults to now)
             model_name_pattern: Optional regex pattern for matching model variants
             derived_from_deployment: True when the provider is the deployment's own route (register /
-                edit resolved it from litellm_params), which relaxes the family allowlist to the tag
-                check — see assert_billable_provider. False for admin-typed values.
+                edit resolved it from litellm_params) — validated by assert_routable_provider rather
+                than the family allowlist. False for admin-typed values.
 
         Returns:
             List of created rate card entry IDs
@@ -477,7 +483,10 @@ class RateCardService:
         if effective_from is None:
             effective_from = datetime.now(timezone.utc)
 
-        assert_billable_provider(provider, derived_from_deployment=derived_from_deployment)
+        if derived_from_deployment:
+            assert_routable_provider(provider)
+        else:
+            assert_billable_provider(provider)
 
         entry_ids = await self.repository.create_model_rate_card(
             db=db,

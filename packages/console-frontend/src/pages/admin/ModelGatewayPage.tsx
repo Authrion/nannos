@@ -335,12 +335,12 @@ export function ModelGatewayPage() {
   // absent from the catalog; it is seeded from the gateway, never typed. Nothing here is sent —
   // registration carries no provider field at all.
   const derivedProvider = deriveProvider(form.litellm_model);
-  const catalogFamily = catalog.find((c) => c.model_id === form.litellm_model)?.family ?? '';
   // A route the SERVER would also resolve — the id's prefix or the catalog entry's server-derived
   // family. Everything the UI promises about saving must be based on this, never on the wider
   // `effectiveProvider` below, whose form.provider tail can be a cost-map TAG (`bedrock_converse`,
   // seeded from the gateway on edit) that nothing routes and registration 422s.
-  const routableProvider = derivedProvider || catalogFamily;
+  const routableProvider =
+    derivedProvider || (catalog.find((c) => c.model_id === form.litellm_model)?.family ?? '');
   // Adds that tag tail: still useful for deciding WHICH credential fields a provider takes (a
   // `bedrock_converse` model is a Bedrock model), but never for what will be written.
   const effectiveProvider = routableProvider || form.provider;
@@ -946,7 +946,7 @@ export function ModelGatewayPage() {
             <div className="grid gap-1.5">
               <Label>Provider route</Label>
               <Input
-                value={routableProvider || effectiveProvider}
+                value={effectiveProvider}
                 readOnly
                 disabled
                 placeholder="resolved from the model id"

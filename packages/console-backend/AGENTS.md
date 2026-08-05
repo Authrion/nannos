@@ -459,20 +459,23 @@ Enforcement lives entirely in `services/rate_card_service.py`, on BOTH write pat
   instead of the cost-map tag (`bedrock_converse`) and no client re-implements the normalization.
 - the Rate Cards page passes an admin-typed provider, so every service write path
   (`create_entry`, `create_model_rate_card`, `copy_model_rates`, `rekey_model_provider`) runs
-  `assert_billable_provider` → 422. Any NEW rate-card write must go through the service, never
+  `assert_billable_provider` → 422 (`create_model_rate_card` uses `assert_routable_provider` instead
+  when register/edit derived the value). Any NEW rate-card write must go through the service, never
   straight to the repository, or this invariant is bypassed and the card bills $0.
 
-How strictly that check applies depends on WHERE the provider came from, and the difference matters:
-- admin-typed → the `runtime_provider_families()` allowlist (verified built-ins plus whatever
-  `LLM_GATEWAY_PROVIDERS` adds, so integrating `mistral` needs no code change — for those tag ==
-  family, which is how litellm routes `mistral/…`). A typo and an un-integrated vendor are
-  indistinguishable here, so the allowlist is the only guard available.
-- `derived_from_deployment=True` (register/edit only) → only the TAG vocabulary is refused
-  (`is_catalog_tag_vocabulary`). The value is the deployment's own route, which is by construction
-  what `get_llm_provider` routes on and what the cost logger stamps, so any routable vendor is
-  billable — applying the allowlist here 422'd `anthropic/…`, `groq/…`, `deepseek/…` with "not a
-  runtime billing provider" immediately after the sibling error asked for that very prefix. An
-  unroutable prefix is caught by the mandatory post-registration test call, which rolls it back.
+Which check applies depends on WHERE the provider came from. The two share no logic, so they are two
+functions — do not fold them back into one with a mode flag:
+- admin-typed → `assert_billable_provider`: the `runtime_provider_families()` allowlist (verified
+  built-ins plus whatever `LLM_GATEWAY_PROVIDERS` adds, so integrating `mistral` needs no code change
+  — for those tag == family, which is how litellm routes `mistral/…`). A typo and an un-integrated
+  vendor are indistinguishable here, so the allowlist is the only guard available.
+- derived from the deployment (register/edit only) → `assert_routable_provider`: only the TAG
+  vocabulary is refused (`is_catalog_tag_vocabulary`). The value is the deployment's own route, which
+  is by construction what `get_llm_provider` routes on and what the cost logger stamps, so any
+  routable vendor is billable — applying the allowlist here 422'd `anthropic/…`, `groq/…`,
+  `deepseek/…` with "not a runtime billing provider" immediately after the sibling error asked for
+  that very prefix. An unroutable prefix is caught by the mandatory post-registration test call,
+  which rolls it back.
 
 Do NOT key or "correct" a card from the gateway's
 `model_info.litellm_provider`: that is LiteLLM's cost-map *implementation tag*

@@ -38,11 +38,6 @@ def _entry_in_force(as_of_expr: str = "NOW()", rce: str = "rce") -> str:
     return f"({rce}.effective_from <= {as_of_expr} AND ({rce}.effective_until IS NULL OR {rce}.effective_until > {as_of_expr}))"
 
 
-def _prefer_exact_match(rc: str = "rc") -> str:
-    """ORDER BY fragment: exact-name cards win over pattern cards."""
-    return f"CASE WHEN {rc}.model_name_pattern IS NULL THEN 0 ELSE 1 END"
-
-
 class RateCardRepository(AuditedRepository):
     """Repository for managing LLM cost rate cards with audit trail."""
 
@@ -454,7 +449,7 @@ class RateCardRepository(AuditedRepository):
               AND rce.billing_unit = :billing_unit
               AND {_entry_in_force(":as_of")}
             ORDER BY
-              {_prefer_exact_match()},
+              CASE WHEN rc.model_name_pattern IS NULL THEN 0 ELSE 1 END,  -- exact beats pattern
               rce.effective_from DESC
             LIMIT 1
         """)
@@ -506,7 +501,7 @@ class RateCardRepository(AuditedRepository):
               AND {_model_match(":model_name")}
               AND {_entry_in_force(":as_of")}
             ORDER BY rce.billing_unit,
-              {_prefer_exact_match()},
+              CASE WHEN rc.model_name_pattern IS NULL THEN 0 ELSE 1 END,  -- exact beats pattern
               rce.effective_from DESC
         """)
 
