@@ -332,22 +332,35 @@ export function RateCardsPage() {
           if (!open) setEditModel(null);
         }}
         onSubmit={async (entries) => {
-          // If editing, expire old entries first
+          // Create BEFORE expiring, never the other way round. The create can fail — most sharply on
+          // a card keyed to a provider the runtime never reports (422), which is exactly the kind of
+          // card the banner tells admins to come and fix — and expiring first would then leave the
+          // model with zero active pricing, i.e. billing $0, with the provider field disabled so it
+          // couldn't even be corrected here. In this order a failed create leaves the old rates in
+          // place; the new entry simply wins while both are open (get_active_rate takes the latest
+          // effective_from), and the expiry below is cleanup rather than a prerequisite.
+          const createdIds = new Set<number>();
+          for (const entry of entries) {
+            const created = await createEntryMutation.mutateAsync({ body: entry });
+            const id = (created as { id?: number } | undefined)?.id;
+            if (typeof id === 'number') createdIds.add(id);
+          }
+
           if (editModel) {
             const effectiveUntil = new Date().toISOString();
             await Promise.all(
-              editModel.entries.map(entry =>
-                expireMutation.mutateAsync({
-                  path: { rate_id: entry.id },
-                  query: { effective_until: effectiveUntil },
-                })
-              )
+              editModel.entries
+                // An unchanged price is a no-op server-side: create_entry returns the EXISTING entry
+                // id instead of inserting a row. Expiring that id would close the very entry we just
+                // "created" and leave the unit unpriced — so skip anything a create just claimed.
+                .filter((entry) => !createdIds.has(entry.id))
+                .map(entry =>
+                  expireMutation.mutateAsync({
+                    path: { rate_id: entry.id },
+                    query: { effective_until: effectiveUntil },
+                  })
+                )
             );
-          }
-
-          // Create all new entries
-          for (const entry of entries) {
-            await createEntryMutation.mutateAsync({ body: entry });
           }
         }}
         existingModel={editModel}
@@ -643,7 +656,14 @@ function ModelPricingDialog({ open, onOpenChange, onSubmit, existingModel }: {
       return;
     }
 
-    await onSubmit(entries);
+    // Keep the dialog open when a write fails, so the entered prices aren't lost and the toast's
+    // reason (e.g. a provider the runtime never reports) can be acted on. The mutations report the
+    // failure themselves; swallowing it here only stops the unhandled rejection.
+    try {
+      await onSubmit(entries);
+    } catch {
+      return;
+    }
     onOpenChange(false);
   };
 
