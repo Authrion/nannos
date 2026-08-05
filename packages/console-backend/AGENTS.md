@@ -418,6 +418,19 @@ has_access = await user_group_service.check_resource_permission(
 
 When sending a steering message via `_send_steering_message_to_agent()`, the code uses `break` after the first event from `a2a_client.send_message()` — NOT `pass` to drain. The agent-console shares the same A2A SDK `Client` instance between the primary stream (`_send_message_to_agent`) and steering. The A2A SDK's `EventQueue.tap()` creates a child queue that receives all parent events. If leaked parent events containing raw `Task` objects were consumed through the shared `Client`, its `ClientTaskManager` would raise "Task is already set" errors. The `break` takes only the ack event and lets SSE teardown close the child queue. Note: consuming from the child never removes events from the parent queue (they're independent `asyncio.Queue` instances). See the root copilot instructions "Continuous Interaction Turns" section for the full mechanism.
 
+### One Alias = One Deployment (admin_model_gateway_router)
+
+`register_model` 409s when the alias is already registered on the gateway (checked BEFORE the
+rate-card write, so a refused registration leaves nothing behind; fails open when the gateway can't
+be listed). LiteLLM itself allows many deployments under one `model_name` and load-balances across
+them — this console cannot express that: the rate card, the provider check and the role defaults are
+all keyed on the alias, edit/delete address a single gateway id, and `edit_model` already reports a
+surviving second deployment as a fault (`updated_with_stale_duplicate`). A duplicate alias silently
+doubles routing for a model the admin can only manage half of. If replica/failover routing is ever
+wanted, it needs an explicit flow, not a re-registration. The guard is registration-only: an edit
+re-registers its own alias by design. `ModelGatewayPage` mirrors it (`aliasTaken`) — picking the
+same catalog entry twice auto-fills the same alias, which is how duplicates happened.
+
 ### Rate-Card Provider Must Equal the litellm Provider Family (cost tracking ↔ rate cards)
 
 Rate cards key on `(provider, model_name=alias)`. Billing resolves provider in the cost logger

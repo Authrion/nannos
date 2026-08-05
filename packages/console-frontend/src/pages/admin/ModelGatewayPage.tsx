@@ -313,6 +313,12 @@ export function ModelGatewayPage() {
   // `bedrock_converse` model is a Bedrock model), but never for what will be written.
   const effectiveProvider = routableProvider || form.provider;
 
+  // An alias addresses exactly one deployment here (the server 409s on a duplicate): the rate card,
+  // the role defaults and the provider check are all keyed on it, and Edit/Remove act on one gateway
+  // id. Flag the collision while typing — picking the same catalog entry twice auto-fills the same
+  // alias, which is the easy way to end up with two cards for one name.
+  const aliasTaken = !editingId && models.some((m) => m.model_name === form.model_name.trim());
+
   // Registering, editing and deleting a model all change what the billing check sees (a register/edit
   // writes the correctly-keyed rate card; a delete removes the deployment it flags), so its cached
   // result must go — otherwise the banner keeps showing the mismatch the admin just fixed and its
@@ -514,6 +520,10 @@ export function ModelGatewayPage() {
     // provider: a cost-map tag inherited from the gateway is not a route the server would accept.
     if (!routableProvider) {
       toast.error('Prefix the gateway model id with its provider route (e.g. bedrock/…)');
+      return;
+    }
+    if (aliasTaken) {
+      toast.error(`'${form.model_name}' is already registered — pick a different alias`);
       return;
     }
     // Local use only — which credential params this route takes. The request carries no provider:
@@ -796,14 +806,18 @@ export function ModelGatewayPage() {
                 placeholder="claude-sonnet-4.6"
                 value={form.model_name}
                 disabled={!!editingId}
+                aria-invalid={aliasTaken}
+                className={aliasTaken ? 'border-destructive' : undefined}
                 onChange={(e) => {
                   setAliasEdited(true);
                   setForm({ ...form, model_name: e.target.value });
                 }}
               />
               {!editingId && (
-                <p className="text-[11px] text-muted-foreground">
-                  Auto-filled from the model id — edit to set a custom alias.
+                <p className={`text-[11px] ${aliasTaken ? 'text-destructive' : 'text-muted-foreground'}`}>
+                  {aliasTaken
+                    ? `'${form.model_name}' is already registered — an alias maps to exactly one deployment. Edit or remove that model, or pick a different alias.`
+                    : 'Auto-filled from the model id — edit to set a custom alias.'}
                 </p>
               )}
             </div>
@@ -940,7 +954,7 @@ export function ModelGatewayPage() {
             <Button variant="outline" onClick={closeDialog}>
               Cancel
             </Button>
-            <Button onClick={submit} disabled={saving}>
+            <Button onClick={submit} disabled={saving || aliasTaken}>
               {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {editingId
                 ? saving

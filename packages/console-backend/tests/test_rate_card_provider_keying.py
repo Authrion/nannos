@@ -58,17 +58,19 @@ def test_unprefixed_model_is_underivable():
 
 def _register_request(
     created_ids: list[int],
+    registered: list[dict] | None = None,
     catalog: list[dict] | None = None,
 ):
     """A request whose rate-card service records create_model_rate_card kwargs and whose gateway
-    accepts the registration. ``catalog`` seeds the cost-map entries the server resolves unprefixed
-    model ids against."""
+    accepts the registration. ``registered`` seeds the aliases already on the gateway; ``catalog``
+    the cost-map entries the server resolves unprefixed model ids against."""
     rate_card_service = SimpleNamespace(
         create_model_rate_card=AsyncMock(return_value=created_ids),
     )
     entries = catalog if catalog is not None else _CATALOG
     gateway = SimpleNamespace(
         register_model=AsyncMock(return_value={"model_info": {"id": "gw-1"}}),
+        list_models=AsyncMock(return_value=registered or []),
         catalog_model=AsyncMock(side_effect=lambda mid: next((c for c in entries if c["model_id"] == mid), None)),
         # Readability is what separates "unknown model id" (422) from "catalog outage" (502).
         get_catalog=AsyncMock(return_value=entries),
@@ -287,6 +289,60 @@ async def test_register_accepts_explicit_custom_llm_provider():
     await router.register_model(request, body, AsyncMock(), user=SimpleNamespace(id="admin"))
 
     assert rate_card_service.create_model_rate_card.await_args.kwargs["provider"] == "vertex_ai"
+
+
+@pytest.mark.asyncio
+async def test_register_refuses_an_alias_that_is_already_registered():
+    """An alias addresses exactly one deployment: the rate card, the role defaults and the provider
+    check are all keyed on it, and Edit/Remove act on a single gateway id. A second deployment under
+    the same name would silently load-balance a model the admin can only manage half of."""
+    import console_backend.routers.admin_model_gateway_router as router
+
+    request, rate_card_service, gateway = _register_request(
+        [1], registered=[{"model_name": "claude-opus-4-8", "litellm_params": {"model": "bedrock/x"}}]
+    )
+    body = _body({"model": "bedrock/us.anthropic.claude-opus-4-8-v1:0"})
+
+    with pytest.raises(HTTPException) as exc:
+        await router.register_model(request, body, AsyncMock(), user=SimpleNamespace(id="admin"))
+
+    assert exc.value.status_code == 409
+    # Refused before the rate-card write, so a rejected registration leaves nothing behind.
+    rate_card_service.create_model_rate_card.assert_not_awaited()
+    gateway.register_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_register_proceeds_when_the_alias_list_is_unavailable():
+    """Fails open: an unlistable gateway must not block registration — the register call itself
+    surfaces the outage as a 502."""
+    import console_backend.routers.admin_model_gateway_router as router
+    from console_backend.services.model_gateway_service import ModelGatewayError
+
+    request, rate_card_service, gateway = _register_request([1])
+    gateway.list_models = AsyncMock(side_effect=ModelGatewayError("gateway down"))
+    body = _body({"model": "bedrock/us.anthropic.claude-opus-4-8-v1:0"})
+
+    await router.register_model(request, body, AsyncMock(), user=SimpleNamespace(id="admin"))
+
+    gateway.register_model.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_editing_a_model_keeps_its_own_alias():
+    """The duplicate guard is registration-only: an edit re-registers the SAME alias by design."""
+    import console_backend.routers.admin_model_gateway_router as router
+
+    request, rate_card_service, gateway = _register_request(
+        [1], registered=[{"model_name": "claude-opus-4-8", "litellm_params": {"model": "bedrock/x"}}]
+    )
+    gateway.update_model = AsyncMock(return_value={"model_info": {"id": "gw-2"}})
+    body = _body({"model": "bedrock/us.anthropic.claude-opus-4-8-v1:0"})
+
+    result = await router.edit_model("gw-1", request, body, AsyncMock(), user=SimpleNamespace(id="admin"))
+
+    assert result.status == "updated"
+    gateway.update_model.assert_awaited_once()
 
 
 @pytest.mark.asyncio

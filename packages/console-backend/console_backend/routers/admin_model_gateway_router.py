@@ -372,6 +372,28 @@ async def register_model(
     """Register a model: Rate Card first, then gateway routing/capability."""
     svc = get_model_gateway_service(request)
 
+    # 0. One alias = one deployment. LiteLLM will happily hold several deployments under the same
+    #    model_name and load-balance across them, but nothing in this console can express that: the
+    #    rate card, the provider check and the role defaults are all keyed on the alias, edit/delete
+    #    address a single gateway id, and edit_model already reports a leftover second deployment as
+    #    a fault ("gateway will serve both until it is removed"). Registering a duplicate alias
+    #    therefore silently doubles routing for a model the admin can only manage half of — refuse it
+    #    BEFORE the rate-card write, so a rejected registration leaves nothing behind. Fails open when
+    #    the gateway can't be listed; step 2 surfaces that as a 502 anyway.
+    try:
+        registered_aliases = {m.get("model_name") for m in await svc.list_models()}
+    except ModelGatewayError:
+        registered_aliases = set()
+    if body.model_name in registered_aliases:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"'{body.model_name}' is already registered on the gateway. Aliases must be unique: "
+                "edit the existing model to change its routing or pricing, remove it first, or pick a "
+                "different alias."
+            ),
+        )
+
     # 1. Rate Card first — a model must be billable before it is usable.
     entry_ids, provider, litellm_params, model_info = await _write_rate_card_and_routing(request, body, db, user)
 
