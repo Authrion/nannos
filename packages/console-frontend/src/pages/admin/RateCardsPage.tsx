@@ -31,6 +31,8 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { CardListSkeleton } from '@/components/skeletons';
 import { Badge } from '@/components/ui/badge';
+import { ProviderMismatchBanner } from '@/components/admin/ProviderMismatchBanner';
+import { PROVIDER_CONFIG_QUERY_KEY } from '@/lib/providerCheckQuery';
 
 interface GroupedModel {
   provider: string;
@@ -83,16 +85,27 @@ export function RateCardsPage() {
     queryFn: fetchAllActiveEntries,
   });
 
+  // Both writes change what the billing banner sees (a new card can resolve a flagged $0 deployment;
+  // expiring one can create it), so its cached result has to go too — otherwise the banner keeps
+  // rendering pre-fix state while the page stays mounted.
+  const invalidateAfterWrite = () => {
+    queryClient.invalidateQueries({ queryKey: ['rate-card-entries-all'] });
+    queryClient.invalidateQueries({ queryKey: PROVIDER_CONFIG_QUERY_KEY });
+  };
+
   const createEntryMutation = useMutation({
     ...createRateCardEntryApiV1AdminRateCardsEntryPostMutation(),
     onSuccess: () => {
       toast.success('Rate card created successfully');
-      queryClient.invalidateQueries({ queryKey: ['rate-card-entries-all'] });
+      invalidateAfterWrite();
       setAddModelOpen(false);
       setEditModel(null);
     },
-    onError: () => {
-      toast.error('Failed to create rate card entry');
+    onError: (error) => {
+      // A 422 carries the reason (e.g. a provider the runtime never reports, which would bill $0) —
+      // show it instead of a generic failure the admin can't act on.
+      const detail = (error as { detail?: unknown })?.detail;
+      toast.error(typeof detail === 'string' ? detail : 'Failed to create rate card entry');
     },
   });
 
@@ -100,7 +113,7 @@ export function RateCardsPage() {
     ...expireRateCardEntryApiV1AdminRateCardsExpireRateIdPostMutation(),
     onSuccess: () => {
       toast.success('Rate card entries expired');
-      queryClient.invalidateQueries({ queryKey: ['rate-card-entries-all'] });
+      invalidateAfterWrite();
     },
     onError: () => {
       toast.error('Failed to expire rate cards');
@@ -211,6 +224,9 @@ export function RateCardsPage() {
           Add Model Pricing
         </Button>
       </div>
+
+      {/* Live billing-configuration check (async — never blocks the list) */}
+      <ProviderMismatchBanner />
 
       {/* Info Banner */}
       <Card className="bg-blue-50/50 dark:bg-blue-950/20 border-blue-200 dark:border-blue-800">
@@ -328,7 +344,7 @@ export function RateCardsPage() {
               )
             );
           }
-          
+
           // Create all new entries
           for (const entry of entries) {
             await createEntryMutation.mutateAsync({ body: entry });
@@ -647,12 +663,21 @@ function ModelPricingDialog({ open, onOpenChange, onSubmit, existingModel }: {
           {/* Provider and Model Name */}
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="provider">Provider</Label>
+              <Label htmlFor="provider">
+                Provider
+                {/* The card only bills when this equals the provider FAMILY the gateway reports at
+                    runtime (bedrock, vertex_ai, …). A LiteLLM catalog tag (bedrock_converse) or a
+                    Vertex location (eu) never matches usage — the server rejects those with a 422,
+                    but the hint keeps admins from hitting it. */}
+                <span className="text-xs text-muted-foreground ml-2">
+                  Runtime provider family, not a catalog tag or region
+                </span>
+              </Label>
               <Input
                 id="provider"
                 value={formData.provider}
                 onChange={(e) => setFormData({ ...formData, provider: e.target.value })}
-                placeholder="e.g., bedrock-anthropic"
+                placeholder="e.g., bedrock, vertex_ai, azure"
                 disabled={isEdit}
               />
             </div>

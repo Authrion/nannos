@@ -45,6 +45,8 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { ConfirmDialog } from '@/components/admin/ConfirmDialog';
+import { ProviderMismatchBanner } from '@/components/admin/ProviderMismatchBanner';
+import { PROVIDER_CONFIG_QUERY_KEY } from '@/lib/providerCheckQuery';
 import { WebSearchSettings } from '@/components/admin/WebSearchSettings';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Badge } from '@/components/ui/badge';
@@ -105,6 +107,9 @@ const visiblePricingUnits = (mode: string, prices: Record<string, string>) =>
 interface FormState {
   model_name: string;
   litellm_model: string;
+  // Provider ROUTE, never authored here and never sent: seeded from the picked catalog entry's
+  // server-resolved `family` (or, on edit, from the gateway) purely so the UI knows which
+  // credential inputs this route takes. `effectiveProvider` prefers the model id / catalog.
   provider: string;
   aws_region_name: string;
   vertex_location: string;
@@ -149,13 +154,13 @@ function deriveAlias(modelId: string): string {
   return parts.join('.');
 }
 
-// The litellm provider family is the gateway model id prefix (the part before the first "/"),
-// e.g. "vertex_ai/gemini-embedding-2" → "vertex_ai", "bedrock/eu.anthropic.claude-…" → "bedrock".
-// This is exactly how the cost logger resolves provider for billing (custom_llm_provider, else
-// the deployment-id prefix), so deriving it here keeps the rate card keyed on the same provider
-// usage is logged under. Critically, it prevents a region/location (Vertex "eu"/"global") from
-// being typed into the free-text provider field and silently mis-keying billing to $0.
-// Empty when the id has no prefix (e.g. a bare Azure deployment name) — admin sets it then.
+// The provider route is the gateway model id prefix (the part before the first "/"), e.g.
+// "vertex_ai/gemini-embedding-2" → "vertex_ai". That prefix is how LiteLLM routes the call AND how
+// the cost logger keys billing (custom_llm_provider, else the deployment-id prefix), which is why a
+// single value covers routing, provider-specific params and the rate card. Read-only mirror of the
+// server's own resolution — the display only, never a submitted value.
+// Empty when the id has no prefix (the norm for Bedrock cost-map ids): the catalog entry's
+// server-resolved `family` answers those, and the server re-derives it the same way on save.
 function deriveProvider(modelId: string): string {
   return modelId.includes('/') ? modelId.slice(0, modelId.indexOf('/')) : '';
 }
@@ -279,7 +284,9 @@ export function ModelGatewayPage() {
       litellm_model: entry.model_id,
       // Pre-fill the alias from the model unless the user has already typed their own.
       model_name: !editingId && !aliasEdited ? deriveAlias(entry.model_id) : f.model_name,
-      provider: entry.provider ?? f.provider,
+      // The server-resolved route, not LiteLLM's cost-map tag — this only drives which
+      // credential inputs show; the request carries no provider (see effectiveProvider).
+      provider: entry.family ?? f.provider,
       mode: isEmbedding ? 'embedding' : 'chat',
       input_modes: isEmbedding ? embeddingInputModes(entry) : modes,
       // Replace (not merge): selecting a different model must not leave a prior model's prices —
@@ -288,9 +295,37 @@ export function ModelGatewayPage() {
     }));
   };
 
+  // The provider route this deployment will be served and billed under. ONE value answers all of it,
+  // and the form never authors it — it mirrors the server's resolution so what you see is what will
+  // be written: the model id's own route prefix, else the route of that id's catalog entry
+  // (`family`, derived server-side — the norm for Bedrock, whose cost-map ids are bare). The trailing
+  // form.provider is only a fallback for an already-registered model whose id is unprefixed and
+  // absent from the catalog; it is seeded from the gateway, never typed. Nothing here is sent —
+  // registration carries no provider field at all.
+  const derivedProvider = deriveProvider(form.litellm_model);
+  const catalogFamily = catalog.find((c) => c.model_id === form.litellm_model)?.family ?? '';
+  // A route the SERVER would also resolve — the id's prefix or the catalog entry's server-derived
+  // family. Everything the UI promises about saving must be based on this, never on the wider
+  // `effectiveProvider` below, whose form.provider tail can be a cost-map TAG (`bedrock_converse`,
+  // seeded from the gateway on edit) that nothing routes and registration 422s.
+  const routableProvider = derivedProvider || catalogFamily;
+  // Adds that tag tail: still useful for deciding WHICH credential fields a provider takes (a
+  // `bedrock_converse` model is a Bedrock model), but never for what will be written.
+  const effectiveProvider = routableProvider || form.provider;
+
+  // Registering, editing and deleting a model all change what the billing check sees (a register/edit
+  // writes the correctly-keyed rate card; a delete removes the deployment it flags), so its cached
+  // result must go — otherwise the banner keeps showing the mismatch the admin just fixed and its
+  // Re-key button 409s. Kept callable on its own because the register path deliberately does NOT
+  // refetch the model list (see saveMutation.onSuccess).
+  const invalidateProviderCheck = () => {
+    queryClient.invalidateQueries({ queryKey: PROVIDER_CONFIG_QUERY_KEY });
+  };
+
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['gateway-models'] });
     queryClient.invalidateQueries({ queryKey: ['available-models'] }); // refresh every picker
+    invalidateProviderCheck();
   };
 
   const closeDialog = () => {
@@ -366,7 +401,10 @@ export function ModelGatewayPage() {
       const created: GatewayModel = {
         model_name: res.model_name,
         model_id: res.gateway_model_id ?? null,
-        provider: body.provider,
+        // The key the server actually wrote the card under: the request carries no provider at all
+        // (the server derives it), and an unprefixed catalog id submitted with its catalog tag
+        // (`bedrock_converse`) is stored as the family (`bedrock`) — only the response knows.
+        provider: res.provider,
         litellm_model: (body.litellm_params.model as string | undefined) ?? null,
         mode: body.mode ?? 'chat',
         input_modes: body.input_modes,
@@ -413,6 +451,7 @@ export function ModelGatewayPage() {
           old.some((m) => m.model_name === created.model_name) ? old : [...old, created],
         );
         queryClient.invalidateQueries({ queryKey: ['available-models'] }); // refresh every picker
+        invalidateProviderCheck(); // the new model's rate card just landed — re-run the banner check
       } else {
         invalidate(); // edit landed in place — reflect the gateway's real state
       }
@@ -466,16 +505,20 @@ export function ModelGatewayPage() {
   };
 
   const submit = () => {
-    if (!form.model_name || !form.litellm_model || !form.provider) {
-      toast.error('Alias, gateway model id, and provider are required');
+    if (!form.model_name || !form.litellm_model) {
+      toast.error('Alias and gateway model id are required');
       return;
     }
-    // The rate card MUST be keyed on the same provider usage is billed under. The cost logger
-    // resolves provider from the model-id prefix, so when the id has one we take it as
-    // authoritative — overriding whatever is in the free-text field. This is what stops a Vertex
-    // location ("eu"/"global") in the provider field from creating an orphan rate card that never
-    // matches usage (→ silent $0 billing).
-    const provider = deriveProvider(form.litellm_model) || form.provider;
+    // The server refuses an id it can't resolve a route for (it would have to guess what bills);
+    // mirror that here so the failure is visible before saving, not as a 422. Gated on the ROUTABLE
+    // provider: a cost-map tag inherited from the gateway is not a route the server would accept.
+    if (!routableProvider) {
+      toast.error('Prefix the gateway model id with its provider route (e.g. bedrock/…)');
+      return;
+    }
+    // Local use only — which credential params this route takes. The request carries no provider:
+    // the server resolves the route itself (id prefix, else its catalog entry) and keys billing on it.
+    const provider = effectiveProvider;
     // Embeddings bill input only; chat bills input/output (+ optional cache / web search).
     const units = visiblePricingUnits(form.mode, form.prices);
     const pricing: Record<string, RateCardPricingEntry> = {};
@@ -507,7 +550,6 @@ export function ModelGatewayPage() {
       ...(Object.keys(model_info).length ? { model_info } : {}),
       mode: form.mode,
       input_modes: form.input_modes,
-      provider,
       pricing,
     };
     saveMutation.mutate(body);
@@ -541,6 +583,9 @@ export function ModelGatewayPage() {
       </div>
 
       <WebSearchSettings />
+
+      {/* Billing-provider consistency check (async — never blocks the model list) */}
+      <ProviderMismatchBanner />
 
       {isLoading ? (
         <p className="text-muted-foreground">Loading…</p>
@@ -728,7 +773,9 @@ export function ModelGatewayPage() {
                       >
                         <span className="font-mono text-xs">{c.model_id}</span>
                         <span className="text-muted-foreground text-[11px]">
-                          {c.provider} · {c.mode}
+                          {/* The route it resolves to, not LiteLLM's cost-map tag: the tag
+                              (`bedrock_converse`) is a vocabulary nothing here uses. */}
+                          {c.family ?? c.provider} · {c.mode}
                           {c.supports_vision ? ' · vision' : ''}
                           {c.supports_reasoning ? ' · thinking' : ''}
                         </span>
@@ -762,15 +809,28 @@ export function ModelGatewayPage() {
             </div>
 
             <div className="grid gap-1.5">
-              <Label>Provider (rate-card key)</Label>
+              <Label>Provider route</Label>
               <Input
-                placeholder="bedrock"
-                value={form.provider}
-                onChange={(e) => setForm({ ...form, provider: e.target.value })}
+                value={routableProvider || effectiveProvider}
+                readOnly
+                disabled
+                placeholder="resolved from the model id"
               />
+              <p className={`text-[11px] ${routableProvider ? 'text-muted-foreground' : 'text-destructive'}`}>
+                {routableProvider
+                  ? derivedProvider
+                    ? 'From the model id’s route prefix. This is how the gateway routes the call and how billing is keyed — change the prefix above to change it.'
+                    : `This model id resolves to the ${routableProvider} route, which will be prefixed onto it on save. It’s how the gateway routes the call and how billing is keyed.`
+                  : effectiveProvider
+                    ? // effectiveProvider without a routable one means the value came from the gateway's
+                      // cost-map TAG (litellm_provider), a vocabulary nothing routes or bills under — so
+                      // it must never be promised as "will be prefixed on save": the server 422s it.
+                      `“${effectiveProvider}” is this model’s cost-map tag, not a route — the gateway can’t route it and billing can’t key on it. Prefix the model id above with its provider route (e.g. bedrock/…, vertex_ai/…).`
+                    : 'This model id has no route and isn’t a known catalog model — prefix it above with its provider route (e.g. bedrock/…, vertex_ai/…) so it can be routed and billed.'}
+              </p>
             </div>
 
-            {isAzureProvider(form.provider) && (
+            {isAzureProvider(effectiveProvider) && (
               <div className="grid gap-1.5">
                 <Label>Base model (Azure)</Label>
                 <Input
@@ -786,14 +846,14 @@ export function ModelGatewayPage() {
               </div>
             )}
 
-            {(isVertexProvider(form.provider) || isBedrockProvider(form.provider)) && (
+            {(isVertexProvider(effectiveProvider) || isBedrockProvider(effectiveProvider)) && (
               <Collapsible open={credsOpen} onOpenChange={setCredsOpen}>
                 <CollapsibleTrigger className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors [&[data-state=open]>svg]:rotate-180">
                   <ChevronDown className="h-4 w-4 transition-transform" />
                   Advanced — region & credentials
                 </CollapsibleTrigger>
                 <CollapsibleContent className="grid gap-3 pt-3">
-                  {isBedrockProvider(form.provider) && (
+                  {isBedrockProvider(effectiveProvider) && (
                     <div className="grid gap-1.5">
                       <Label>AWS region (optional)</Label>
                       <Input
@@ -803,7 +863,7 @@ export function ModelGatewayPage() {
                       />
                     </div>
                   )}
-                  {isVertexProvider(form.provider) && (
+                  {isVertexProvider(effectiveProvider) && (
                     <div className="grid grid-cols-2 gap-3">
                       <div className="grid gap-1.5">
                         <Label>Vertex location (optional)</Label>

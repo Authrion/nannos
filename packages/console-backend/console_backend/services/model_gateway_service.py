@@ -390,6 +390,16 @@ class ModelGatewayService:
             logger.warning("Skipped %d unparseable catalog entr%s", skipped, "y" if skipped == 1 else "ies")
         return catalog
 
+    async def catalog_model(self, model_id: str) -> dict | None:
+        """The catalog entry for this exact cost-map id, or None (unknown / filtered / unreadable).
+
+        Registration uses it to resolve the provider family of an *unprefixed* catalog id — the norm
+        for Bedrock, whose cost-map keys are bare (`eu.amazon.nova-2-lite-v1:0`) — so the client
+        never has to send a provider value at all. ``get_catalog`` keys on the cost-map key, so this
+        is an exact match, and its cache is normally already warm from the picker's own fetch.
+        """
+        return next((c for c in await self.get_catalog() if c.get("model_id") == model_id), None)
+
     async def test_model(self, model_name: str) -> dict:
         """Cheap call to validate a freshly-registered model end to end.
 
