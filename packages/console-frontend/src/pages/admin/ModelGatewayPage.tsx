@@ -13,10 +13,12 @@ import {
   Loader2,
   Lock,
   ChevronDown,
+  AlertTriangle,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
 import {
+  getBedrockRegions,
   getGatewayConfig,
   listGatewayModels,
   listModelCatalog,
@@ -74,6 +76,29 @@ function errMsg(e: unknown): string {
     if (d) return JSON.stringify(d);
   }
   return String(e);
+}
+
+// Bedrock rejects a model that isn't offered in the region it was called in with this message, and
+// says nothing about the region — which reads as "this model can't be registered" when it is really
+// "wrong region". Recognizing it lets the dialog name the region and point at the region field.
+// (Verified 2026-08-05: amazon.nova-2-multimodal-embeddings-v1:0 is absent from eu-central-1 and
+// works in us-east-1, sync embeddings included.)
+const BEDROCK_WRONG_REGION = /provided model identifier is invalid/i;
+
+function bedrockRegionHint(
+  message: string,
+  modelId: string,
+  region: string,
+  availableIn: string[] | null,
+): string | null {
+  if (!BEDROCK_WRONG_REGION.test(message)) return null;
+  const where = region ? `region ${region}` : "the region it was called in";
+  const remedy = availableIn?.length
+    ? `AWS offers it in ${availableIn.join(', ')} — set one of those as the AWS region under ` +
+      '“Advanced — region & credentials” and register again.'
+    : 'This is a region problem, not a bad model id: set the AWS region under “Advanced — region & ' +
+      'credentials” (e.g. us-east-1 for the Nova multimodal embedding models) and register again.';
+  return `AWS doesn't offer ${modelId || 'this model'} in ${where}. ${remedy}`;
 }
 
 // billing_unit -> flow_direction. These match the units the proxy CustomLogger emits.
@@ -213,6 +238,10 @@ export function ModelGatewayPage() {
   // Provider credential overrides (region/project) are hidden by default — the gateway's
   // env defaults are the norm; only collapse-open them when overriding per model.
   const [credsOpen, setCredsOpen] = useState(false);
+  // Sticky, in-dialog explanation for the one failure a toast handles badly: AWS rejecting a model
+  // that simply isn't in the region. The dialog stays open on failure, so the fix (the region field
+  // right above) and the reason must both be on screen — a toast is gone before the admin reads it.
+  const [regionError, setRegionError] = useState<string | null>(null);
   // Once the alias is hand-edited, stop auto-filling it from the picked model.
   const [aliasEdited, setAliasEdited] = useState(false);
   // null = registering a new model; a gateway id = editing that model.
@@ -246,6 +275,9 @@ export function ModelGatewayPage() {
   const defaultVertexLocation = gatewayConfig?.default_vertex_location || 'eu';
   // Deployment project id (env-driven) as a placeholder hint — never a hardcoded project.
   const defaultVertexProject = gatewayConfig?.default_vertex_project || 'my-gcp-project';
+  // The region a Bedrock model with a blank region is actually called in. Named in the UI because
+  // Bedrock availability is regional and AWS's rejection doesn't say which region it checked.
+  const defaultBedrockRegion = gatewayConfig?.default_bedrock_region || '';
 
   // Picker matches: scoped to the chosen mode, substring-filtered on what's typed, capped.
   const q = form.litellm_model.trim().toLowerCase();
@@ -313,6 +345,35 @@ export function ModelGatewayPage() {
   // `bedrock_converse` model is a Bedrock model), but never for what will be written.
   const effectiveProvider = routableProvider || form.provider;
 
+  // The region THIS deployment will be called in: its own pin, else the gateway's.
+  const effectiveBedrockRegion = form.aws_region_name.trim() || defaultBedrockRegion;
+
+  // Which regions offer the chosen Bedrock id. Only asked once the id is a real catalog entry (the
+  // picker's normal path): probing per keystroke would be a pointless AWS call per character, and a
+  // half-typed id has no answer. Long-cached server-side; advisory, so failures stay invisible.
+  const bedrockModelId = form.litellm_model.trim().replace(/^bedrock\//, '');
+  const isKnownCatalogId = catalog.some((c) => c.model_id === bedrockModelId);
+  const { data: bedrockRegions } = useQuery({
+    queryKey: ['bedrock-regions', bedrockModelId],
+    queryFn: () => getBedrockRegions(bedrockModelId),
+    enabled: dialogOpen && isBedrockProvider(effectiveProvider) && isKnownCatalogId,
+    staleTime: 60 * 60_000,
+    retry: false,
+  });
+  // Four distinct states, and they must stay distinct: the model is in the region we'll call
+  // ('here'), it exists but not there ('elsewhere' — the actionable one), no probed region has it
+  // ('nowhere' — most likely a bad id), or we know the regions but not which one this deployment
+  // will use ('unknown-region'), where saying "not offered here" would be a fabrication.
+  const bedrockAvailability = !bedrockRegions?.regions
+    ? null
+    : bedrockRegions.regions.length === 0
+      ? 'nowhere'
+      : !effectiveBedrockRegion
+        ? 'unknown-region'
+        : bedrockRegions.regions.includes(effectiveBedrockRegion)
+          ? 'here'
+          : 'elsewhere';
+
   // An alias addresses exactly one deployment here (the server 409s on a duplicate): the rate card,
   // the role defaults and the provider check are all keyed on it, and Edit/Remove act on one gateway
   // id. Flag the collision while typing — picking the same catalog entry twice auto-fills the same
@@ -338,6 +399,7 @@ export function ModelGatewayPage() {
     setDialogOpen(false);
     setEditingId(null);
     setForm(EMPTY_FORM);
+    setRegionError(null);
   };
 
   const openCreate = () => {
@@ -463,10 +525,25 @@ export function ModelGatewayPage() {
       }
     },
     onError: (e: unknown) => {
+      const message = errMsg(e);
+      // Bedrock's "invalid model identifier" is a region verdict in disguise. Keep it in the dialog,
+      // next to the field that fixes it, and open that section so it's visible without a click.
+      const hint = bedrockRegionHint(
+        message,
+        form.litellm_model,
+        effectiveBedrockRegion,
+        // If the availability probe answered, name the regions that DO have it instead of leaving
+        // the admin to guess which one to type.
+        bedrockRegions?.regions ?? null,
+      );
+      if (hint) {
+        setRegionError(hint);
+        setCredsOpen(true);
+      }
       toast.error(
         editingId
-          ? `Update applied but its test failed — please verify: ${errMsg(e)}`
-          : `Test failed — registration rolled back: ${errMsg(e)}`,
+          ? `Update applied but its test failed — please verify: ${hint ?? message}`
+          : `Test failed — registration rolled back: ${hint ?? message}`,
       );
       invalidate(); // an edit may have landed; reflect the gateway's real state
     },
@@ -511,6 +588,7 @@ export function ModelGatewayPage() {
   };
 
   const submit = () => {
+    setRegionError(null); // a retry re-answers the question; don't leave the last verdict up
     if (!form.model_name || !form.litellm_model) {
       toast.error('Alias and gateway model id are required');
       return;
@@ -799,6 +877,49 @@ export function ModelGatewayPage() {
                   </div>
                 )}
               </div>
+              {/* Bedrock availability is per-region and AWS's rejection never says which region it
+                  checked, so state it here — before the admin submits and gets an "invalid model
+                  identifier" they'd otherwise read as a bad id. Silent when unknowable. */}
+              {bedrockRegions?.regions && (
+                <p
+                  className={`text-[11px] ${
+                    bedrockAvailability === 'elsewhere' || bedrockAvailability === 'nowhere'
+                      ? 'text-amber-700 dark:text-amber-500'
+                      : 'text-muted-foreground'
+                  }`}
+                >
+                  {bedrockAvailability === 'nowhere' ? (
+                    <>
+                      AWS doesn&apos;t offer this id in any checked region (
+                      {(bedrockRegions.probed_regions ?? []).join(', ')}) — check the model id.
+                    </>
+                  ) : bedrockAvailability === 'here' ? (
+                    <>
+                      Available in <span className="font-mono">{effectiveBedrockRegion}</span>
+                      {bedrockRegions.regions.length > 1 && (
+                        <>
+                          {' '}
+                          (also {bedrockRegions.regions.filter((r) => r !== effectiveBedrockRegion).join(', ')})
+                        </>
+                      )}
+                    </>
+                  ) : bedrockAvailability === 'elsewhere' ? (
+                    <>
+                      Not offered in <span className="font-mono">{effectiveBedrockRegion}</span>
+                      {form.aws_region_name.trim() ? '' : " (the gateway's region)"} — available in{' '}
+                      <span className="font-mono">{bedrockRegions.regions.join(', ')}</span>. Set the AWS
+                      region under “Advanced — region &amp; credentials”.
+                    </>
+                  ) : (
+                    // Region unknown (the deployment pins none and the gateway's isn't readable):
+                    // state where the model exists and stop there — claiming "not offered here" when
+                    // "here" is unknown is how this line first read for a model that was available.
+                    <>
+                      Available in <span className="font-mono">{bedrockRegions.regions.join(', ')}</span>
+                    </>
+                  )}
+                </p>
+              )}
             </div>
             <div className="grid gap-1.5">
               <Label>Alias (what apps request)</Label>
@@ -871,10 +992,23 @@ export function ModelGatewayPage() {
                     <div className="grid gap-1.5">
                       <Label>AWS region (optional)</Label>
                       <Input
-                        placeholder="eu-central-1"
+                        placeholder={defaultBedrockRegion || 'eu-central-1'}
                         value={form.aws_region_name}
                         onChange={(e) => setForm({ ...form, aws_region_name: e.target.value })}
                       />
+                      <p className="text-[11px] text-muted-foreground">
+                        Leave blank to call the model in the gateway&apos;s own region
+                        {defaultBedrockRegion ? (
+                          <>
+                            {' '}
+                            (<span className="font-mono">{defaultBedrockRegion}</span>)
+                          </>
+                        ) : null}
+                        . Bedrock model availability is per-region, so a model that isn&apos;t offered there
+                        fails registration with &ldquo;The provided model identifier is invalid&rdquo; — e.g.{' '}
+                        <span className="font-mono">amazon.nova-2-multimodal-embeddings-v1:0</span> is
+                        us-east-1 only.
+                      </p>
                     </div>
                   )}
                   {isVertexProvider(effectiveProvider) && (
@@ -949,6 +1083,15 @@ export function ModelGatewayPage() {
               </div>
             </div>
           </div>
+
+          {regionError && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm">
+              <div className="flex gap-2">
+                <AlertTriangle className="w-4 h-4 text-destructive mt-0.5 flex-shrink-0" />
+                <p className="text-muted-foreground">{regionError}</p>
+              </div>
+            </div>
+          )}
 
           <DialogFooter>
             <Button variant="outline" onClick={closeDialog}>

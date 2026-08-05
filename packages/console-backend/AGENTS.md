@@ -535,6 +535,23 @@ provider they actually keyed (`ModelRegistrationResponse.provider`) so the UI ne
 with a key that doesn't bill. Do not reintroduce an editable provider input: an admin-typed value in
 the keying path is the whole class of bug this removes.
 
+Related but NOT a keying problem — Bedrock availability is per-REGION, and AWS rejects a model that
+isn't offered in the caller's region with "The provided model identifier is invalid": the same message
+a genuinely wrong model id gets. Registration then rolls the deployment back, so it reads as "this
+model can't be registered" (verified 2026-08-05: `amazon.nova-2-multimodal-embeddings-v1:0` exists in
+us-east-1 only — sync `/v1/embeddings` works there — while `amazon.titan-embed-image-v1` is also in
+eu-central-1). Nothing pins a default region for Bedrock (unlike `_with_default_vertex_location`): a
+blank `aws_region_name` means the proxy pod's own region, surfaced to the UI as
+`GatewayUiConfig.default_bedrock_region` (`AWS_BEDROCK_REGION`, else `AWS_REGION`). The registration
+dialog states availability up front from `GET /bedrock-regions` →
+`services/bedrock_availability_service.py` (ListFoundationModels + ListInferenceProfiles per probed
+region, long-cached), and turns that AWS message into a region verdict on failure. That service is
+ADVISORY: it needs `bedrock:ListFoundationModels`/`ListInferenceProfiles` (granted to the console pod
+role in rcplus-alloy-infrastructure-agents `cf-iam-roles.yml`, catalog reads only — never `Invoke*`,
+which stays with the gateway per ADR-0001), and when the probe can't run it returns `regions: null`
+so the UI says nothing. `null` (can't tell) must never collapse into `[]` (AWS doesn't have it) —
+that would accuse a working model id.
+
 ### Repository Pattern with Automatic Audit Logging (repositories/base.py)
 
 ALL database write operations (INSERT/UPDATE/DELETE) MUST use the repository pattern. The `AuditedRepository` base class automatically logs every mutation with before/after state. Direct SQL writes bypass the audit trail. Repositories call `audit_service.log_action()` automatically in `create()`, `update()`, and `delete()` methods.

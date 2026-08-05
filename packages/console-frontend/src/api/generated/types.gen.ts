@@ -291,6 +291,40 @@ export type AvailableModel = {
 };
 
 /**
+ * BedrockModelRegions
+ *
+ * Where a Bedrock model id can actually be called — availability is per-region.
+ *
+ * ``regions=None`` means the probe itself failed (no permission, no credentials): the UI must stay
+ * silent, not claim the model is unavailable. An empty list IS an answer: none of the probed
+ * regions offer it (a wrong id looks like this too, which is the same ambiguity AWS gives us).
+ */
+export type BedrockModelRegions = {
+    /**
+     * Model Id
+     */
+    model_id: string;
+    /**
+     * Regions
+     *
+     * Probed regions that offer this model; null when availability is unknown
+     */
+    regions?: Array<string> | null;
+    /**
+     * Probed Regions
+     *
+     * Regions that were checked
+     */
+    probed_regions?: Array<string>;
+    /**
+     * Gateway Region
+     *
+     * Region a deployment with no aws_region_name is called in
+     */
+    gateway_region?: string;
+};
+
+/**
  * BillingUnitBreakdown
  *
  * Usage breakdown by billing unit type.
@@ -1735,6 +1769,12 @@ export type GatewayUiConfig = {
      * Suggested GCP project id for new Vertex models; '' when unset (no hardcoded default)
      */
     default_vertex_project?: string;
+    /**
+     * Default Bedrock Region
+     *
+     * AWS region a Bedrock deployment is called in when it pins no aws_region_name (the proxy's AWS_REGION). Shown in the UI because Bedrock model availability is regional: a model absent from this region fails registration with AWS's 'provided model identifier is invalid'.
+     */
+    default_bedrock_region?: string;
 };
 
 /**
@@ -10692,6 +10732,38 @@ export type ModelCatalogApiV1AdminModelGatewayCatalogGetResponses = {
 };
 
 export type ModelCatalogApiV1AdminModelGatewayCatalogGetResponse = ModelCatalogApiV1AdminModelGatewayCatalogGetResponses[keyof ModelCatalogApiV1AdminModelGatewayCatalogGetResponses];
+
+export type BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Model Id
+         *
+         * Bedrock model id or inference-profile id, as typed in the picker
+         */
+        model_id: string;
+    };
+    url: '/api/v1/admin/model-gateway/bedrock-regions';
+};
+
+export type BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetError = BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetErrors[keyof BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetErrors];
+
+export type BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: BedrockModelRegions;
+};
+
+export type BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetResponse = BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetResponses[keyof BedrockModelRegionsApiV1AdminModelGatewayBedrockRegionsGetResponses];
 
 export type CostPrefillApiV1AdminModelGatewayModelsModelNameCostPrefillGetData = {
     body?: never;

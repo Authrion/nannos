@@ -10,12 +10,13 @@ import logging
 from decimal import Decimal
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..config import config
 from ..db.session import DbSession
 from ..dependencies import require_admin
 from ..models.model_gateway import (
+    BedrockModelRegions,
     CatalogModel,
     CostPrefill,
     GatewayModel,
@@ -27,6 +28,7 @@ from ..models.model_gateway import (
 )
 from ..models.usage import RateCardPricingEntry
 from ..models.user import User
+from ..services.bedrock_availability_service import model_regions, probed_regions
 from ..services.model_defaults_service import ModelDefaultsService
 from ..services.model_gateway_service import ModelGatewayError, ModelGatewayService
 from ..services.rate_card_service import resolve_deployment_provider, route_family
@@ -273,6 +275,7 @@ async def gateway_ui_config(user: User = Depends(require_admin)):
     return GatewayUiConfig(
         default_vertex_location=config.model_gateway.default_vertex_location,
         default_vertex_project=config.model_gateway.default_vertex_project,
+        default_bedrock_region=config.model_gateway.default_bedrock_region,
     )
 
 
@@ -290,6 +293,25 @@ async def model_catalog(request: Request, user: User = Depends(require_admin)):
     except ModelGatewayError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
     return [{**entry, "family": route_family(entry.get("provider"))} for entry in catalog]
+
+
+@router.get("/bedrock-regions", response_model=BedrockModelRegions)
+async def bedrock_model_regions(
+    model_id: str = Query(..., description="Bedrock model id or inference-profile id, as typed in the picker"),
+    _: User = Depends(require_admin),
+):
+    """Which regions offer this Bedrock model — the question AWS's error refuses to answer.
+
+    Advisory only: never blocks registration, and answers ``regions: null`` when the probe can't run
+    (no ``bedrock:ListFoundationModels``, no credentials), in which case the UI shows nothing rather
+    than claiming the model is unavailable. Long-cached server-side.
+    """
+    return BedrockModelRegions(
+        model_id=model_id,
+        regions=await model_regions(model_id),
+        probed_regions=probed_regions(),
+        gateway_region=config.model_gateway.default_bedrock_region,
+    )
 
 
 @router.get("/models/{model_name}/cost-prefill", response_model=CostPrefill)

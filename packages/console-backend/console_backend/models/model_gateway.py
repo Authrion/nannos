@@ -153,6 +153,31 @@ class GatewayUiConfig(BaseModel):
     default_vertex_project: str = Field(
         "", description="Suggested GCP project id for new Vertex models; '' when unset (no hardcoded default)"
     )
+    default_bedrock_region: str = Field(
+        "",
+        description=(
+            "AWS region a Bedrock deployment is called in when it pins no aws_region_name (the "
+            "proxy's AWS_REGION). Shown in the UI because Bedrock model availability is regional: a "
+            "model absent from this region fails registration with AWS's 'provided model identifier "
+            "is invalid'."
+        ),
+    )
+
+
+class BedrockModelRegions(BaseModel):
+    """Where a Bedrock model id can actually be called — availability is per-region.
+
+    ``regions=None`` means the probe itself failed (no permission, no credentials): the UI must stay
+    silent, not claim the model is unavailable. An empty list IS an answer: none of the probed
+    regions offer it (a wrong id looks like this too, which is the same ambiguity AWS gives us).
+    """
+
+    model_id: str
+    regions: list[str] | None = Field(
+        None, description="Probed regions that offer this model; null when availability is unknown"
+    )
+    probed_regions: list[str] = Field(default_factory=list, description="Regions that were checked")
+    gateway_region: str = Field("", description="Region a deployment with no aws_region_name is called in")
 
 
 class CostPrefill(BaseModel):
