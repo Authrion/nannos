@@ -125,7 +125,9 @@ async def generate_watch_params(
         "For `job_type='task'`, supply a `sub_agent_id` referencing an `automated` sub-agent. "
         "For `job_type='watch'`, supply `check_tool`, `check_args`, `condition_expr`, and `expected_value` "
         "(JSONPath + expected value for comparison) so the scheduler can poll a condition before optionally invoking an agent. "
-        "Supply a `delivery_channel_id` referencing a registered delivery channel."
+        "Supply a `delivery_channel_id` referencing a registered delivery channel. "
+        "Cron expressions are evaluated in the job's `timezone` (defaults to the user's settings timezone), "
+        "so write them as the user's local wall-clock time — never convert to UTC."
     ),
     operation_id="scheduler_create_job",
     tags=["MCP"],
@@ -327,7 +329,12 @@ async def resume_job(
     current_user: User = Depends(require_auth_or_bearer_token),
 ) -> ScheduledJob:
     service = _get_scheduler_service(request)
-    ok = await service.resume_job(db=db, job_id=job_id, actor=current_user)
+    try:
+        ok = await service.resume_job(db=db, job_id=job_id, actor=current_user)
+    except ValueError as e:
+        # Completed once-jobs and unresolvable stored timezones must surface as
+        # an actionable 400, not an opaque 500.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
     job = await service.get_job(db=db, job_id=job_id, user_id=current_user.id)

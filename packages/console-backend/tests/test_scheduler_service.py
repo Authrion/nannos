@@ -16,7 +16,7 @@ from console_backend.models.scheduled_job import (
     ScheduledJobUpdate,
     ScheduleKind,
 )
-from console_backend.models.user import User, UserRole, UserStatus
+from console_backend.models.user import User, UserRole, UserSettings, UserStatus
 from console_backend.services.scheduler_service import SchedulerService
 
 
@@ -90,11 +90,23 @@ def mock_delivery_channel_repo():
 
 
 @pytest.fixture
-def service(mock_repo, mock_sub_agent_service, mock_delivery_channel_repo) -> SchedulerService:
+def mock_user_settings_service():
+    svc = AsyncMock()
+    # Explicit timezone — the model default follows the DEFAULT_TIMEZONE env
+    # var, which must not leak into these assertions.
+    svc.get_settings.return_value = UserSettings(user_id="user-123", timezone="Europe/Zurich")
+    return svc
+
+
+@pytest.fixture
+def service(
+    mock_repo, mock_sub_agent_service, mock_delivery_channel_repo, mock_user_settings_service
+) -> SchedulerService:
     s = SchedulerService()
     s.set_repository(mock_repo)
     s.set_sub_agent_service(mock_sub_agent_service)
     s.set_delivery_channel_repository(mock_delivery_channel_repo)
+    s.set_user_settings_service(mock_user_settings_service)
     return s
 
 
@@ -588,3 +600,243 @@ class TestUpdateJobScheduleSwitch:
         fields = mock_repo.update_job.call_args[1]["fields"]
         for f in ("schedule_kind", "cron_expr", "interval_seconds", "run_at", "next_run_at"):
             assert f not in fields
+
+
+class TestJobTimezone:
+    """Jobs snapshot the owner's settings timezone and evaluate cron in it."""
+
+    @staticmethod
+    def _cron_create(timezone_name: str | None = None) -> ScheduledJobCreate:
+        return ScheduledJobCreate(
+            sub_agent_id=42,
+            name="Morning Priorities",
+            job_type=JobType.TASK,
+            schedule_kind=ScheduleKind.CRON,
+            cron_expr="0 8 * * *",
+            timezone=timezone_name,
+            prompt="Summarize",
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_defaults_timezone_from_user_settings(
+        self,
+        service: SchedulerService,
+        mock_repo: AsyncMock,
+        mock_sub_agent_service: AsyncMock,
+        mock_user_settings_service: AsyncMock,
+        actor: User,
+    ):
+        db = AsyncMock()
+        accessible = MagicMock()
+        accessible.id = 42
+        mock_sub_agent_service.get_accessible_sub_agents.return_value = [accessible]
+        mock_repo.create_job.return_value = 1
+        mock_repo.get_job.return_value = _make_job(job_id=1)
+
+        await service.create_job(db=db, data=self._cron_create(), actor=actor)
+
+        mock_user_settings_service.get_settings.assert_awaited_once()
+        fields = mock_repo.create_job.call_args[1]["fields"]
+        assert fields["timezone"] == "Europe/Zurich"
+
+    @pytest.mark.asyncio
+    async def test_create_explicit_timezone_skips_settings_lookup(
+        self,
+        service: SchedulerService,
+        mock_repo: AsyncMock,
+        mock_sub_agent_service: AsyncMock,
+        mock_user_settings_service: AsyncMock,
+        actor: User,
+    ):
+        db = AsyncMock()
+        accessible = MagicMock()
+        accessible.id = 42
+        mock_sub_agent_service.get_accessible_sub_agents.return_value = [accessible]
+        mock_repo.create_job.return_value = 1
+        mock_repo.get_job.return_value = _make_job(job_id=1)
+
+        await service.create_job(db=db, data=self._cron_create("America/New_York"), actor=actor)
+
+        mock_user_settings_service.get_settings.assert_not_awaited()
+        fields = mock_repo.create_job.call_args[1]["fields"]
+        assert fields["timezone"] == "America/New_York"
+
+    @pytest.mark.asyncio
+    async def test_cron_next_run_uses_job_timezone(
+        self, service: SchedulerService, mock_repo: AsyncMock, mock_sub_agent_service: AsyncMock, actor: User
+    ):
+        """'0 8 * * *' in Europe/Zurich must fire at 08:00 Zurich time, not 08:00 UTC."""
+        from zoneinfo import ZoneInfo
+
+        db = AsyncMock()
+        accessible = MagicMock()
+        accessible.id = 42
+        mock_sub_agent_service.get_accessible_sub_agents.return_value = [accessible]
+        mock_repo.create_job.return_value = 1
+        mock_repo.get_job.return_value = _make_job(job_id=1)
+
+        await service.create_job(db=db, data=self._cron_create(), actor=actor)
+
+        next_run_at = mock_repo.create_job.call_args[1]["fields"]["next_run_at"]
+        local = next_run_at.astimezone(ZoneInfo("Europe/Zurich"))
+        assert (local.hour, local.minute) == (8, 0)
+
+    @pytest.mark.asyncio
+    async def test_naive_run_at_is_interpreted_in_job_timezone(
+        self, service: SchedulerService, mock_repo: AsyncMock, mock_sub_agent_service: AsyncMock, actor: User
+    ):
+        """A datetime-local value without offset means local wall-clock, not UTC."""
+        from zoneinfo import ZoneInfo
+
+        db = AsyncMock()
+        accessible = MagicMock()
+        accessible.id = 42
+        mock_sub_agent_service.get_accessible_sub_agents.return_value = [accessible]
+        mock_repo.create_job.return_value = 1
+        mock_repo.get_job.return_value = _make_job(job_id=1)
+
+        once_data = ScheduledJobCreate(
+            sub_agent_id=42,
+            name="Once Local Task",
+            job_type=JobType.TASK,
+            schedule_kind=ScheduleKind.ONCE,
+            run_at=datetime(2027, 6, 15, 14, 30),  # naive — as the datetime-local input sends it
+            prompt="Run once",
+        )
+        await service.create_job(db=db, data=once_data, actor=actor)
+
+        fields = mock_repo.create_job.call_args[1]["fields"]
+        assert fields["run_at"] == datetime(2027, 6, 15, 14, 30, tzinfo=ZoneInfo("Europe/Zurich"))
+        assert fields["next_run_at"] == fields["run_at"]
+
+    @pytest.mark.asyncio
+    async def test_update_timezone_recomputes_next_run_at(
+        self, service: SchedulerService, mock_repo: AsyncMock, actor: User
+    ):
+        from zoneinfo import ZoneInfo
+
+        db = AsyncMock()
+        existing_job = _make_job(
+            user_id=actor.id, schedule_kind=ScheduleKind.CRON, interval_seconds=None
+        )
+        existing_job.cron_expr = "0 8 * * *"
+        mock_repo.get_job.side_effect = [existing_job, existing_job]
+        mock_repo.update_job.return_value = None
+
+        await service.update_job(
+            db=db, job_id=1, data=ScheduledJobUpdate(timezone="Asia/Tokyo"), actor=actor
+        )
+
+        fields = mock_repo.update_job.call_args[1]["fields"]
+        assert fields["timezone"] == "Asia/Tokyo"
+        local = fields["next_run_at"].astimezone(ZoneInfo("Asia/Tokyo"))
+        assert (local.hour, local.minute) == (8, 0)
+
+
+class TestResumeJob:
+    """resume_job guards: a finished once-job must not silently re-run."""
+
+    @pytest.mark.asyncio
+    async def test_resume_completed_once_job_raises(
+        self, service: SchedulerService, mock_repo: AsyncMock, actor: User
+    ):
+        now = datetime.now(timezone.utc)
+        job = _make_job(user_id=actor.id, schedule_kind=ScheduleKind.ONCE, interval_seconds=None)
+        job.run_at = now - timedelta(hours=1)
+        job.next_run_at = job.run_at
+        job.enabled = False
+        mock_repo.get_job.return_value = job
+
+        with pytest.raises(ValueError, match="already run"):
+            await service.resume_job(db=AsyncMock(), job_id=1, actor=actor)
+        mock_repo.update_job.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resume_future_once_job_re_enables(
+        self, service: SchedulerService, mock_repo: AsyncMock, actor: User
+    ):
+        now = datetime.now(timezone.utc)
+        job = _make_job(user_id=actor.id, schedule_kind=ScheduleKind.ONCE, interval_seconds=None)
+        job.run_at = now + timedelta(days=1)
+        job.next_run_at = job.run_at
+        job.enabled = False
+        mock_repo.get_job.return_value = job
+
+        assert await service.resume_job(db=AsyncMock(), job_id=1, actor=actor) is True
+        fields = mock_repo.update_job.call_args[1]["fields"]
+        assert fields["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_resume_cron_job_with_invalid_timezone_raises_value_error(
+        self, service: SchedulerService, mock_repo: AsyncMock, actor: User
+    ):
+        """An unresolvable stored timezone surfaces as ValueError (→ 400), not KeyError (→ 500)."""
+        job = _make_job(user_id=actor.id, schedule_kind=ScheduleKind.CRON, interval_seconds=None)
+        job.cron_expr = "0 8 * * *"
+        job.timezone = "Zurich"  # migrated verbatim from unvalidated user settings
+        job.enabled = False
+        mock_repo.get_job.return_value = job
+
+        with pytest.raises(ValueError, match="Unknown IANA timezone"):
+            await service.resume_job(db=AsyncMock(), job_id=1, actor=actor)
+
+
+class TestSettingsTimezoneFallback:
+    """Empty or missing settings timezones resolve through DEFAULT_TIMEZONE."""
+
+    @pytest.mark.asyncio
+    async def test_empty_settings_timezone_falls_back_to_env_default(
+        self,
+        service: SchedulerService,
+        mock_repo: AsyncMock,
+        mock_sub_agent_service: AsyncMock,
+        mock_user_settings_service: AsyncMock,
+        actor: User,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("DEFAULT_TIMEZONE", "Asia/Tokyo")
+        # Legacy rows can carry an empty string (predates schema validation).
+        mock_user_settings_service.get_settings.return_value = UserSettings(user_id=actor.id, timezone="")
+        accessible = MagicMock()
+        accessible.id = 42
+        mock_sub_agent_service.get_accessible_sub_agents.return_value = [accessible]
+        mock_repo.create_job.return_value = 1
+        mock_repo.get_job.return_value = _make_job(job_id=1)
+
+        data = ScheduledJobCreate(
+            sub_agent_id=42,
+            name="Morning Priorities",
+            job_type=JobType.TASK,
+            schedule_kind=ScheduleKind.CRON,
+            cron_expr="0 8 * * *",
+            prompt="Summarize",
+        )
+        await service.create_job(db=AsyncMock(), data=data, actor=actor)
+
+        fields = mock_repo.create_job.call_args[1]["fields"]
+        assert fields["timezone"] == "Asia/Tokyo"
+
+    @pytest.mark.asyncio
+    async def test_invalid_settings_timezone_raises_clean_value_error(
+        self,
+        service: SchedulerService,
+        mock_repo: AsyncMock,
+        mock_sub_agent_service: AsyncMock,
+        mock_user_settings_service: AsyncMock,
+        actor: User,
+    ):
+        mock_user_settings_service.get_settings.return_value = UserSettings(user_id=actor.id, timezone="Zurich")
+        accessible = MagicMock()
+        accessible.id = 42
+        mock_sub_agent_service.get_accessible_sub_agents.return_value = [accessible]
+
+        data = ScheduledJobCreate(
+            sub_agent_id=42,
+            name="Morning Priorities",
+            job_type=JobType.TASK,
+            schedule_kind=ScheduleKind.CRON,
+            cron_expr="0 8 * * *",
+            prompt="Summarize",
+        )
+        with pytest.raises(ValueError, match="settings timezone"):
+            await service.create_job(db=AsyncMock(), data=data, actor=actor)
