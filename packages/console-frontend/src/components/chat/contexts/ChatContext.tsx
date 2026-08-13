@@ -17,6 +17,9 @@ import { getCurrentUserSettingsApiV1AuthMeSettingsGetOptions } from '@/api/gener
 import type { UploadedFileInfo } from '@/api/generated';
 import { config } from '@/config';
 
+/** Messages fetched per request — the backend caps `limit` at 100. */
+const MESSAGE_PAGE_SIZE = 100;
+
 interface ChatContextType {
   // State
   conversations: Conversation[];
@@ -33,6 +36,10 @@ interface ChatContextType {
   } | null;
   isLoadingConversations: boolean;
   isLoadingMessages: boolean;
+  /** True while an older page of the active conversation's history is being fetched. */
+  isLoadingOlderMessages: boolean;
+  /** Whether the active conversation has older messages left to page in. */
+  hasMoreMessages: boolean;
   isConnected: boolean;
   isWaiting: boolean;
   streamingMessage: string | null;
@@ -53,6 +60,8 @@ interface ChatContextType {
   dismissFeedbackRequest: () => void;
   updateSettings: (settings: Settings) => Promise<boolean>;
   loadConversations: (search?: string) => Promise<void>;
+  /** Page in the messages that precede the oldest one currently loaded. */
+  loadOlderMessages: () => Promise<void>;
 }
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
@@ -244,6 +253,9 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [messagesMap, setMessagesMap] = useState<Map<string, Message[]>>(new Map());
+  // Mirror for synchronous reads inside loadMessages (which is deliberately kept
+  // dependency-free so effects don't resubscribe on every message).
+  const messagesMapRef = useRef<Map<string, Message[]>>(new Map());
   const [tasksMap, setTasksMap] = useState<Map<string, Task[]>>(new Map());
   const [contextIdsMap, setContextIdsMap] = useState<Map<string, string>>(new Map());
   const [waitingMap, setWaitingMap] = useState<Map<string, boolean>>(new Map());
@@ -271,6 +283,15 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
   const statusHistoryMapRef = useRef<Map<string, Array<{timestamp: Date; message: string; source?: string}>>>(new Map());
   const [isLoadingConversations, setIsLoadingConversations] = useState(false);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
+  // Keyset pagination state per conversation: `cursor` is the message_id the next
+  // (older) page starts from, `hasMore` whether such a page exists at all.
+  const [messagePageMap, setMessagePageMap] = useState<Map<string, { cursor: string | null; hasMore: boolean }>>(
+    new Map()
+  );
+  const [loadingOlderIds, setLoadingOlderIds] = useState<Set<string>>(new Set());
+  // Mirror for synchronous read inside loadOlderMessages, so two scroll events in
+  // the same frame can't fire the same page request twice.
+  const loadingOlderIdsRef = useRef<Set<string>>(new Set());
   // Settings are ephemeral and not persisted to localStorage
   const [settings, setSettings] = useState<Settings | null>(null);
 
@@ -286,6 +307,10 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
     activeConversationIdRef.current = activeConversationId;
   }, [activeConversationId]);
 
+  useEffect(() => {
+    messagesMapRef.current = messagesMap;
+  }, [messagesMap]);
+
   // Keep playground-mode ref in sync so config-hash filtering and message
   // tagging pick up changes (e.g. when the user views a different sub-agent
   // version in the playground) without relying solely on a provider remount.
@@ -299,6 +324,8 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
     [pendingInterruptMap, activeConversationId]
   );
   const messages = activeConversationId ? messagesMap.get(activeConversationId) || [] : [];
+  const hasMoreMessages = activeConversationId ? messagePageMap.get(activeConversationId)?.hasMore === true : false;
+  const isLoadingOlderMessages = activeConversationId ? loadingOlderIds.has(activeConversationId) : false;
   const tasks = activeConversationId ? tasksMap.get(activeConversationId) || [] : [];
   const isWaiting = activeConversationId ? waitingMap.get(activeConversationId) === true : false;
   const streamingMessage = activeConversationId ? streamingMap.get(activeConversationId) ?? null : null;
@@ -1001,12 +1028,25 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
     }
   }, [settings?.agentUrl, activeConversationId, contextIdsMap]);
 
-  // Load messages for a conversation
-  const loadMessages = useCallback(async (conversationId: string) => {
-    setIsLoadingMessages(true);
+  // Load one page of a conversation's messages.
+  //
+  // Without `before` this fetches the NEWEST page (what the user sees on open);
+  // with a cursor it fetches the page of older messages that precedes it, which is
+  // merged into the existing list rather than replacing it.
+  const loadMessages = useCallback(async (conversationId: string, before?: string) => {
+    const isOlderPage = before !== undefined;
+    if (isOlderPage) {
+      loadingOlderIdsRef.current.add(conversationId);
+      setLoadingOlderIds(new Set(loadingOlderIdsRef.current));
+    } else {
+      setIsLoadingMessages(true);
+    }
     try {
       const url = new URL(`/api/v1/messages/${encodeURIComponent(conversationId)}`, window.location.origin);
-      url.searchParams.set('limit', '100');
+      url.searchParams.set('limit', String(MESSAGE_PAGE_SIZE));
+      if (before !== undefined) {
+        url.searchParams.set('before', before);
+      }
 
       // Inject impersonation headers if active
       const headers: HeadersInit = {};
@@ -1027,11 +1067,40 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
         if (resp.status === 404) {
           return;
         }
+        // The cursor no longer names a message (history pruned, or the message was
+        // removed). Retrying it would fail forever, so retire it rather than leaving
+        // every scroll-to-top firing a doomed request.
+        if (resp.status === 400 && isOlderPage) {
+          setMessagePageMap((prev) => new Map(prev).set(conversationId, { cursor: null, hasMore: false }));
+          return;
+        }
         throw new Error(`Failed to load messages (status=${resp.status})`);
       }
       const data = await resp.json();
 
       const raw = Array.isArray(data.items) ? data.items : Array.isArray(data.messages) ? data.messages : [];
+
+      // Remember where the next (older) page starts. A refetch of the NEWEST page
+      // (e.g. after a socket snapshot) must not rewind a cursor that has already been
+      // paged backwards — unless the page doesn't even reach what we hold, which means
+      // more than a page arrived while we were away and there is now a gap in between.
+      // Adopting the fresh cursor then lets the reader page back across that gap.
+      const pageState = {
+        cursor: (data.next_cursor as string | null) ?? null,
+        hasMore: !!data.has_more,
+      };
+      const held = messagesMapRef.current.get(conversationId) || [];
+      const oldestInPage = raw.length > 0 ? (raw[0].created_at || raw[0].timestamp) : null;
+      const gapAboveHeld =
+        held.length > 0 &&
+        oldestInPage !== null &&
+        new Date(oldestInPage as string).getTime() > held[held.length - 1].timestamp.getTime();
+      setMessagePageMap((prev) => {
+        if (!isOlderPage && prev.has(conversationId) && !gapAboveHeld) return prev;
+        const next = new Map(prev);
+        next.set(conversationId, pageState);
+        return next;
+      });
 
       const mapped: Message[] = raw
         .map((m: Record<string, unknown>) => {
@@ -1154,7 +1223,9 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
       // Restore pending HITL interrupt if the last agent status is still input-required.
       // Find the most recent input-required + HITL message, then check whether a later
       // non-input-required status-update exists (which would mean the interrupt was resolved).
-      const hitlMsg = [...raw].reverse().find((m: Record<string, unknown>) => {
+      // Only the newest page can carry a still-pending interrupt — an older page's
+      // input-required status was necessarily resolved by something further down.
+      const hitlMsg = isOlderPage ? undefined : [...raw].reverse().find((m: Record<string, unknown>) => {
         if (m.kind !== 'status-update' || getTaskState(m.state as string | undefined) !== 'input-required') return false;
         try {
           const payload = typeof m.raw_payload === 'string' ? JSON.parse(m.raw_payload as string) : null;
@@ -1208,9 +1279,26 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
     } catch (e) {
       console.error('loadMessages failed', e);
     } finally {
-      setIsLoadingMessages(false);
+      if (isOlderPage) {
+        loadingOlderIdsRef.current.delete(conversationId);
+        setLoadingOlderIds(new Set(loadingOlderIdsRef.current));
+      } else {
+        setIsLoadingMessages(false);
+      }
     }
   }, []);
+
+  // Page in the messages preceding the oldest one currently loaded for the active
+  // conversation. No-op when the conversation start has been reached or a page is
+  // already in flight — the scroll handler fires far more often than pages arrive.
+  const loadOlderMessages = useCallback(async () => {
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) return;
+    if (loadingOlderIdsRef.current.has(conversationId)) return;
+    const page = messagePageMap.get(conversationId);
+    if (!page?.hasMore || !page.cursor) return;
+    await loadMessages(conversationId, page.cursor);
+  }, [messagePageMap, loadMessages]);
 
   // Apply the snapshot returned when (re)subscribing to a conversation.
   //
@@ -1622,6 +1710,8 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
         userSettings: userSettings || null,
         isLoadingConversations,
         isLoadingMessages,
+        isLoadingOlderMessages,
+        hasMoreMessages,
         isConnected,
         isWaiting,
         streamingMessage,
@@ -1640,6 +1730,7 @@ export function ChatProvider({ children, playgroundMode }: ChatProviderProps) {
         sendSilentMessage: sendSilentMessageAction,
         updateSettings,
         loadConversations,
+        loadOlderMessages,
       }}
     >
       {children}
