@@ -12,7 +12,7 @@ import { A2AClientService, A2ASlackBasedRequest } from '../../services/a2aClient
 import type { Message, Task, TaskStatusUpdateEvent } from '@a2a-js/sdk';
 import { FileStorageService } from '../../services/fileStorageService.js';
 import type { IContextStore, IPendingRequestStore, IInFlightTaskStore, ContextRecord } from '../../storage/types.js';
-import { handleError, postMessage, finalizeStreamedTask, isInterruptedOrTerminated, isTerminatedState } from '../../utils/taskResponseHandler.js';
+import { handleError, postMessage, finalizeStreamedTask, isInterruptedOrTerminated, isTerminatedState, isTurnDelivered } from '../../utils/taskResponseHandler.js';
 import { ThinkingStepsStreamer, type WorkPlanTodo } from '../../utils/thinkingStepsStreamer.js';
 import { FeedbackService } from '../../services/feedbackService.js';
 import _ from 'lodash';
@@ -503,6 +503,13 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
   // the stream (it can close right after the final artifact), so keying deletion
   // off the state alone leaves the record behind and the recovery loop re-posts.
   let responsePosted = false;
+  // Set when the A2A stream throws mid-flight (transport drop, orchestrator
+  // restart/OOM). The task itself is usually still running server-side, so this
+  // is NOT a failed turn — it's an undelivered one. It changes two decisions in
+  // the finally cleanup: the dangling stream is sealed with a visible notice
+  // instead of being deleted, and the in-flight record is kept so the recovery
+  // loop can finish the turn.
+  let streamErrored = false;
   // Declared at function scope so the finally cleanup can read the final task
   // state to decide whether the stream was sealed.
   let accumulatedTask: Task | null = null;
@@ -975,14 +982,22 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
         logger.debug({ taskId: accumulatedTask?.id }, `Current state: ${accumulatedTask?.status?.state}`);
       }
     } catch (error) {
+      streamErrored = true;
       logger.error(error, `A2A stream error: ${error}`);
     }
 
     // Build the final response
     if (!accumulatedTask) {
-      logger.error(
-        `No task information received from A2A server. Silently failing without sending a response to the user.`
-      );
+      // No task event ever arrived. There is nothing to recover — without a task
+      // id we cannot poll for the result — so this turn is definitively lost and
+      // the user must be told. Previously this returned silently (the log line
+      // said so in as many words), producing the same "bot ignored me" symptom
+      // one event earlier than the dropped-stream case handled above.
+      // The finally block below discards the dangling widget (accumulatedTask is
+      // null, so it takes the discard path), leaving handleError's message as the
+      // only thing on screen.
+      logger.error(`No task information received from A2A server (streamErrored=${streamErrored})`);
+      await handleError(client, channelId, threadTs, messageTs);
       return;
     }
 
@@ -1005,8 +1020,13 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
         statusMessageTs,
       },
     });
-    // We've delivered the final answer to Slack — recovery must never re-post it.
-    responsePosted = true;
+    // See isTurnDelivered for why this is a shared, tested helper rather than an
+    // inline expression: both directions fail silently, and both have been wrong.
+    responsePosted = isTurnDelivered({
+      finalizeMessageTs: result.messageTs,
+      hasStreamedAnswer: streamer.hasAnswer,
+      streamErrored,
+    });
     if (result.messageTs) {
       contextStore.set(contextKey, accumulatedTask?.contextId, result.messageTs).catch((err) => {
         logger.error(err, `Failed to update context store for task ${accumulatedTask?.id}: ${err}`);
@@ -1114,23 +1134,53 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
     // thinking-steps message is left behind. Inferred from the task state rather
     // than a manual flag.
     if (!isInterruptedOrTerminated(accumulatedTask?.status?.state)) {
-      await streamer.discard();
+      if (streamErrored && accumulatedTask) {
+        // The stream dropped while the agent was still working. The widget is
+        // already on screen and the user watched it appear, so deleting it (the
+        // `discard()` below) makes the bot look like it silently ignored them.
+        // Seal it with a visible notice instead and leave it in place.
+        //
+        // The in-flight record is kept below so the recovery loop can poll the
+        // task. Whether that yields an answer depends on WHY the stream dropped:
+        // a transport blip leaves the task running server-side and recovery will
+        // post the answer into this thread, but if the orchestrator itself died
+        // (e.g. OOM) nothing re-invokes the run on restart and the task stays
+        // non-terminal forever. Recovery distinguishes the two by polling and,
+        // past MAX_RECOVERY_AGE_MS, posts a give-up notice instead — so the
+        // wording below promises a follow-up, not an answer.
+        await streamer
+          .finish({
+            trailingMarkdown:
+              '\n\n⚠️ _Lost the connection to the agent while it was working. ' +
+              "I'll post the answer here if it can still be recovered, and tell you if it can't._",
+            planTitle: 'Interrupted',
+          })
+          .catch((err) => logger.error(err, `Failed to seal dropped stream: ${err}`));
+      } else {
+        await streamer.discard();
+      }
     }
 
     // Remove the in-flight record once we've delivered a response to Slack,
     // otherwise the periodic recovery loop treats the leftover record as orphaned
     // and re-posts the message ~5 min later (the recovery cadence). The signal is
-    // `responsePosted` (set right after finalize), NOT the task state: a soft
+    // `responsePosted` (set from finalize's own result — it is false when finalize
+    // returned without posting), NOT the task state: a soft
     // `input-required` clarification ("did you mean…?") is delivered through the
     // normal finalize path, so even though the state is "interrupted" we've
     // already shown it to the user and must delete the record. A terminal state
-    // is also a delete (covers any path that ends without posting). Records are
-    // deliberately KEPT when:
-    //   - a true HITL approval widget was posted — that path returns early before
-    //     finalize, so responsePosted stays false and the record persists for the
-    //     resume turn;
-    //   - the stream dropped/errored mid-flight while still "working" — recovery
-    //     should legitimately finish it.
+    // is also a delete (covers any path that ends without posting).
+    //
+    // A HITL approval widget is a DELETE, not a keep: that path sets
+    // responsePosted itself (see the interrupt branch above) because the widget
+    // has been delivered and the resume turn re-enters via the IDs in the
+    // button payload, not via this record. Leaving it would let recovery re-post
+    // the approval prompt ~5 min later.
+    //
+    // The record is deliberately KEPT when the stream dropped/errored mid-flight
+    // while still "working" and nothing reached the user — recovery polls the
+    // task and either delivers the answer or, past its own give-up threshold,
+    // tells the user the turn was lost.
     if (accumulatedTask && (responsePosted || isTerminatedState(accumulatedTask.status?.state))) {
       await inFlightTaskStore.delete(accumulatedTask.id).catch((err) => {
         logger.error(err, `Failed to delete in-flight task ${accumulatedTask?.id} after delivery: ${err}`);

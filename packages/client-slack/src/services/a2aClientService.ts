@@ -182,7 +182,16 @@ export class A2AClientService {
     // Build message parts (text + optional files)
     const messageParts = this.buildMessageParts(request);
 
-    // Build A2A message send params
+    // NOTE: no `configuration.pushNotificationConfig` is sent here, even though
+    // the request carries webhookUrl/webhookToken. Wiring it up is not a one-line
+    // change and sending it half-configured is worse than not sending it:
+    //   - the callback route validates the token against the per-installation
+    //     secret (validateNotificationToken in slackApp.ts), not against the
+    //     per-turn randomUUID the caller generates, so every push would 403 —
+    //     after an uncached listAll() scan of all installations;
+    //   - handleA2ANotification only understands scheduler payloads and DMs, so
+    //     even a validated chat-turn Task would be dropped with a warning.
+    // Tracked in ringier-data/nannos#150.
     const sendParams: MessageSendParams = {
       message: {
         messageId,
