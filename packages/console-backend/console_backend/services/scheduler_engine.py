@@ -231,6 +231,9 @@ class SchedulerEngine:
             "scheduled_job_id": job.id,
             "scheduled_job_run_id": run_id,
             "job_type": job.job_type.value,
+            # The job's IANA timezone, so the runner's tool-less LLM calls
+            # (condition eval, notification generation) can be told "now".
+            "timezone": job.timezone or None,
         }
 
         if job.sub_agent_id is not None:
@@ -245,6 +248,9 @@ class SchedulerEngine:
                 "expected_value": job.expected_value,
                 "llm_condition": job.llm_condition,
                 "last_check_result": job.last_check_result,
+                # Custom instruction for the sub-agent triggered by the condition
+                # (agent-runner falls back to a generic instruction when unset).
+                "prompt": job.prompt or None,
             }
 
         # Select the appropriate message content based on job type
