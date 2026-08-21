@@ -56,12 +56,84 @@ Decision formats:
   - reject:  {"type": "reject", "message": "reason text"}
 """
 
+CONVERSATION_ORIGIN_EXTENSION = "urn:nannos:a2a:conversation-origin:1.0"
+"""Request-side extension: what a new conversation originates from.
+
+A conversation is sometimes opened *about* prior work the orchestrator never
+saw — a scheduled run's delivered output, a reported bug, an old conversation
+found in search. Clients describe that origin as a DataPart (identified by its
+top-level ``origin`` key, mirroring the ``decisions`` convention of the
+human-in-the-loop extension):
+
+  {
+    "origin": {
+      "kind": "<origin kind>",
+      ...kind-specific fields
+    }
+  }
+
+Clients may attach it on every message of the thread/channel context it
+belongs to; the orchestrator consumes it only on the first turn of a
+conversation (empty checkpoint), where the kind's registered builder
+reconstructs the origin as synthetic history, and ignores it otherwise
+(unknown kinds are skipped with a log line, never an error). This carries
+*data*, not state: it reconstructs context for the model — it does not fork
+or resume the referenced conversation's checkpoint. A kind MAY additionally
+enable cross-service conversation adoption (below), but only from ids the
+orchestrator re-resolves server-side for the authenticated user — never from
+the DataPart's own values, which are client-supplied and untrusted.
+
+Registered kinds:
+
+``scheduled_run`` — a scheduled job run executed on agent-runner whose output
+was delivered to the user (the reply arrives under that notification):
+
+  {
+    "origin": {
+      "kind": "scheduled_run",
+      "context_id": "<A2A context id of the run on agent-runner>",
+      "scheduled_job_id": 7,
+      "scheduled_job_run_id": 42,
+      "sub_agent_id": 5,
+      "sub_agent_name": "Report Agent",
+      "prompt": "<the prompt the run was dispatched with>",
+      "result_summary": "<the delivered agent output>",
+      "scheduler_status": "success" | "failed",
+      "error_message": "<set when failed>",
+      "task_state": "completed" | "input_required" | "failed"  // optional: the
+        // sub-agent's terminal A2A task state. "input_required" means the run
+        // did not finish — it asked the user a question and its conversation
+        // is waiting for the answer; the reconstruction then frames the reply
+        // as that answer and steers toward forwarding it to the sub-agent.
+    }
+  }
+
+Reconstructed as a synthetic delegation turn (job prompt -> ``task`` tool
+call -> run output). ``context_id`` is provenance data about the sub-agent's
+own conversation — it must never be sent as the request's contextId.
+
+The orchestrator additionally attempts conversation adoption: it resolves
+the job and run via console-backend under the authenticated user's token
+(ownership check + server-stored ``conversation_id``, ignoring the
+DataPart's ``context_id``) and seeds ``a2a_tracking`` so a follow-up
+delegation to that sub-agent continues the run's own conversation — the
+workflow continues (e.g. a run that ended asking the user for input)
+instead of the sub-agent starting blank. One contract, two continuity
+mechanisms: REMOTE runs resume by contextId on the executing server;
+LOCAL/AUTOMATED runs are forked — the run's checkpoint is copied from the
+shared checkpoint tables into the conversation's own thread on first
+delegation. Automated (scheduler-only) sub-agents become delegable inside
+the adopting conversation only. Foundry runs are not adopted (their
+continuity is a session rid the provenance does not carry).
+"""
+
 ALL_EXTENSIONS = [
     ACTIVITY_LOG_EXTENSION,
     WORK_PLAN_EXTENSION,
     INTERMEDIATE_OUTPUT_EXTENSION,
     FEEDBACK_REQUEST_EXTENSION,
     HUMAN_IN_THE_LOOP_EXTENSION,
+    CONVERSATION_ORIGIN_EXTENSION,
 ]
 
 

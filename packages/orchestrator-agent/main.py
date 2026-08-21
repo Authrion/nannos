@@ -57,6 +57,7 @@ from ringier_a2a_sdk.server import AuthRequestContextBuilder
 
 from app.core.a2a_extensions import (
     ACTIVITY_LOG_EXTENSION,
+    CONVERSATION_ORIGIN_EXTENSION,
     HUMAN_IN_THE_LOOP_EXTENSION,
     INTERMEDIATE_OUTPUT_EXTENSION,
     WORK_PLAN_EXTENSION,
@@ -264,6 +265,13 @@ def create_app():
                 uri=HUMAN_IN_THE_LOOP_EXTENSION,
                 description="Emits structured interrupt requests requiring human approval before tool execution. "
                 "Response: send a DataPart with {decisions: [{type, ...}]}.",
+            ),
+            AgentExtension(
+                uri=CONVERSATION_ORIGIN_EXTENSION,
+                description="Accepts an origin descriptor on incoming messages: a DataPart with "
+                "{origin: {kind, ...}} describing prior work this conversation is about (e.g. a delivered "
+                "scheduled-run notification the user replies to). Consumed only on the first turn of a "
+                "conversation, where the kind's builder reconstructs the origin as context.",
             ),
         ],
     )
