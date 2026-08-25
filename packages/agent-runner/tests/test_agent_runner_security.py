@@ -182,123 +182,91 @@ class TestExtractMessageMetadata:
         assert result["watch"] == watch_cfg
 
 
-class TestWatchConditionNotMet:
-    """When watch condition is not met, _stream_impl returns early with condition_not_met status."""
+class TestDispatchShapes:
+    """Two shapes reach the runner now: run this sub-agent, or deliver this text.
 
-    @pytest.mark.asyncio
-    async def test_condition_not_met_yields_condition_not_met_response(self, agent_runner):
-        """If _evaluate_watch returns (False, check_result), stream yields condition_not_met."""
+    Nothing watch-specific — the scheduler decided whether to dispatch at all and wrote
+    whatever needs saying before it did.
+    """
 
-        check_result = {"value": 0, "threshold": 5}
-        agent_runner._evaluate_watch = AsyncMock(return_value=(False, check_result))
-        agent_runner._execute_sub_agent = AsyncMock()
-
-        # Build a minimal Task and UserConfig
+    @staticmethod
+    def _task(sub_agent_id: int | None) -> MagicMock:
         task = MagicMock()
-        task.context_id = "ctx-1"
+        task.context_id = "ctx-shape"
         task.history = [
-            MagicMock(
-                metadata={
-                    "job_type": "watch",
-                    "watch": {
-                        "check_tool": "ping",
-                        "check_args": {},
-                    },
-                    "sub_agent_id": 5,
-                    "scheduled_job_id": 10,
-                }
-            )
+            MagicMock(metadata={"sub_agent_id": sub_agent_id, "scheduled_job_id": 10})
         ]
+        return task
 
+    @staticmethod
+    def _user_config() -> MagicMock:
         user_config = MagicMock()
         user_config.user_sub = "sub-1"
         user_config.access_token = MagicMock()
         user_config.access_token.get_secret_value.return_value = "bearer-token"
+        return user_config
 
-        # Patch _fetch_user_id_from_backend so we don't hit the real HTTP
+    async def _run(self, agent_runner, task, text: str) -> list[dict]:
         agent_runner._fetch_user_id_from_backend = AsyncMock(return_value="user-uuid-1")
-
         responses = []
         async for response in agent_runner._stream_impl(
-            [Message(role=Role.ROLE_USER, parts=[Part(text="any query")], message_id="msg-1")],
-            user_config,
+            [Message(role=Role.ROLE_USER, parts=[Part(text=text)], message_id="msg-s")],
+            self._user_config(),
             task,
         ):
             responses.append(response)
-
-        # First response is the "working" status, second is condition_not_met
-        content_items = [json.loads(r.content) for r in responses if r.content.startswith("{")]
-        assert any(item.get("scheduler_status") == "condition_not_met" for item in content_items)
-        condition_not_met_item = next(i for i in content_items if i.get("scheduler_status") == "condition_not_met")
-        assert condition_not_met_item["last_check_result"] == check_result
-
-        # Sub-agent must NOT have been called
-        agent_runner._execute_sub_agent.assert_not_awaited()
+        return [json.loads(r.content) for r in responses if r.content.startswith("{")]
 
     @pytest.mark.asyncio
-    async def test_condition_met_does_not_short_circuit(self, agent_runner):
-        """When watch condition IS met, _execute_sub_agent is called."""
-        check_result = {"value": 10}
-        agent_runner._evaluate_watch = AsyncMock(return_value=(True, check_result))
-        agent_runner._fetch_sub_agent_config = AsyncMock(
-            return_value={"type": "automated", "name": "watch-agent", "sub_agent_id": 5}
+    async def test_no_sub_agent_delivers_the_text_it_was_given(self, agent_runner):
+        agent_runner._execute_sub_agent = AsyncMock()
+        items = await self._run(
+            agent_runner, self._task(None), "Campaign 4821 stopped syncing."
         )
-        agent_runner._execute_sub_agent = AsyncMock(return_value=("Agent completed task.", "completed"))
-        agent_runner._generate_watch_message = AsyncMock(return_value="Watch triggered.")
 
-        task = MagicMock()
-        task.context_id = "ctx-2"
-        task.history = [
-            MagicMock(
-                metadata={
-                    "job_type": "watch",
-                    "watch": {
-                        "check_tool": "ping",
-                        "check_args": {},
-                    },
-                    "sub_agent_id": 5,
-                    "scheduled_job_id": 10,
-                }
-            )
-        ]
+        agent_runner._execute_sub_agent.assert_not_awaited()
+        success = next(i for i in items if i.get("scheduler_status") == "success")
+        assert success["agent_message"] == "Campaign 4821 stopped syncing."
 
-        user_config = MagicMock()
-        user_config.user_sub = "sub-2"
-        user_config.access_token = MagicMock()
-        user_config.access_token.get_secret_value.return_value = "bearer-token"
+    @pytest.mark.asyncio
+    async def test_a_sub_agent_runs_with_the_given_prompt(self, agent_runner):
+        agent_runner._fetch_sub_agent_config = AsyncMock(
+            return_value={"type": "automated", "name": "triage", "sub_agent_id": 5}
+        )
+        agent_runner._execute_sub_agent = AsyncMock(return_value=("Handled it.", "completed"))
+        items = await self._run(agent_runner, self._task(5), "Triage this: {}")
 
-        agent_runner._fetch_user_id_from_backend = AsyncMock(return_value="user-uuid-2")
+        prompt = agent_runner._execute_sub_agent.await_args[1]["prompt"]
+        assert prompt == "Triage this: {}"  # passed through, not rebuilt here
+        assert next(i for i in items if i.get("scheduler_status") == "success")["agent_message"] == (
+            "Handled it."
+        )
 
-        responses = []
-        async for response in agent_runner._stream_impl(
-            [Message(role=Role.ROLE_USER, parts=[Part(text="")], message_id="msg-2")],
-            user_config,
-            task,
-        ):
-            responses.append(response)
+    @pytest.mark.asyncio
+    async def test_an_empty_dispatch_falls_back_to_the_default_instruction(self, agent_runner):
+        agent_runner._fetch_sub_agent_config = AsyncMock(
+            return_value={"type": "automated", "name": "triage", "sub_agent_id": 5}
+        )
+        agent_runner._execute_sub_agent = AsyncMock(return_value=("done", "completed"))
+        await self._run(agent_runner, self._task(5), "")
 
-        # Sub-agent was called
-        agent_runner._execute_sub_agent.assert_awaited_once()
+        assert (
+            agent_runner._execute_sub_agent.await_args[1]["prompt"]
+            == "Execute your configured task."
+        )
 
-        # Final response is success and carries the correlation/provenance fields
-        # the delivery channel needs to link thread replies back to this run.
-        final_content = json.loads(responses[-1].content)
-        assert final_content["scheduler_status"] == "success"
-        assert final_content["scheduled_job_id"] == 10
-        assert final_content["sub_agent_id"] == 5
-        assert final_content["sub_agent_name"] == "watch-agent"
-        assert final_content["agent_message"] == "Agent completed task."
-        # The sub-agent's terminal task state rides the result metadata so an
-        # adopting conversation knows whether the run finished or is waiting
-        # for the user's answer (input_required).
-        assert final_content["task_state"] == "completed"
 
 
 class TestRemoteAgentContextPropagation:
-    """Cross-service conversation adoption: the run task's contextId must ride
-    the outgoing A2A message so the remote agent checkpoints the run's
-    conversation under the id this side stores as
-    scheduled_job_runs.conversation_id."""
+    """Cross-service conversation adoption: the run task's contextId must ride the
+    outgoing A2A message so the remote agent checkpoints the run's conversation under
+    the id this side stores as scheduled_job_runs.conversation_id.
+
+    Unchanged by the move of condition evaluation into the scheduler, but load-bearing
+    and easy to drop silently: without these, an edit losing the `context_id` kwarg
+    passes CI, and at runtime the remote agent checkpoints under a different id and
+    orphans the run's thread.
+    """
 
     @pytest.mark.asyncio
     async def test_remote_dispatch_carries_run_context_id(self, agent_runner):
@@ -326,7 +294,11 @@ class TestRemoteAgentContextPropagation:
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
 
             result = await agent_runner._run_remote_agent(
-                sub_agent_cfg={"name": "Remote Agent", "agent_url": "https://remote.example", "sub_agent_id": 5},
+                sub_agent_cfg={
+                    "name": "Remote Agent",
+                    "agent_url": "https://remote.example",
+                    "sub_agent_id": 5,
+                },
                 raw_a2a_messages=[],
                 prompt="Do the thing.",
                 user_access_token="tok",
@@ -344,7 +316,11 @@ class TestRemoteAgentContextPropagation:
         agent_runner._run_remote_agent = AsyncMock(return_value=("ok", None))
 
         await agent_runner._execute_sub_agent(
-            sub_agent_cfg={"type": "remote", "name": "Remote Agent", "agent_url": "https://remote.example"},
+            sub_agent_cfg={
+                "type": "remote",
+                "name": "Remote Agent",
+                "agent_url": "https://remote.example",
+            },
             prompt="p",
             user_access_token="tok",
             scheduled_job_id=10,
