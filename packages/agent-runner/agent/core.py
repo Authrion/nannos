@@ -680,7 +680,7 @@ class AgentRunner(BaseAgent):
                 result_meta = {
                     "scheduler_status": "failed",
                     "error_message": error_message,
-                            "agent_message": agent_message,
+                    "agent_message": agent_message,
                     "user_sub": user_config.user_sub,
                     "sub_agent_name": sub_agent_name,
                     "prompt": prompt,
@@ -869,7 +869,9 @@ class AgentRunner(BaseAgent):
                 context_id=context_id,
             )
         else:
-            raise ValueError(f"Unsupported sub-agent type '{agent_type}' for sub-agent {sub_agent_cfg.get('sub_agent_id')}")
+            raise ValueError(
+                f"Unsupported sub-agent type '{agent_type}' for sub-agent {sub_agent_cfg.get('sub_agent_id')}"
+            )
 
     async def _run_langgraph_agent(
         self,
