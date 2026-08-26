@@ -355,6 +355,18 @@ class AgentSettings:
     # no longer scales with the size of the gateway catalogue.
     MCP_DISCOVERY_CONCURRENCY = max(1, _int_env("MCP_DISCOVERY_CONCURRENCY", 5))
 
+    # Tool-catalogue ingest (agent_common.core.tool_catalogue / catalogue_ingest).
+    #
+    # The catalogue is always held as raw bytes + cards; this only selects how it is
+    # *fetched*. When true (default), discovery lists each server with a single stateless
+    # JSON-RPC ``tools/list`` POST — the standard MCP method, same URL and token as the
+    # SDK path, so the gateway applies per-user entitlements/overrides exactly as usual —
+    # but without the SDK handshake or its pydantic parse (~0.5 s instead of ~3 s for ~30
+    # servers). Whether an endpoint accepts a stateless request is probed once per URL;
+    # refusal or any other failure falls back to the SDK session. Set false to force the
+    # SDK session everywhere (bisecting lever).
+    MCP_CATALOGUE_STATELESS_LIST = os.getenv("MCP_CATALOGUE_STATELESS_LIST", "true").strip().lower() in {"1", "true", "yes"}
+
     # Gatana compression: slug of the MCP server that provides compression utilities.
     # When tools from compression-enabled servers are in use, all tools from this
     # server are automatically included so agents can access compressed outputs.
