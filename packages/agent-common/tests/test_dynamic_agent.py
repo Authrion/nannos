@@ -18,6 +18,40 @@ from agent_common.agents.dynamic_agent import (
 )
 
 
+def _install_list_tools(mock_client_cls, **list_tools_kwargs):
+    """Make the patched MultiServerMCPClient's ``session(name)`` yield a session whose
+    ``list_tools`` behaves per ``list_tools_kwargs`` (AsyncMock kwargs). A ``return_value``
+    given as a list of LangChain tools is converted into an MCP ``ListToolsResult``."""
+    from contextlib import asynccontextmanager
+    from mcp.types import ListToolsResult, Tool as MCPTool
+
+    rv = list_tools_kwargs.get("return_value")
+    if isinstance(rv, list):
+        list_tools_kwargs["return_value"] = ListToolsResult(
+            tools=[
+                MCPTool(name=t.name, description=t.description, inputSchema={"type": "object", "properties": {}})
+                for t in rv
+            ],
+            nextCursor=None,
+        )
+    client = mock_client_cls.return_value
+    client.callbacks = None
+    client.tool_interceptors = []
+
+    def session(name):
+        @asynccontextmanager
+        async def _cm():
+            sess = MagicMock()
+            sess.list_tools = AsyncMock(**list_tools_kwargs)
+            yield sess
+
+        return _cm()
+
+    client.session = session
+
+
+
+
 class TestDynamicLocalAgentRunnable:
     """Tests for DynamicLocalAgentRunnable."""
 
@@ -483,6 +517,9 @@ class TestDiscoverMcpTools:
 
     @pytest.fixture
     def runnable(self, gateway_config, mock_model):
+        from agent_common.core.tool_catalogue import reset_catalogue_store
+
+        reset_catalogue_store()  # the store is process-wide; don't let one test's catalogue serve the next
         oauth2_client = MagicMock()
         oauth2_client.exchange_token = AsyncMock(return_value="gateway-token")
         return DynamicLocalAgentRunnable(
@@ -500,7 +537,7 @@ class TestDiscoverMcpTools:
         inside the discovery try block must propagate, not be silently
         reported to the user as "temporarily unavailable" forever."""
         with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
-            mock_client_cls.return_value.get_tools = AsyncMock(side_effect=ValueError("schema bug"))
+            _install_list_tools(mock_client_cls, side_effect=ValueError("schema bug"))
 
             with pytest.raises(ValueError, match="schema bug"):
                 await runnable._discover_mcp_tools()
@@ -510,7 +547,7 @@ class TestDiscoverMcpTools:
     @pytest.mark.asyncio
     async def test_non_retryable_gateway_error_degrades_to_empty_list(self, runnable):
         with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
-            mock_client_cls.return_value.get_tools = AsyncMock(
+            _install_list_tools(mock_client_cls, 
                 side_effect=ExceptionGroup("boom", [_http_error(400)])
             )
             tools = await runnable._discover_mcp_tools()
@@ -524,7 +561,7 @@ class TestDiscoverMcpTools:
         # The exact shape the pre-fix single-level unwrap missed.
         nested = ExceptionGroup("outer", [ExceptionGroup("inner", [_http_error(403)])])
         with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
-            mock_client_cls.return_value.get_tools = AsyncMock(side_effect=nested)
+            _install_list_tools(mock_client_cls, side_effect=nested)
             tools = await runnable._discover_mcp_tools()
 
         assert tools == []
@@ -565,14 +602,14 @@ class TestDiscoverMcpTools:
     @pytest.mark.asyncio
     async def test_stale_discovery_error_cleared_on_next_call(self, runnable):
         with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
-            mock_client_cls.return_value.get_tools = AsyncMock(
+            _install_list_tools(mock_client_cls, 
                 side_effect=ExceptionGroup("boom", [_http_error(400)])
             )
             await runnable._discover_mcp_tools()
         assert runnable._mcp_discovery_error is not None
 
         with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
-            mock_client_cls.return_value.get_tools = AsyncMock(return_value=[])
+            _install_list_tools(mock_client_cls, return_value=[])
             await runnable._discover_mcp_tools()
         assert runnable._mcp_discovery_error is None
 
@@ -586,7 +623,7 @@ class TestDiscoverMcpTools:
         meant to allow (this is the within-turn "stale pin" the reset-at-entry
         version of this method was vulnerable to)."""
         with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
-            mock_client_cls.return_value.get_tools = AsyncMock(
+            _install_list_tools(mock_client_cls, 
                 side_effect=ExceptionGroup("boom", [_http_error(400)])
             )
             await runnable._discover_mcp_tools()
@@ -613,7 +650,7 @@ class TestDiscoverMcpTools:
             patch("agent_common.agents.dynamic_agent.build_sub_agent_graph", return_value=mock_graph),
             patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls,
         ):
-            mock_client_cls.return_value.get_tools = AsyncMock(
+            _install_list_tools(mock_client_cls, 
                 side_effect=ExceptionGroup("boom", [_http_error(400)])
             )
             await runnable._ensure_agent()
@@ -622,12 +659,148 @@ class TestDiscoverMcpTools:
 
             # Second call must retry discovery (not short-circuit on the
             # _cached_tools guard) and, on success, actually resolve.
-            mock_client_cls.return_value.get_tools = AsyncMock(return_value=[fake_tool("some_gateway_tool")])
+            _install_list_tools(mock_client_cls, return_value=[fake_tool("some_gateway_tool")])
             await runnable._ensure_agent()
 
         assert runnable._mcp_discovery_error is None
         assert [t.name for t in runnable._discovered_tools] == ["some_gateway_tool"]
         assert "tool_availability_warning" not in runnable._cached_system_prompt
+
+    @pytest.mark.asyncio
+    async def test_whitelist_is_served_from_shared_catalogue_store_without_tools_list(self, runnable):
+        """A sub-agent whose whitelist is already held by the process-wide catalogue store
+        (filled by the orchestrator's discovery) must not open its own tools/list."""
+        from agent_common.core.tool_catalogue import (
+            LazyMcpTool,
+            build_server_catalogue,
+            get_catalogue_store,
+            make_catalogue_tool,
+        )
+
+        store = get_catalogue_store()
+        store.intern(
+            build_server_catalogue(
+                "some-server",
+                [
+                    make_catalogue_tool(
+                        server_name="some-server",
+                        name="some_gateway_tool",
+                        description="from the store",
+                        input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+                    )
+                ],
+                source="stateless",
+            )
+        )
+        with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
+            _install_list_tools(mock_client_cls, side_effect=AssertionError("tools/list must not be called"))
+            tools = await runnable._discover_mcp_tools()
+
+        assert [t.name for t in tools] == ["some_gateway_tool"]
+        assert isinstance(tools[0], LazyMcpTool)
+        assert tools[0].description == "from the store"
+        # Bound to *this* agent's gateway connection (its own exchanged token), not the orchestrator's.
+        assert tools[0]._connection["headers"]["Authorization"] == "Bearer gateway-token"
+        assert runnable._mcp_discovery_error is None
+
+    @pytest.mark.asyncio
+    async def test_missing_names_fall_back_to_tools_list_and_are_interned(self, runnable):
+        """Names the store does not hold are fetched once over MCP and then served from the store."""
+        from agent_common.core.tool_catalogue import get_catalogue_store
+
+        with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
+            _install_list_tools(
+                mock_client_cls,
+                return_value=[Tool(name="some_gateway_tool", description="fetched", func=lambda x: x)],
+            )
+            tools = await runnable._discover_mcp_tools()
+        assert [t.name for t in tools] == ["some_gateway_tool"]
+        # Interned under the connection name (gateway-wide listing) for the next delegation.
+        held = get_catalogue_store().interned("gatana")
+        assert held is not None and "some_gateway_tool" in held.tools
+        assert held.source == "mcp"
+
+    @pytest.mark.asyncio
+    async def test_pre_resolved_tools_skip_exchange_and_discovery_entirely(self, gateway_config, mock_model):
+        """When the orchestrator hands over its already-authenticated tools, a delegation must
+        perform no token exchange, build no MCP client and open no tools/list."""
+        from agent_common.core.tool_catalogue import (
+            LazyMcpTool,
+            build_server_catalogue,
+            make_catalogue_tool,
+            make_lazy_tool,
+        )
+
+        entry = make_catalogue_tool(
+            server_name="some-server",
+            name="some_gateway_tool",
+            description="orchestrator's",
+            input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+        )
+        build_server_catalogue("some-server", [entry], source="stateless")
+        orch_tool = make_lazy_tool(
+            entry, server_name="some-server", connection={"url": "gw", "headers": {"Authorization": "Bearer orch"}}
+        )
+        oauth2_client = MagicMock()
+        oauth2_client.exchange_token = AsyncMock(side_effect=AssertionError("must not exchange"))
+        runnable = DynamicLocalAgentRunnable(
+            config=gateway_config,
+            model=mock_model,
+            oauth2_client=oauth2_client,
+            user_token="user-token",
+            mcp_gateway_url="https://gateway.example/mcp",
+            mcp_gateway_client_id="gatana",
+            pre_resolved_tools={"some_gateway_tool": orch_tool},
+        )
+        with patch(
+            "agent_common.agents.dynamic_agent.MultiServerMCPClient", side_effect=AssertionError("no MCP client")
+        ):
+            tools = await runnable._discover_mcp_tools()
+
+        assert [t.name for t in tools] == ["some_gateway_tool"]
+        assert isinstance(tools[0], LazyMcpTool)
+        assert tools[0] is not orch_tool, "a private copy — schema validation must not touch the registry entry"
+        assert tools[0].catalogue_entry is orch_tool.catalogue_entry, "…but the bytes are shared"
+        assert tools[0]._connection["headers"]["Authorization"] == "Bearer orch"
+        oauth2_client.exchange_token.assert_not_called()
+        assert runnable._mcp_discovery_error is None
+
+    @pytest.mark.asyncio
+    async def test_only_names_missing_from_pre_resolved_are_discovered(self, mock_model):
+        from agent_common.core.tool_catalogue import reset_catalogue_store
+
+        reset_catalogue_store()
+        config = LocalLangGraphSubAgentConfig(
+            type="langgraph",
+            name="gateway-agent",
+            description="x",
+            system_prompt="x",
+            mcp_tools=["have_this", "need_this"],
+        )
+        oauth2_client = MagicMock()
+        oauth2_client.exchange_token = AsyncMock(return_value="gateway-token")
+        runnable = DynamicLocalAgentRunnable(
+            config=config,
+            model=mock_model,
+            oauth2_client=oauth2_client,
+            user_token="user-token",
+            mcp_gateway_url="https://gateway.example/mcp",
+            mcp_gateway_client_id="gatana",
+            pre_resolved_tools={"have_this": Tool(name="have_this", description="d", func=lambda x: x)},
+        )
+        with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
+            _install_list_tools(
+                mock_client_cls,
+                return_value=[
+                    Tool(name="need_this", description="d", func=lambda x: x),
+                    Tool(name="have_this", description="dup", func=lambda x: x),
+                ],
+            )
+            tools = await runnable._discover_mcp_tools()
+
+        assert sorted(t.name for t in tools) == ["have_this", "need_this"]
+        assert next(t for t in tools if t.name == "have_this").description == "d", "pre-resolved wins"
+        assert oauth2_client.exchange_token.await_count == 1  # one exchange for the one connection still needed
 
     def test_tool_availability_addendum_empty_when_no_error(self, runnable):
         assert runnable._build_tool_availability_addendum() == ""

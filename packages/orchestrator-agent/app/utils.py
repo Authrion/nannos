@@ -58,6 +58,24 @@ def _wrap_tool_with_agent_name(tool: Any, agent_name: str) -> Any:
     )
 
 
+def _pre_resolved_tools_for(config: Any, tool_registry: dict[str, Any]) -> dict[str, Any]:
+    """The orchestrator's already-authenticated tools a sub-agent can reuse, by name.
+
+    A delegated sub-agent runs as the same user against the same MCP gateway/console, so
+    the tools the orchestrator discovered this turn (connections carrying this user's
+    exchanged tokens) are exactly what the sub-agent would rebuild with two or three more
+    token exchanges and a gateway-wide ``tools/list``. Hand them over instead: the
+    whitelist (``config.mcp_tools``) plus the console self-improvement tools every
+    sub-agent gets. Names not in the registry are left for the sub-agent to discover.
+    """
+    from langchain_core.tools import BaseTool
+
+    from agent_common.agents.dynamic_agent import DynamicLocalAgentRunnable
+
+    wanted = set(config.mcp_tools or []) | set(DynamicLocalAgentRunnable._CONSOLE_SELF_IMPROVEMENT_TOOLS)
+    return {name: tool_registry[name] for name in wanted if isinstance(tool_registry.get(name), BaseTool)}
+
+
 def _gp_tool_catalog_enabled() -> bool:
     """Whether the GP agent gets its registry as a lazy catalog (default on).
 
@@ -483,6 +501,7 @@ def build_runtime_context(
                         config=config,
                         model=subagent_model,
                         orchestrator_tools=orchestrator_tools,
+                        pre_resolved_tools=_pre_resolved_tools_for(config, tool_registry),
                         oauth2_client=oauth2_client,
                         user_token=user_config.access_token.get_secret_value() if user_config.access_token else None,
                         checkpointer=checkpointer,
