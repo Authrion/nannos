@@ -26,9 +26,12 @@ build_sub_agent_graph
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Iterable
 import contextvars
+import difflib
 import logging
 import os
+import re
 import threading
 from typing import TYPE_CHECKING, Annotated, Any, Iterator, Optional
 
@@ -54,6 +57,7 @@ from langchain.agents.middleware.types import PrivateStateAttr
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
 from langchain_quickjs import CodeInterpreterMiddleware
+from langchain_quickjs._prompt import to_camel_case
 from langchain_quickjs.middleware import REPLState, _resolve_thread_id
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.config import get_config
@@ -391,6 +395,103 @@ def code_interpreter_ptc_enabled() -> bool:
     return _code_interpreter_ptc_enabled()
 
 
+# Appended to the interpreter prompt: langchain-quickjs' own text only *prefers* the
+# last expression over console.log; it never says the code is a script, so models
+# trained on function-bodied sandboxes emit `return x;` and hit a SyntaxError.
+_TOP_LEVEL_RETURN_RULE = (
+    "\n- The code runs as a script, not inside a function: a top-level `return` is a "
+    "SyntaxError. End with the expression whose value you want back (e.g. the variable "
+    "holding your result) instead of `return`ing it.\n"
+)
+
+_TOP_LEVEL_RETURN_ERROR_MARKER = "'return' statement can only be used within a function body"
+
+# Console tools that list raw MCP tool names; kept out of ``eval`` when discovery is attached.
+_RAW_LISTING_TOOL_NAMES = frozenset({"console_grep_mcp_tools", "console_list_mcp_servers"})
+
+# ``tools.<name>`` member accesses in an eval program.
+_TOOLS_MEMBER_RE = re.compile(r"\btools\.([A-Za-z_$][\w$]*)")
+
+# Names models reach for by habit that map onto the PTC discovery surface.
+_DISCOVERY_SYNONYMS = {
+    "search_tools": PTC_SEARCH_TOOL_NAME,
+    "searchTools": PTC_SEARCH_TOOL_NAME,
+    "describe_tool": PTC_DESCRIBE_TOOL_NAME,
+    "describeTool": PTC_DESCRIBE_TOOL_NAME,
+}
+
+
+def _is_not_a_function_error(result: Any) -> bool:
+    content = getattr(result, "content", result)
+    if isinstance(content, list):
+        content = " ".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in content)
+    return isinstance(content, str) and 'type="TypeError"' in content and "not a function" in content
+
+
+def _not_a_function_hint(code: str, exposed_names: Iterable[str]) -> str:
+    """Explain a ``tools.<x> is not a function`` in terms the model can act on.
+
+    QuickJS' message does not name the member, so find every ``tools.<x>`` in the
+    program that is not an exposed camelCase bridge and say what it should have been.
+    The advice depends on what this ``eval`` actually has: with in-sandbox discovery
+    (core-only mode) point at ``tools.search``; without it (inline mode — the
+    orchestrator's few whitelisted tools) list the callable names and say the rest are
+    regular tool calls or a ``task`` delegation. No aliases are installed: the namespace
+    stays camelCase-only, the error just becomes self-correcting.
+    """
+    exposed = [n for n in exposed_names if isinstance(n, str)]
+    known = {to_camel_case(n) for n in exposed}
+    has_search = PTC_SEARCH_TOOL_NAME in known
+    raw_listers_camel = {to_camel_case(n) for n in _RAW_LISTING_TOOL_NAMES}
+    callable_list = ", ".join(f"`tools.{n}`" for n in sorted(known)[:30]) + (" …" if len(known) > 30 else "")
+    outside = (
+        "Tools not in that list are not reachable from eval: call them as regular tool calls if you have "
+        "them, or delegate the work with `task`."
+    )
+    search_tip = f"Use `await tools.{PTC_SEARCH_TOOL_NAME}({{ query: '...' }})` to find callable names."
+
+    lines: list[str] = []
+    for ident in dict.fromkeys(_TOOLS_MEMBER_RE.findall(code)):
+        if ident in known:
+            continue
+        camel = to_camel_case(ident)
+        if ident in _DISCOVERY_SYNONYMS:
+            if has_search:
+                lines.append(f"`tools.{ident}` does not exist — use `tools.{_DISCOVERY_SYNONYMS[ident]}`.")
+            else:
+                lines.append(f"`tools.{ident}` does not exist and this eval has no discovery helper. Callable here: {callable_list}. {outside}")
+        elif ident == "call_tool":
+            lines.append("`tools.call_tool` does not exist — call the tool directly, e.g. `await tools.githubGetMe({...})`.")
+        elif camel in known:
+            lines.append(f"`tools.{ident}` does not exist — tool names are camelCase here: use `tools.{camel}`.")
+        elif ident in _RAW_LISTING_TOOL_NAMES or camel in raw_listers_camel:
+            lines.append(
+                f"`tools.{ident}` is not available inside eval. Call `{ident if ident in _RAW_LISTING_TOOL_NAMES else next(n for n in _RAW_LISTING_TOOL_NAMES if to_camel_case(n) == camel)}` "
+                "as a regular tool call instead; tools it lists are mostly not callable here — delegate work that needs them with `task`."
+            )
+        elif has_search:
+            close = difflib.get_close_matches(camel, sorted(known), n=3, cutoff=0.6)
+            hint = f" Did you mean {', '.join(f'`tools.{c}`' for c in close)}?" if close else ""
+            lines.append(f"`tools.{ident}` is not exposed in this eval.{hint} {search_tip}")
+        else:
+            close = difflib.get_close_matches(camel, sorted(known), n=3, cutoff=0.6)
+            hint = f" Did you mean {', '.join(f'`tools.{c}`' for c in close)}?" if close else ""
+            lines.append(f"`tools.{ident}` is not available inside eval.{hint} Callable here: {callable_list}. {outside}")
+    if not lines:
+        return ""
+    return "\n<hint>\n" + "\n".join(lines) + "\n</hint>"
+
+
+def _is_top_level_return_parse_error(result: Any) -> bool:
+    """True when an ``eval`` result is QuickJS' parse error for a top-level ``return``."""
+    content = getattr(result, "content", result)
+    if isinstance(content, list):
+        content = " ".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in content)
+    if not isinstance(content, str):
+        return False
+    return 'type="SyntaxError"' in content and _TOP_LEVEL_RETURN_ERROR_MARKER in content
+
+
 class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
     """``CodeInterpreterMiddleware`` that exposes *all* eligible tools via PTC.
 
@@ -577,8 +678,9 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         # pinned ``search``/``describe`` discovery tools (below) so the prompt
         # stays bounded and the model can find the rest at runtime.
         if not self._broaden_exposure:
+            collected = self._without_raw_listers(collected)
             if self._is_core_only(collected):
-                collected.extend(build_discovery_tools(collected))
+                collected = self._with_discovery(collected)
             return collected
 
         def _consider(tool: Any) -> None:
@@ -637,10 +739,32 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         # set (callable + rendered) so the model can find the unrendered catalog at
         # runtime. They close over the catalog collected above. Small, fixed sub-agent
         # toolsets stay fully rendered inline and need no discovery helpers.
+        collected = self._without_raw_listers(collected)
         if self._is_core_only(collected):
-            collected.extend(build_discovery_tools(collected))
+            collected = self._with_discovery(collected)
 
         return collected
+
+    @staticmethod
+    def _without_raw_listers(collected: list[BaseTool]) -> list[BaseTool]:
+        """Keep the raw MCP-catalogue listers out of the ``eval`` namespace.
+
+        ``console_grep_mcp_tools`` / ``console_list_mcp_servers`` return raw MCP names
+        (``github_get_me``) for the *whole* catalogue — tools that are mostly not callable
+        in this sandbox at all (not exposed) and never under that spelling (bridges are
+        camelCase). A model that greps inside ``eval`` then calls ``tools.github_get_me``
+        gets ``TypeError: not a function`` and detours through introspection before it
+        delegates. Outside the sandbox the same tool is bound natively and its output
+        feeds a ``task`` delegation — the right move — so it is only removed from ``eval``.
+        In core-only mode ``tools.search``/``tools.describe`` cover in-sandbox discovery
+        with callable names.
+        """
+        return [t for t in collected if t.name not in _RAW_LISTING_TOOL_NAMES]
+
+    @staticmethod
+    def _with_discovery(collected: list[BaseTool]) -> list[BaseTool]:
+        """Core-only mode: add the ``tools.search``/``tools.describe`` discovery helpers."""
+        return [*collected, *build_discovery_tools(collected)]
 
     @staticmethod
     def _mcp_tool_count(tools: list[BaseTool]) -> int:
@@ -723,7 +847,7 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
             # <0.2) became the ``_base_prompt(*, ptc_attached=...)`` method in the
             # 0.2 wasm rewrite; the flag toggles whether the base prompt describes
             # the ``tools.*`` namespace.
-            return self._base_prompt(ptc_attached=False)
+            return self._base_prompt(ptc_attached=False) + _TOP_LEVEL_RETURN_RULE
         exposed = [t for t in self._ptc if isinstance(t, BaseTool) and t.name != self._tool_name]
         thread_id = _resolve_thread_id(self._fallback_thread_id)
         repl = self._registry.get(thread_id)
@@ -737,7 +861,7 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         if self._ptc_prompt_cache is None or self._ptc_prompt_cache[0] != cache_key:
             body = render_tools_namespace(render_set, tool_name=self._tool_name, discovery_note=discovery_note)
             self._ptc_prompt_cache = (cache_key, body)
-        return self._base_prompt(ptc_attached=bool(exposed)) + self._ptc_prompt_cache[1]
+        return self._base_prompt(ptc_attached=bool(exposed)) + _TOP_LEVEL_RETURN_RULE + self._ptc_prompt_cache[1]
 
     def _ptc_prompt_and_hidden(self, request: Any) -> tuple[str, set[str]]:
         """Build the PTC prompt and the set of tool names exposed this turn.
@@ -838,6 +962,52 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
     async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         return self._exposure_state_update()
 
+    async def _run_eval_with_guidance(self, request: Any, handler: Any, thread_id: Any) -> Any:
+        """Run ``eval`` with the top-level-``return`` retry, then annotate a ``not a function``.
+
+        A ``TypeError: not a function`` on ``tools.<x>`` almost always means the model used
+        a snake_case MCP name or a misremembered discovery helper; QuickJS does not say
+        which member, so append a hint naming the offending accesses and their fix.
+        """
+        result = await self._run_eval_tolerating_top_level_return(request, handler)
+        if not _is_not_a_function_error(result) or not isinstance(getattr(result, "content", None), str):
+            return result
+        code = ((getattr(request, "tool_call", None) or {}).get("args") or {}).get("code")
+        if not isinstance(code, str):
+            return result
+        exposed = self._ptc_tools_by_thread.get(thread_id) or ()
+        hint = _not_a_function_hint(code, (t.name for t in exposed if isinstance(t, BaseTool)))
+        if not hint:
+            return result
+        logger.info("[PTC] eval called a non-existent tools.* member; appending naming hint")
+        return result.model_copy(update={"content": result.content + hint})
+
+    async def _run_eval_tolerating_top_level_return(self, request: Any, handler: Any) -> Any:
+        """Run ``eval``; if the source failed to parse only because of a top-level ``return``,
+        re-run it once wrapped in an async IIFE.
+
+        Models carry a strong prior from other sandboxes (which run code inside a function)
+        and write ``return result;`` at the top level; QuickJS parses the source as a script
+        and rejects that — a wasted round-trip per occurrence. Wrapping is done *only* on
+        that specific error, never up front: wrapping always would put the model's
+        ``const``/``let`` declarations inside the IIFE and break the persistent-REPL contract
+        the prompt promises (top-level state survives across ``eval`` calls in a turn). The
+        wrapped run's own declarations do not persist either — the prompt rule steers the
+        model away from the pattern so this stays a fallback.
+        """
+        result = await handler(request)
+        if not _is_top_level_return_parse_error(result):
+            return result
+        tool_call = getattr(request, "tool_call", None) or {}
+        args = tool_call.get("args") or {}
+        code = args.get("code")
+        if not isinstance(code, str) or not code.strip():
+            return result
+        logger.info("[PTC] eval used a top-level `return`; re-running the source wrapped in an async IIFE")
+        wrapped = f"(async () => {{\n{code}\n}})()"
+        retry = request.override(tool_call={**tool_call, "args": {**args, "code": wrapped}})
+        return await handler(retry)
+
     async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
         """Drive PTC HITL approvals for the ``eval`` tool from the main graph loop.
 
@@ -861,11 +1031,13 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         tool calls (and the unguarded configuration) pass straight through.
         """
         tool_call = getattr(request, "tool_call", None) or {}
-        if not self._ptc_enabled or self._ptc_risk_scorer is None or tool_call.get("name") != self._tool_name:
+        if tool_call.get("name") != self._tool_name:
             return await handler(request)
-
         runtime = getattr(request, "runtime", None)
         thread_id = resolve_ptc_thread_id(runtime)
+        if not self._ptc_enabled or self._ptc_risk_scorer is None:
+            return await self._run_eval_with_guidance(request, handler, thread_id)
+
         context = getattr(runtime, "context", None)
         # On an interrupt *resume* the graph may have been rebuilt (a fresh
         # middleware instance on a different request/pod), so the upstream
@@ -883,7 +1055,7 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
         try:
             while True:
                 clear_ptc_pending(thread_id)
-                result = await handler(request)
+                result = await self._run_eval_with_guidance(request, handler, thread_id)
                 pending = take_ptc_pending(thread_id)
                 if not pending:
                     return result
