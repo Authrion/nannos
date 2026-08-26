@@ -241,11 +241,16 @@ def build_runtime_context(
 
     # Auto-include scheduler tools and console tools (always available from MCP)
     # These are essential for the orchestrator to delegate to task-scheduler sub-agent
+    #
+    # Deliberately NOT here: console_list_mcp_servers / console_grep_mcp_tools. They date
+    # from when the orchestrator ran the scheduler itself and needed tool names for job
+    # configs; that moved into the task-scheduler sub-agent (#108), whose seed whitelists
+    # both listers (agent-creator's too). On the orchestrator they only tempted the model
+    # to discover tools it cannot call — the right move for anything outside its own
+    # whitelist is a `task` delegation, and it knows the sub-agents from the task enum.
     allowed_orchestrator_tools = {
         "console_list_sub_agents",
         "console_update_sub_agent",
-        "console_list_mcp_servers",
-        "console_grep_mcp_tools",
         "console_create_bug_report",
         "console_create_skill",
         "console_update_skill",
