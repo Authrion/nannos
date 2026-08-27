@@ -49,10 +49,14 @@ CONSOLE_SERVER = "console"
 # Console-backend tools (``console_*``, ``scheduler_*``) go to the console MCP; the rest to the gateway.
 is_console_tool = is_console_backend_tool
 
-# When each MCP URL was last listed by this process. Catalogues are per-user views and can
-# change on the gateway, so the shared store only serves a whitelist without a fresh
-# ``tools/list`` while the URL was listed within ``catalogue_ttl`` (default: the same 60 s the
-# orchestrator's discovery cache uses).
+# When each MCP URL was last listed by this process. Catalogues can change on the gateway, so
+# the shared store only serves a whitelist without a fresh ``tools/list`` while the URL was
+# listed within ``catalogue_ttl`` (default: the same 60 s the orchestrator's discovery cache
+# uses). Keyed per URL, not per user, on purpose: the store is what lets runs of different
+# users share one listing (the win over the old per-run ``get_tools()``), and the whitelist is
+# admin-configured. Per-user entitlement is enforced where it matters — every call carries
+# that user's own bearer, so a name the store holds but the user may not call still fails at
+# the gateway. What a user could observe is at most a stale *schema* for up to the TTL.
 _LISTED_AT: dict[str, float] = {}
 DEFAULT_CATALOGUE_TTL_S = 60.0
 
