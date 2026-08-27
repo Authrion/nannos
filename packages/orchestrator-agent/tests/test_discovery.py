@@ -54,6 +54,7 @@ def _settings(**overrides):
     config.CONSOLE_BACKEND_URL = None
     config.MCP_DISCOVERY_CONCURRENCY = 5
     config.MCP_CATALOGUE_STATELESS_LIST = False
+    config.MCP_TOKEN_LEEWAY_SECONDS = 90
     for k, v in overrides.items():
         setattr(config, k, v)
     return config
@@ -258,6 +259,7 @@ class TestToolDiscoveryService:
         config.CONSOLE_BACKEND_URL = None
         config.MCP_DISCOVERY_CONCURRENCY = 5
         config.MCP_CATALOGUE_STATELESS_LIST = False
+        config.MCP_TOKEN_LEEWAY_SECONDS = 90
 
         oauth2_client = AsyncMock()
         oauth2_client.exchange_token = AsyncMock(return_value="mcp_token")
@@ -303,6 +305,7 @@ class TestToolDiscoveryService:
         config.CONSOLE_BACKEND_URL = None
         config.MCP_DISCOVERY_CONCURRENCY = 3
         config.MCP_CATALOGUE_STATELESS_LIST = False
+        config.MCP_TOKEN_LEEWAY_SECONDS = 90
 
         oauth2_client = AsyncMock()
         oauth2_client.exchange_token = AsyncMock(return_value="mcp_token")

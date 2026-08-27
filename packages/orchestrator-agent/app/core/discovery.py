@@ -408,8 +408,15 @@ class ToolDiscoveryService:
         raise last_error or Exception(f"Failed to load MCP tools from {server_name}")
 
     def make_token_provider(self, token: str) -> UserTokenProvider:
-        """A per-user provider of exchanged MCP bearer tokens (see agent_common.core.token_provider)."""
-        return UserTokenProvider(token, self.oauth2_client.exchange_token)
+        """A per-user provider of exchanged MCP bearer tokens (see agent_common.core.token_provider).
+
+        ``MCP_TOKEN_LEEWAY_SECONDS`` sets how much validity a memoised token must keep to be
+        reused. Setting it above the exchanged tokens' lifetime forces a fresh exchange on
+        *every* call — a QA lever to watch the call-time path work without waiting for expiry.
+        """
+        return UserTokenProvider(
+            token, self.oauth2_client.exchange_token, leeway_seconds=self.config.MCP_TOKEN_LEEWAY_SECONDS
+        )
 
     def _audience_for_server(self, server_name: str) -> str:
         """OAuth audience a server's calls must carry: console-backend's client id for the
