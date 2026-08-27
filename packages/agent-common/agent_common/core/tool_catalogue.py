@@ -18,9 +18,11 @@ actually touches.
 
 Ingest is a strategy (see :mod:`catalogue_ingest`): a stateless JSON-RPC ``tools/list``
 over plain HTTP, or the same call through the MCP SDK session. Both produce the same
-:class:`ServerCatalogue`, and a process-wide :class:`CatalogueStore` interns catalogues
-by ``(server, interface_hash)`` so identical catalogues share one set of bytes across
-users.
+:class:`ServerCatalogue`. A catalogue is a **per-user view** — the gateway answers
+``tools/list`` per bearer and a profile may hide tools of a server from one user and not
+another — so there is deliberately no process-wide catalogue registry: each user's tools
+own their catalogue's bytes for as long as the per-user discovery cache holds them, and
+nothing may answer *which tools exist* except a listing made with that user's own token.
 
 Dispatch delegates to ``langchain_mcp_adapters`` on first invocation: the one tool
 being called is rebuilt as an ``mcp.types.Tool`` (a single small pydantic object) and
@@ -33,7 +35,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -350,94 +351,3 @@ def make_lazy_tool(
     tool._callbacks = callbacks
     tool._interceptors = tool_interceptors
     return tool
-
-
-class CatalogueStore:
-    """Process-wide home for server catalogues.
-
-    * **Interning** by ``(server, interface_hash)``: whichever ingest path produced a
-      catalogue, an identical one already held is returned instead, so N users of the
-      same server share one set of schema bytes. One entry per server is kept (the
-      latest interface); superseded catalogues stay alive only as long as tools built
-      from them do. Catalogues are per-user-token views, so they are never *served*
-      from here in place of a fetch — only deduplicated.
-    * **Lookup by name** (:meth:`resolve`) for consumers that hold only tool names.
-    * **Capability memo**: whether an MCP endpoint serves a stateless ``tools/list``
-      (probed once per URL).
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._interned: dict[str, ServerCatalogue] = {}  # server -> latest catalogue
-        self._stateless_supported: dict[str, bool] = {}  # mcp url -> supported
-
-    # -- interning -----------------------------------------------------------------
-    def intern(self, catalogue: ServerCatalogue) -> ServerCatalogue:
-        with self._lock:
-            held = self._interned.get(catalogue.server_name)
-            if held is not None and held.interface_hash == catalogue.interface_hash:
-                return held
-            self._interned[catalogue.server_name] = catalogue
-            return catalogue
-
-    def interned(self, server_name: str) -> ServerCatalogue | None:
-        with self._lock:
-            return self._interned.get(server_name)
-
-    def resolve(self, names: Iterable[str]) -> dict[str, tuple[ServerCatalogue, CatalogueTool]]:
-        """Look up tools by name across every interned catalogue.
-
-        Lets a consumer that knows only tool *names* (a sub-agent's whitelist) reuse the
-        catalogues discovery already fetched in this process instead of opening its own
-        ``tools/list``. Returns only the names found; the caller fetches the rest.
-        Gateway tool names are unique across servers (they carry the server prefix), so
-        the first catalogue holding a name wins.
-        """
-        wanted = set(names)
-        found: dict[str, tuple[ServerCatalogue, CatalogueTool]] = {}
-        if not wanted:
-            return found
-        with self._lock:
-            catalogues = list(self._interned.values())
-        for catalogue in catalogues:
-            for name in wanted - found.keys():
-                entry = catalogue.tools.get(name)
-                if entry is not None:
-                    found[name] = (catalogue, entry)
-            if len(found) == len(wanted):
-                break
-        return found
-
-    # -- capability memo -----------------------------------------------------------
-    def stateless_supported(self, url: str) -> bool | None:
-        with self._lock:
-            return self._stateless_supported.get(url)
-
-    def set_stateless_supported(self, url: str, supported: bool) -> None:
-        with self._lock:
-            self._stateless_supported[url] = supported
-
-    def clear(self) -> None:
-        with self._lock:
-            self._interned.clear()
-            self._stateless_supported.clear()
-
-
-_store: CatalogueStore | None = None
-_store_lock = threading.Lock()
-
-
-def get_catalogue_store() -> CatalogueStore:
-    """Process-wide singleton."""
-    global _store
-    with _store_lock:
-        if _store is None:
-            _store = CatalogueStore()
-        return _store
-
-
-def reset_catalogue_store() -> None:
-    """Test hook."""
-    global _store
-    with _store_lock:
-        _store = None

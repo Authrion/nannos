@@ -518,9 +518,6 @@ class TestDiscoverMcpTools:
 
     @pytest.fixture
     def runnable(self, gateway_config, mock_model):
-        from agent_common.core.tool_catalogue import reset_catalogue_store
-
-        reset_catalogue_store()  # the store is process-wide; don't let one test's catalogue serve the next
         oauth2_client = MagicMock()
         oauth2_client.exchange_token = AsyncMock(return_value="gateway-token")
         return DynamicLocalAgentRunnable(
@@ -668,46 +665,10 @@ class TestDiscoverMcpTools:
         assert "tool_availability_warning" not in runnable._cached_system_prompt
 
     @pytest.mark.asyncio
-    async def test_whitelist_is_served_from_shared_catalogue_store_without_tools_list(self, runnable):
-        """A sub-agent whose whitelist is already held by the process-wide catalogue store
-        (filled by the orchestrator's discovery) must not open its own tools/list."""
-        from agent_common.core.tool_catalogue import (
-            LazyMcpTool,
-            build_server_catalogue,
-            get_catalogue_store,
-            make_catalogue_tool,
-        )
-
-        store = get_catalogue_store()
-        store.intern(
-            build_server_catalogue(
-                "some-server",
-                [
-                    make_catalogue_tool(
-                        server_name="some-server",
-                        name="some_gateway_tool",
-                        description="from the store",
-                        input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
-                    )
-                ],
-                source="stateless",
-            )
-        )
-        with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
-            _install_list_tools(mock_client_cls, side_effect=AssertionError("tools/list must not be called"))
-            tools = await runnable._discover_mcp_tools()
-
-        assert [t.name for t in tools] == ["some_gateway_tool"]
-        assert isinstance(tools[0], LazyMcpTool)
-        assert tools[0].description == "from the store"
-        # Bound to *this* agent's gateway connection (its own exchanged token), not the orchestrator's.
-        assert tools[0]._connection["headers"]["Authorization"] == "Bearer gateway-token"
-        assert runnable._mcp_discovery_error is None
-
-    @pytest.mark.asyncio
-    async def test_missing_names_fall_back_to_tools_list_and_are_interned(self, runnable):
-        """Names the store does not hold are fetched once over MCP and then served from the store."""
-        from agent_common.core.tool_catalogue import get_catalogue_store
+    async def test_names_not_pre_resolved_are_listed_on_the_agents_own_connection(self, runnable):
+        """A name the orchestrator did not hand over is resolved by a tools/list on this agent's
+        connection with this user's token — a listing is a per-user view, never reused."""
+        from agent_common.core.tool_catalogue import LazyMcpTool
 
         with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
             _install_list_tools(
@@ -716,38 +677,14 @@ class TestDiscoverMcpTools:
             )
             tools = await runnable._discover_mcp_tools()
         assert [t.name for t in tools] == ["some_gateway_tool"]
-        # Interned under the connection name (gateway-wide listing) for the next delegation.
-        held = get_catalogue_store().interned("gatana")
-        assert held is not None and "some_gateway_tool" in held.tools
-        assert held.source == "mcp"
+        assert isinstance(tools[0], LazyMcpTool) and tools[0].catalogue_entry.card.description == "fetched"
+        assert tools[0]._connection["headers"]["Authorization"] == "Bearer gateway-token"
+        assert runnable._mcp_discovery_error is None
 
     @pytest.mark.asyncio
-    async def test_store_hits_bind_to_the_gateway_connection_by_key_not_position(self, gateway_config, mock_model):
-        """The gateway connection is looked up by mcp_gateway_client_id; a console tool by 'console'.
-        Dict order must not matter (regression for a positional gateway[0] pick)."""
-        from agent_common.core.tool_catalogue import (
-            build_server_catalogue,
-            get_catalogue_store,
-            make_catalogue_tool,
-            reset_catalogue_store,
-        )
-
-        reset_catalogue_store()
-        store = get_catalogue_store()
-        store.intern(
-            build_server_catalogue(
-                "github",
-                [make_catalogue_tool(server_name="github", name="some_gateway_tool", description="", input_schema={"type": "object"})],
-                source="stateless",
-            )
-        )
-        store.intern(
-            build_server_catalogue(
-                "console",
-                [make_catalogue_tool(server_name="console", name="console_create_skill", description="", input_schema={"type": "object"})],
-                source="mcp",
-            )
-        )
+    async def test_listed_tools_bind_to_the_connection_by_key_not_position(self, gateway_config, mock_model):
+        """Console names are listed on and bound to 'console'; gateway names to the connection keyed by
+        mcp_gateway_client_id. Dict order must not matter (regression for a positional gateway[0] pick)."""
         config = LocalLangGraphSubAgentConfig(
             type="langgraph", name="g", description="x", system_prompt="x", mcp_tools=["some_gateway_tool", "console_create_skill"]
         )
@@ -763,9 +700,16 @@ class TestDiscoverMcpTools:
         )
         runnable.console_backend_mcp_url = "https://console.example/mcp"
         with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
-            _install_list_tools(mock_client_cls, side_effect=AssertionError("store must serve both"))
+            _install_list_tools(
+                mock_client_cls,
+                return_value=[
+                    Tool(name="some_gateway_tool", description="", func=lambda x: x),
+                    Tool(name="console_create_skill", description="", func=lambda x: x),
+                ],
+            )
             tools = {t.name: t for t in await runnable._discover_mcp_tools()}
 
+        assert set(tools) == {"some_gateway_tool", "console_create_skill"}
         assert tools["some_gateway_tool"]._connection["headers"]["Authorization"] == "Bearer tok-gatana"
         assert tools["console_create_skill"]._connection["headers"]["Authorization"] == "Bearer tok-agent-console"
 
@@ -774,9 +718,6 @@ class TestDiscoverMcpTools:
         """Given the orchestrator's UserTokenProvider, the sub-agent exchanges through it and the
         tools it discovers itself carry no bearer — an interceptor mints one per call."""
         from agent_common.core.token_provider import UserTokenProvider
-        from agent_common.core.tool_catalogue import reset_catalogue_store
-
-        reset_catalogue_store()
         exchanges: list[str] = []
 
         import base64
@@ -874,9 +815,6 @@ class TestDiscoverMcpTools:
 
     @pytest.mark.asyncio
     async def test_only_names_missing_from_pre_resolved_are_discovered(self, mock_model):
-        from agent_common.core.tool_catalogue import reset_catalogue_store
-
-        reset_catalogue_store()
         config = LocalLangGraphSubAgentConfig(
             type="langgraph",
             name="gateway-agent",

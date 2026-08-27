@@ -49,6 +49,7 @@ from agent_common.core.model_factory import (
     require_default_model,
 )
 from agent_common.core.stream_watchdog import watch_stream_with_resume
+from agent_common.core.token_provider import DEFAULT_LEEWAY_S, UserTokenProvider
 from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.struct_pb2 import Struct
 from object_storage import get_object_storage_service
@@ -56,8 +57,6 @@ from object_storage import get_object_storage_service
 if TYPE_CHECKING:
     from agent_common.core.sandbox_pool import SandboxPool
 from langchain_core.messages import HumanMessage
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.sessions import StreamableHttpConnection
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from psycopg.rows import dict_row
@@ -67,11 +66,23 @@ from ringier_a2a_sdk.models import AgentStreamResponse, UserConfig
 from ringier_a2a_sdk.oauth import OidcOAuth2Client
 from ringier_a2a_sdk.utils.a2a_part_conversion import a2a_parts_to_content
 
+from agent.mcp_tools import McpToolResolver
+
 logger = logging.getLogger(__name__)
 
 _CONSOLE_BACKEND_URL = os.getenv("CONSOLE_BACKEND_URL", "http://localhost:5001")
 _CONSOLE_BACKEND_CLIENT_ID = os.getenv("CONSOLE_BACKEND_CLIENT_ID", "agent-console")
 _MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", "https://nannos.gatana.nannos.ringier.ch/mcp")
+_MCP_GATEWAY_CLIENT_ID = os.getenv("MCP_GATEWAY_CLIENT_ID", "gatana")
+# Stateless JSON-RPC tools/list (no SDK handshake/parse); off = always list through the SDK.
+_MCP_CATALOGUE_STATELESS_LIST = os.getenv("MCP_CATALOGUE_STATELESS_LIST", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+# How much validity a memoised exchanged bearer must keep to be reused for a tool call. Set it
+# above the exchanged tokens' lifetime to force one exchange per call (QA lever, see #170).
+_MCP_TOKEN_LEEWAY_SECONDS = max(0.0, float(os.getenv("MCP_TOKEN_LEEWAY_SECONDS", str(DEFAULT_LEEWAY_S))))
 _MCP_TIMEOUT_SECONDS = int(os.getenv("MCP_TIMEOUT_SECONDS", "300"))
 _DOCUMENT_STORE_S3_BUCKET = os.getenv("DOCUMENT_STORE_S3_BUCKET", "")
 _MAX_RECURSION_LIMIT = int(os.getenv("MAX_RECURSION_LIMIT", "50"))
@@ -1100,49 +1111,23 @@ class AgentRunner(BaseAgent):
 
         try:
             if mcp_tool_names:
-                # Keep the MCP session open for the entire graph execution so that
-                # tool closures can call back into the session when invoked.
-                allowed = set(mcp_tool_names)
-                has_console_tools = any(name.startswith("console_") for name in allowed)
-                has_gateway_tools = any(not name.startswith("console_") for name in allowed)
-
-                connections: dict[str, StreamableHttpConnection] = {}
-
-                # Add Gatana gateway connection for non-console tools
-                if has_gateway_tools:
-                    gatana_access_token = await (self._get_oauth2_client()).exchange_token(user_access_token, "gatana")
-                    connections["gateway"] = StreamableHttpConnection(
-                        transport="streamable_http",
-                        url=_MCP_GATEWAY_URL,
-                        headers={"Authorization": f"Bearer {gatana_access_token}"},
-                        timeout=mcp_timeout,
-                        sse_read_timeout=mcp_timeout,
-                    )
-
-                # Add console backend MCP connection for console_ tools
-                if has_console_tools:
-                    console_mcp_url = f"{_CONSOLE_BACKEND_URL}/mcp"
-                    console_token = await (self._get_oauth2_client()).exchange_token(
-                        user_access_token, _CONSOLE_BACKEND_CLIENT_ID
-                    )
-                    connections["console"] = StreamableHttpConnection(
-                        transport="streamable_http",
-                        url=console_mcp_url,
-                        headers={"Authorization": f"Bearer {console_token}"},
-                        timeout=mcp_timeout,
-                        sse_read_timeout=mcp_timeout,
-                    )
-
-                mcp_client = MultiServerMCPClient(connections)
-                all_tools = await mcp_client.get_tools()
-                tools = [t for t in all_tools if t.name in allowed]
-                logger.info(
-                    "Loaded %d/%d MCP tools for job %s: %s",
-                    len(tools),
-                    len(all_tools),
-                    scheduled_job_id,
-                    [t.name for t in tools],
+                # Tools come from the shared catalogue (stateless tools/list, SDK fallback) as
+                # LazyMcpTools on token-free connections; a per-run UserTokenProvider mints
+                # the bearer at call time, so a token expiring mid-run is re-exchanged.
+                resolver = McpToolResolver(
+                    token_provider=UserTokenProvider(
+                        user_access_token,
+                        self._get_oauth2_client().exchange_token,
+                        leeway_seconds=_MCP_TOKEN_LEEWAY_SECONDS,
+                    ),
+                    gateway_url=_MCP_GATEWAY_URL,
+                    gateway_client_id=_MCP_GATEWAY_CLIENT_ID,
+                    console_mcp_url=f"{_CONSOLE_BACKEND_URL}/mcp",
+                    console_client_id=_CONSOLE_BACKEND_CLIENT_ID,
+                    timeout=mcp_timeout,
+                    stateless_list=_MCP_CATALOGUE_STATELESS_LIST,
                 )
+                tools = await resolver.resolve(mcp_tool_names)  # logs what was resolved and how
                 await _run_graph(tools + docstore_tools)
             else:
                 await _run_graph(docstore_tools)

@@ -92,7 +92,7 @@ from agent_common.core.model_factory import get_model_input_capabilities
 from agent_common.core.catalogue_ingest import fetch_catalogue_mcp
 from agent_common.core.token_provider import UserTokenProvider, bearer_interceptor
 from agent_common.core.tool_catalog import TOOL_CATALOG_PROMPT_ADDENDUM, ToolCatalogMiddleware
-from agent_common.core.tool_catalogue import get_catalogue_store, make_lazy_tool
+from agent_common.core.tool_catalogue import make_lazy_tool
 from agent_common.middleware.conversation_context_tools_middleware import ContextGatedTool
 from agent_common.utils import get_language_display_name
 
@@ -896,19 +896,17 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         connections: Mapping[str, Any],
         wanted: set[str],
     ) -> List[BaseTool]:
-        """Resolve a whitelist of tool names to tools, reusing catalogues already in the process.
+        """Resolve whitelisted names by listing this agent's own connection(s).
 
-        The orchestrator's discovery interns every server's catalogue (bytes + cards) in the
-        process-wide :class:`CatalogueStore`; a sub-agent only needs a handful of names from
-        it, so first look them up there — no network at all. Only names the store does not
-        hold trigger an MCP ``tools/list`` on this agent's own connection(s), and that
-        result is interned too (flattened to bytes, pydantic objects dropped) so the next
-        delegation is served from the store. Every returned tool is a :class:`LazyMcpTool`
-        bound to *this agent's* connection, whatever the source — token-free with a per-call
-        bearer interceptor when a token provider is configured, else carrying this agent's own
-        exchanged token (standalone execution).
+        Only names the orchestrator did not already hand over (``pre_resolved_tools`` — the
+        user's own discovered view) reach here. A ``tools/list`` is a per-user view: a Gatana
+        profile may hide tools of a server from one user and not another, so it is always
+        made on this agent's connection with this user's token and never served from another
+        run's listing. Each page is flattened to bytes as it arrives (pydantic objects
+        dropped) and every returned tool is a :class:`LazyMcpTool` bound to *this agent's*
+        connection — token-free with a per-call bearer interceptor when a token provider is
+        configured, else carrying this agent's own exchanged token (standalone execution).
         """
-        store = get_catalogue_store()
         callbacks = client.callbacks
         tools: list[BaseTool] = []
         # With a provider, tools must not embed the listing bearer: strip it from the connection
@@ -931,74 +929,33 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             headers = {k: v for k, v in connection["headers"].items() if k.lower() != "authorization"}
             return {**connection, "headers": headers or None}
 
-        def _connection_for(tool_name: str, server_name: str | None = None) -> Any | None:
-            """Pick the connection that can reach ``tool_name`` — by key, never by position.
+        # Console-backend names (console_*/scheduler_*) come from the ``console`` connection,
+        # everything else from the gateway connection(s); a connection that can serve none of
+        # the wanted names is not listed at all.
+        for conn_name, connection in connections.items():
+            is_console = conn_name == "console"
+            server_wanted = sorted(n for n in wanted if is_console_backend_tool(n) == is_console)
+            if not server_wanted:
+                continue
 
-            Console-backend tools go to the ``console`` connection. Everything else is a
-            gateway tool: prefer a connection keyed by the tool's own server slug (an agent
-            wired with per-server connections), else the gateway-wide connection keyed by
-            ``mcp_gateway_client_id`` (how this runnable builds it). ``None`` means this agent
-            has no connection that can reach the tool, so it is skipped rather than guessed.
-            """
-            if is_console_backend_tool(tool_name):
-                return connections.get("console")
-            if server_name and server_name != "console" and server_name in connections:
-                return connections[server_name]
-            gateway_key = self.mcp_gateway_client_id
-            return connections.get(gateway_key) if gateway_key else None
+            def _open_session(name: str = conn_name) -> Any:
+                return client.session(name)
 
-        resolved = store.resolve(wanted)
-        for name, (held, held_entry) in resolved.items():
-            connection = _connection_for(name, held.server_name)
-            if connection is None:
-                continue  # whitelisted but this agent has no connection that can reach it
-            tools.append(
-                make_lazy_tool(
-                    held_entry,
-                    server_name=held.server_name,
-                    connection=_call_connection(connection),
-                    callbacks=callbacks,
-                    tool_interceptors=interceptors,
-                )
-            )
-        missing = {n for n in wanted if n not in resolved and _connection_for(n) is not None}
-
-        fetched = 0
-        if missing:
-            # Which connections can still contribute: console for console_*/scheduler_*
-            # names, the gateway-wide connection for everything else.
-            need_console = any(is_console_backend_tool(n) for n in missing)
-            need_gateway = any(not is_console_backend_tool(n) for n in missing)
-            for conn_name, connection in connections.items():
-                is_console = conn_name == "console"
-                if (is_console and not need_console) or (not is_console and not need_gateway):
-                    continue
-                def _open_session(name: str = conn_name) -> Any:
-                    return client.session(name)
-
-                catalogue = store.intern(await fetch_catalogue_mcp(_open_session, server_slug=conn_name))
-                for name in sorted(missing):
-                    entry = catalogue.tools.get(name)
-                    if entry is None:
-                        continue
-                    tools.append(
-                        make_lazy_tool(
-                            entry,
-                            server_name=catalogue.server_name,
-                            connection=_call_connection(connection),
-                            callbacks=callbacks,
-                            tool_interceptors=interceptors,
-                        )
+            catalogue = await fetch_catalogue_mcp(_open_session, server_slug=conn_name)
+            for name in server_wanted:
+                entry = catalogue.tools.get(name)
+                if entry is None:
+                    continue  # not offered to this user by this server
+                tools.append(
+                    make_lazy_tool(
+                        entry,
+                        server_name=catalogue.server_name,
+                        connection=_call_connection(connection),
+                        callbacks=callbacks,
+                        tool_interceptors=interceptors,
                     )
-                    fetched += 1
-        logger.info(
-            "Resolved %d/%d MCP tools for %s: %d from the shared catalogue store, %d via tools/list",
-            len(tools),
-            len(wanted),
-            self.name,
-            len(tools) - fetched,
-            fetched,
-        )
+                )
+        logger.info("Resolved %d/%d MCP tools for %s via tools/list", len(tools), len(wanted), self.name)
         return tools
 
     def _wrap_with_agent_name(self, tool: BaseTool) -> BaseTool:

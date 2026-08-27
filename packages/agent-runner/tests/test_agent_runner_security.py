@@ -15,8 +15,7 @@ from a2a.types import Message, Part, Role
 
 @pytest.fixture
 def agent_runner():
-    """Create an AgentRunner instance with minimal mocking.
-    """
+    """Create an AgentRunner instance with minimal mocking."""
     mock_checkpointer = MagicMock(name="checkpointer")
 
     with patch("agent.core._create_checkpointer", return_value=(mock_checkpointer, None)):
@@ -193,9 +192,7 @@ class TestDispatchShapes:
     def _task(sub_agent_id: int | None) -> MagicMock:
         task = MagicMock()
         task.context_id = "ctx-shape"
-        task.history = [
-            MagicMock(metadata={"sub_agent_id": sub_agent_id, "scheduled_job_id": 10})
-        ]
+        task.history = [MagicMock(metadata={"sub_agent_id": sub_agent_id, "scheduled_job_id": 10})]
         return task
 
     @staticmethod
@@ -220,9 +217,7 @@ class TestDispatchShapes:
     @pytest.mark.asyncio
     async def test_no_sub_agent_delivers_the_text_it_was_given(self, agent_runner):
         agent_runner._execute_sub_agent = AsyncMock()
-        items = await self._run(
-            agent_runner, self._task(None), "Campaign 4821 stopped syncing."
-        )
+        items = await self._run(agent_runner, self._task(None), "Campaign 4821 stopped syncing.")
 
         agent_runner._execute_sub_agent.assert_not_awaited()
         success = next(i for i in items if i.get("scheduler_status") == "success")
@@ -238,9 +233,7 @@ class TestDispatchShapes:
 
         prompt = agent_runner._execute_sub_agent.await_args[1]["prompt"]
         assert prompt == "Triage this: {}"  # passed through, not rebuilt here
-        assert next(i for i in items if i.get("scheduler_status") == "success")["agent_message"] == (
-            "Handled it."
-        )
+        assert next(i for i in items if i.get("scheduler_status") == "success")["agent_message"] == ("Handled it.")
 
     @pytest.mark.asyncio
     async def test_an_empty_dispatch_falls_back_to_the_default_instruction(self, agent_runner):
@@ -250,11 +243,7 @@ class TestDispatchShapes:
         agent_runner._execute_sub_agent = AsyncMock(return_value=("done", "completed"))
         await self._run(agent_runner, self._task(5), "")
 
-        assert (
-            agent_runner._execute_sub_agent.await_args[1]["prompt"]
-            == "Execute your configured task."
-        )
-
+        assert agent_runner._execute_sub_agent.await_args[1]["prompt"] == "Execute your configured task."
 
 
 class TestRemoteAgentContextPropagation:

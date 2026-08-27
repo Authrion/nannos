@@ -12,13 +12,13 @@ from mcp.types import ListToolsResult, Tool as MCPTool
 from agent_common.core.catalogue_ingest import (
     StatelessListError,
     StatelessListUnsupported,
+    reset_stateless_memo,
 )
 from app.core.discovery import ToolDiscoveryService
 from agent_common.core.tool_catalogue import (
     LazyMcpTool,
     build_server_catalogue,
     make_catalogue_tool,
-    reset_catalogue_store,
 )
 from app.models.config import AgentSettings
 
@@ -84,12 +84,12 @@ async def _discover(config: Mock, client: Mock, servers: list[dict]) -> list[Bas
 
 class TestDiscoveryIngestPaths:
     def setup_method(self):
-        reset_catalogue_store()
+        reset_stateless_memo()
 
     @pytest.mark.asyncio
     async def test_flag_off_uses_sdk_session_only(self):
         list_calls: list[str] = []
-        with patch("app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock) as fast:
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock) as fast:
             tools = await _discover(_settings(stateless=False), _mcp_client(list_calls), [{"slug": "s1"}])
         fast.assert_not_awaited()
         assert list_calls == ["s1"]
@@ -100,7 +100,7 @@ class TestDiscoveryIngestPaths:
         """Same URL and token the SDK would use → same per-user listing, no handshake."""
         list_calls: list[str] = []
         with patch(
-            "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
         ) as fast:
             tools = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}, {"slug": "s2"}])
         assert list_calls == [], "no SDK session on the fast path"
@@ -112,22 +112,25 @@ class TestDiscoveryIngestPaths:
         assert all(isinstance(t, LazyMcpTool) and not t.schema_decoded for t in tools)
 
     @pytest.mark.asyncio
-    async def test_identical_catalogues_share_bytes_across_users(self):
+    async def test_each_user_owns_their_own_listing(self):
+        """A listing is a per-user view (profiles filter tools per user): fetched per user and
+        never shared between users' tools, even when the two views happen to be identical."""
         list_calls: list[str] = []
         with patch(
-            "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
         ) as fast:
             a = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
             b = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
         assert fast.await_count == 2, "per-user listing: fetched for each user"
-        assert a[0].catalogue_entry is b[0].catalogue_entry, "…but identical bytes are interned once"
+        assert a[0].catalogue_entry is not b[0].catalogue_entry, "no process-wide catalogue registry"
+        assert a[0].catalogue_entry.schema_bytes == b[0].catalogue_entry.schema_bytes
         assert a[0] is not b[0], "per-user tool objects (they carry the user's connection)"
 
     @pytest.mark.asyncio
     async def test_refusal_falls_back_and_is_remembered_per_url(self):
         list_calls: list[str] = []
         with patch(
-            "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=StatelessListUnsupported("400 no session")
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=StatelessListUnsupported("400 no session")
         ) as fast:
             tools = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
             await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
@@ -144,7 +147,7 @@ class TestDiscoveryIngestPaths:
                 raise StatelessListError("502")
             return _fast_catalogue(server_slug)
 
-        with patch("app.core.discovery.fetch_catalogue_stateless", side_effect=fast):
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=fast):
             tools = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}, {"slug": "s2"}])
         assert list_calls == ["s1"]
         assert sorted(t.name for t in tools) == ["fast_s2", "mcp_s1"]
@@ -158,7 +161,7 @@ class TestDiscoveryIngestPaths:
             seen["follow_redirects"] = client.follow_redirects
             return _fast_catalogue(server_slug)
 
-        with patch("app.core.discovery.fetch_catalogue_stateless", side_effect=fast):
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=fast):
             await _discover(_settings(stateless=True), _mcp_client([]), [{"slug": "s1"}])
         assert seen["follow_redirects"] is True
 
@@ -169,7 +172,7 @@ class TestDiscoveryIngestPaths:
         config.CONSOLE_BACKEND_URL = "https://console"
         config.CONSOLE_BACKEND_CLIENT_ID = "agent-console"
         with patch(
-            "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
         ) as fast:
             tools = await _discover(config, _mcp_client(list_calls), [{"slug": "s1"}])
         assert sorted(c.kwargs["server_slug"] for c in fast.await_args_list) == ["console", "s1"]

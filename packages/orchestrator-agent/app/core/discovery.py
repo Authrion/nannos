@@ -29,15 +29,9 @@ from ringier_a2a_sdk.utils.mcp_errors import (
 from ringier_a2a_sdk.utils.mcp_progress import on_mcp_progress
 
 from ..models.config import AgentSettings
-from agent_common.core.catalogue_ingest import (
-    STATELESS_TIMEOUT_S,
-    StatelessListError,
-    StatelessListUnsupported,
-    fetch_catalogue_mcp,
-    fetch_catalogue_stateless,
-)
+from agent_common.core.catalogue_ingest import STATELESS_TIMEOUT_S, fetch_catalogue
 from agent_common.core.token_provider import UserTokenProvider, bearer_interceptor
-from agent_common.core.tool_catalogue import CatalogueStore, ServerCatalogue, build_lazy_tools, get_catalogue_store
+from agent_common.core.tool_catalogue import ServerCatalogue, build_lazy_tools
 
 logger = logging.getLogger(__name__)
 
@@ -228,11 +222,6 @@ class ToolDiscoveryService:
         self.config = config
         self.oauth2_client = oauth2_client
 
-    @property
-    def catalogue_store(self) -> CatalogueStore:
-        """Process-wide catalogue store (bytes shared across users; capability memo)."""
-        return get_catalogue_store()
-
     def _gateway_base_url(self) -> str:
         # Strip the trailing slash first: removesuffix("/mcp") is a no-op on ".../mcp/".
         return self.config.MCP_GATEWAY_URL.rstrip("/").removesuffix("/mcp")
@@ -307,33 +296,20 @@ class ToolDiscoveryService:
         *,
         http_client: httpx.AsyncClient | None,
     ) -> ServerCatalogue:
-        """Fetch one server's catalogue: stateless ``tools/list`` POST → SDK session.
+        """Fetch one server's catalogue (``agent_common.core.catalogue_ingest.fetch_catalogue``).
 
-        Both paths hit the same MCP URL with the same bearer token (the server's
-        connection), so the result is the same per-user listing; the stateless path just
-        skips the SDK handshake and the pydantic parse. Whether an endpoint serves a
-        stateless request is probed once per URL: a rejection marks it unsupported for the
-        process lifetime; any other failure falls back for this server only. Whatever the
-        path, the result is interned in the process-wide store so identical catalogues
-        share bytes across users.
+        The catalogue is this user's view (the gateway lists per bearer, profiles filter per
+        user) and is owned by this user's discovery-cache entry — never shared with another
+        user's.
         """
-        store = self.catalogue_store
-        url = connection["url"]
-        if http_client is not None and self.config.MCP_CATALOGUE_STATELESS_LIST and store.stateless_supported(url) is not False:
-            try:
-                catalogue = await fetch_catalogue_stateless(
-                    http_client, url=url, headers=connection.get("headers"), server_slug=server_name
-                )
-            except StatelessListUnsupported as e:
-                store.set_stateless_supported(url, False)
-                logger.warning(f"MCP endpoint refuses stateless tools/list — using SDK session for '{server_name}' ({e})")
-            except StatelessListError as e:
-                logger.warning(f"Stateless tools/list failed for '{server_name}', falling back to SDK session: {e}")
-            else:
-                store.set_stateless_supported(url, True)
-                return store.intern(catalogue)
-        catalogue = await fetch_catalogue_mcp(lambda: client.session(server_name), server_slug=server_name)
-        return store.intern(catalogue)
+        return await fetch_catalogue(
+            server_slug=server_name,
+            url=connection["url"],
+            headers=connection.get("headers"),
+            http_client=http_client,
+            session_factory=lambda: client.session(server_name),
+            stateless=self.config.MCP_CATALOGUE_STATELESS_LIST,
+        )
 
     async def _get_catalogue_with_retry(
         self,
