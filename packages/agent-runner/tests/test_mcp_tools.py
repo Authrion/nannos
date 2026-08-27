@@ -57,13 +57,9 @@ class Req(SimpleNamespace):
 
 @pytest.fixture(autouse=True)
 def _fresh_store():
-    import agent.mcp_tools as m
-
     reset_catalogue_store()
-    m._LISTED_AT.clear()
     yield
     reset_catalogue_store()
-    m._LISTED_AT.clear()
 
 
 @pytest.fixture
@@ -187,29 +183,31 @@ class TestStatelessListing:
         assert resolver.stats["unresolved"] == ["not_offered"]
 
     @pytest.mark.asyncio
-    async def test_store_serves_names_without_any_listing(self, provider, exchanges):
+    async def test_every_run_lists_with_its_own_token_and_never_binds_another_users_view(self, provider):
+        """A Gatana profile can hide tools per user: a name another run's listing put in the
+        shared store must not be bound for a user whose own listing does not offer it."""
         seen: list[httpx.Request] = []
         with _patch_http(_serve({GATEWAY_URL: ["github_search", "jira_list"]}, seen)):
-            await _resolver(provider).resolve(["github_search"])
-            assert len(seen) == 1
-            resolver = _resolver(provider)
-            (tool,) = await resolver.resolve(["jira_list"])
-        assert len(seen) == 1, "second run served from the process-wide store"
-        assert resolver.stats == {**resolver.stats, "from_store": 1, "listed": 0}
-        assert exchanges == ["gatana"], (
-            "the exchange is memoised; still made up front so a bad user token fails the run"
-        )
-        assert tool._interceptors and not (tool._connection.get("headers") or {})
+            await _resolver(provider).resolve(["github_search", "jira_list"])
+        assert len(seen) == 1
+
+        async def exchange_b(**kw: Any) -> str:
+            return _jwt("gatana")
+
+        with _patch_http(_serve({GATEWAY_URL: ["github_search"]}, seen)):  # user B's view lacks jira_list
+            resolver = _resolver(UserTokenProvider("user-b-token", exchange_b))
+            tools = await resolver.resolve(["github_search", "jira_list"])
+        assert len(seen) == 2, "the second run listed again with its own token"
+        assert [t.name for t in tools] == ["github_search"]
+        assert resolver.stats["unresolved"] == ["jira_list"]
 
     @pytest.mark.asyncio
-    async def test_store_is_relisted_once_the_ttl_expired(self, provider):
-        seen: list[httpx.Request] = []
-        with _patch_http(_serve({GATEWAY_URL: ["github_search"]}, seen)):
-            await _resolver(provider).resolve(["github_search"])
-            resolver = _resolver(provider, catalogue_ttl_seconds=0)
-            (tool,) = await resolver.resolve(["github_search"])
-        assert len(seen) == 2 and resolver.stats["listed"] == 1
-        assert tool.name == "github_search"
+    async def test_identical_listings_share_one_interned_catalogue(self, provider):
+        with _patch_http(_serve({GATEWAY_URL: ["github_search"]}, [])):
+            (a,) = await _resolver(provider).resolve(["github_search"])
+            (b,) = await _resolver(provider).resolve(["github_search"])
+        assert a.catalogue_entry is b.catalogue_entry, "same bytes, interned once"
+        assert get_catalogue_store().interned("gateway") is not None
 
     @pytest.mark.asyncio
     async def test_scheduler_tools_are_console_tools(self, provider, exchanges):
