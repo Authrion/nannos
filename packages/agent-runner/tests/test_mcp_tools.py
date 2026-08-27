@@ -57,9 +57,13 @@ class Req(SimpleNamespace):
 
 @pytest.fixture(autouse=True)
 def _fresh_store():
+    import agent.mcp_tools as m
+
     reset_catalogue_store()
+    m._LISTED_AT.clear()
     yield
     reset_catalogue_store()
+    m._LISTED_AT.clear()
 
 
 @pytest.fixture
@@ -169,7 +173,7 @@ class TestStatelessListing:
 
         await tool._interceptors[0](Req(server_name="gateway", headers=None), handler)
         await tool._interceptors[0](Req(server_name="gateway", headers=None), handler)
-        assert exchanges == ["gatana"] * 3, "listing + one exchange per call"
+        assert exchanges == ["gatana"] * 4, "up-front + listing + one exchange per call"
 
     @pytest.mark.asyncio
     async def test_only_needed_servers_are_listed(self, provider, exchanges):
@@ -192,8 +196,52 @@ class TestStatelessListing:
             (tool,) = await resolver.resolve(["jira_list"])
         assert len(seen) == 1, "second run served from the process-wide store"
         assert resolver.stats == {**resolver.stats, "from_store": 1, "listed": 0}
-        assert exchanges == ["gatana"], "no exchange needed when nothing is listed"
+        assert exchanges == ["gatana"], (
+            "the exchange is memoised; still made up front so a bad user token fails the run"
+        )
         assert tool._interceptors and not (tool._connection.get("headers") or {})
+
+    @pytest.mark.asyncio
+    async def test_store_is_relisted_once_the_ttl_expired(self, provider):
+        seen: list[httpx.Request] = []
+        with _patch_http(_serve({GATEWAY_URL: ["github_search"]}, seen)):
+            await _resolver(provider).resolve(["github_search"])
+            resolver = _resolver(provider, catalogue_ttl_seconds=0)
+            (tool,) = await resolver.resolve(["github_search"])
+        assert len(seen) == 2 and resolver.stats["listed"] == 1
+        assert tool.name == "github_search"
+
+    @pytest.mark.asyncio
+    async def test_scheduler_tools_are_console_tools(self, provider, exchanges):
+        seen: list[httpx.Request] = []
+        with _patch_http(_serve({CONSOLE_URL: ["scheduler_list_jobs"]}, seen)):
+            (tool,) = await _resolver(provider).resolve(["scheduler_list_jobs"])
+        assert {str(r.url) for r in seen} == {CONSOLE_URL} and exchanges == ["agent-console"]
+        assert tool._connection["url"] == CONSOLE_URL
+
+    @pytest.mark.asyncio
+    async def test_a_failing_exchange_fails_discovery_even_on_a_store_hit(self, provider):
+        with _patch_http(_serve({GATEWAY_URL: ["github_search"]}, [])):
+            await _resolver(provider).resolve(["github_search"])
+
+        async def broken(**kw: Any) -> str:
+            raise RuntimeError("invalid_grant")
+
+        with pytest.raises(RuntimeError, match="invalid_grant"):
+            await _resolver(UserTokenProvider("user-token", broken)).resolve(["github_search"])
+
+    @pytest.mark.asyncio
+    async def test_listing_honours_the_run_mcp_timeout(self, provider):
+        captured: dict[str, Any] = {}
+        real = httpx.AsyncClient
+
+        def factory(**kw: Any) -> httpx.AsyncClient:
+            captured.update(kw)
+            return real(transport=_serve({GATEWAY_URL: ["github_search"]}, []), **kw)
+
+        with patch("agent.mcp_tools.httpx.AsyncClient", factory):
+            await _resolver(provider).resolve(["github_search"])
+        assert captured["timeout"] == 5.0 and captured["follow_redirects"] is True
 
 
 class TestSdkFallback:

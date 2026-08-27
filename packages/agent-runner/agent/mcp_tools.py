@@ -28,8 +28,8 @@ from datetime import timedelta
 from typing import Any
 
 import httpx
+from agent_common.agents.dynamic_agent import is_console_backend_tool
 from agent_common.core.catalogue_ingest import (
-    STATELESS_TIMEOUT_S,
     StatelessListError,
     StatelessListUnsupported,
     fetch_catalogue_mcp,
@@ -46,10 +46,15 @@ logger = logging.getLogger(__name__)
 GATEWAY_SERVER = "gateway"
 CONSOLE_SERVER = "console"
 
+# Console-backend tools (``console_*``, ``scheduler_*``) go to the console MCP; the rest to the gateway.
+is_console_tool = is_console_backend_tool
 
-def is_console_tool(name: str) -> bool:
-    """Console-backend MCP tools are ``console_*``; everything else lives on the gateway."""
-    return name.startswith("console_")
+# When each MCP URL was last listed by this process. Catalogues are per-user views and can
+# change on the gateway, so the shared store only serves a whitelist without a fresh
+# ``tools/list`` while the URL was listed within ``catalogue_ttl`` (default: the same 60 s the
+# orchestrator's discovery cache uses).
+_LISTED_AT: dict[str, float] = {}
+DEFAULT_CATALOGUE_TTL_S = 60.0
 
 
 class McpToolResolver:
@@ -69,11 +74,13 @@ class McpToolResolver:
         console_client_id: str,
         timeout: timedelta,
         stateless_list: bool = True,
+        catalogue_ttl_seconds: float = DEFAULT_CATALOGUE_TTL_S,
     ) -> None:
         self.token_provider = token_provider
         self.gateway_client_id = gateway_client_id
         self.console_client_id = console_client_id
         self.stateless_list = stateless_list
+        self.catalogue_ttl = catalogue_ttl_seconds
         self._urls = {GATEWAY_SERVER: gateway_url, CONSOLE_SERVER: console_mcp_url}
         self._timeout = timeout
         # Discovery statistics for the last resolve(); logged and surfaced for measurements.
@@ -121,11 +128,17 @@ class McpToolResolver:
             else:
                 store.set_stateless_supported(url, True)
                 self.stats["source"][server_name] = "stateless"
+                _LISTED_AT[url] = time.monotonic()
                 return store.intern(catalogue)
         client = MultiServerMCPClient({server_name: self._connection(server_name, bearer=bearer)})
         catalogue = await fetch_catalogue_mcp(lambda: client.session(server_name), server_slug=server_name)
         self.stats["source"][server_name] = "mcp"
+        _LISTED_AT[url] = time.monotonic()
         return store.intern(catalogue)
+
+    def _store_is_fresh(self, server_name: str) -> bool:
+        listed_at = _LISTED_AT.get(self._urls[server_name])
+        return listed_at is not None and time.monotonic() - listed_at < self.catalogue_ttl
 
     # -- resolution ----------------------------------------------------------------------
     async def resolve(self, wanted: Iterable[str]) -> list[BaseTool]:
@@ -152,9 +165,17 @@ class McpToolResolver:
         def _server_for(name: str) -> str:
             return CONSOLE_SERVER if is_console_tool(name) else GATEWAY_SERVER
 
+        # Exchange up front for every audience the run needs: discovery used to do this, and
+        # a user token that is expired or revoked must fail the run here, not surface as a
+        # run that "succeeded" without ever being able to call a tool.
+        for server in connections:
+            await self.token_provider.get(self.audience_for(server))
+
         tools: list[BaseTool] = []
         for name, (_held, entry) in store.resolve(names).items():
             server = _server_for(name)
+            if not self._store_is_fresh(server):
+                continue  # the store's copy may be stale for this process; list again below
             tools.append(
                 make_lazy_tool(
                     entry,
@@ -167,7 +188,8 @@ class McpToolResolver:
 
         missing = names - {t.name for t in tools}
         if missing:
-            async with httpx.AsyncClient(timeout=STATELESS_TIMEOUT_S, follow_redirects=True) as http_client:
+            # follow_redirects: console-backend's ``/mcp`` mount answers ``307 → /mcp/``.
+            async with httpx.AsyncClient(timeout=self._timeout.total_seconds(), follow_redirects=True) as http_client:
                 for server, connection in connections.items():
                     server_missing = {n for n in missing if _server_for(n) == server}
                     if not server_missing:

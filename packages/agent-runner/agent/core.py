@@ -75,7 +75,11 @@ _CONSOLE_BACKEND_CLIENT_ID = os.getenv("CONSOLE_BACKEND_CLIENT_ID", "agent-conso
 _MCP_GATEWAY_URL = os.getenv("MCP_GATEWAY_URL", "https://nannos.gatana.nannos.ringier.ch/mcp")
 _MCP_GATEWAY_CLIENT_ID = os.getenv("MCP_GATEWAY_CLIENT_ID", "gatana")
 # Stateless JSON-RPC tools/list (no SDK handshake/parse); off = always list through the SDK.
-_MCP_CATALOGUE_STATELESS_LIST = os.getenv("MCP_CATALOGUE_STATELESS_LIST", "true").lower() not in ("0", "false", "no")
+_MCP_CATALOGUE_STATELESS_LIST = os.getenv("MCP_CATALOGUE_STATELESS_LIST", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 # How much validity a memoised exchanged bearer must keep to be reused for a tool call. Set it
 # above the exchanged tokens' lifetime to force one exchange per call (QA lever, see #170).
 _MCP_TOKEN_LEEWAY_SECONDS = max(0.0, float(os.getenv("MCP_TOKEN_LEEWAY_SECONDS", str(DEFAULT_LEEWAY_S))))
@@ -1123,14 +1127,7 @@ class AgentRunner(BaseAgent):
                     timeout=mcp_timeout,
                     stateless_list=_MCP_CATALOGUE_STATELESS_LIST,
                 )
-                tools = await resolver.resolve(mcp_tool_names)
-                logger.info(
-                    "Loaded %d/%d MCP tools for job %s: %s",
-                    len(tools),
-                    len(mcp_tool_names),
-                    scheduled_job_id,
-                    [t.name for t in tools],
-                )
+                tools = await resolver.resolve(mcp_tool_names)  # logs what was resolved and how
                 await _run_graph(tools + docstore_tools)
             else:
                 await _run_graph(docstore_tools)
