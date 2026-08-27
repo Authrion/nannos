@@ -375,7 +375,7 @@ class AgentSettings:
     # MCP bearer tokens are minted at call time by a per-user provider and reused only while at
     # least this many seconds of validity remain (bounded by the user token's exp). Raise it
     # above the exchanged tokens' lifetime to force an exchange on every call (QA lever).
-    MCP_TOKEN_LEEWAY_SECONDS = _int_env("MCP_TOKEN_LEEWAY_SECONDS", 90)
+    MCP_TOKEN_LEEWAY_SECONDS = max(0, _int_env("MCP_TOKEN_LEEWAY_SECONDS", 90))
 
     # Gatana compression: slug of the MCP server that provides compression utilities.
     # When tools from compression-enabled servers are in use, all tools from this
