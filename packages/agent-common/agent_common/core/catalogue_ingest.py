@@ -114,6 +114,7 @@ def _walk_object(
 ) -> Iterator[Any]:
     pos = _skip_ws(text, pos + 1)  # past '{'
     if text[pos] == "}":
+        siblings["__end__"] = pos + 1  # an empty object still has to report where it ends
         return
     while True:
         key, pos = dec.raw_decode(text, pos)
@@ -272,8 +273,10 @@ async def fetch_catalogue_stateless(
         try:
             body = rpc_body_from_response(response)
             page, cursor = parse_tools_list_reply(server_slug, body)
-        except (ValueError, IndexError) as e:
-            # IndexError: the bounded scanner ran off the end of a truncated body.
+        except (ValueError, LookupError) as e:
+            # LookupError: the bounded scanner ran off the end of a truncated body (IndexError)
+            # or met a shape it does not handle (KeyError) — never let a parser bug take the
+            # server down when the SDK path can still list it.
             raise StatelessListError(f"{url}: unparseable tools/list reply: {e}") from e
         tools.extend(page)
         if not cursor:

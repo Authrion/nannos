@@ -220,6 +220,12 @@ class TestStatelessIngest:
         assert tools[1].card.param_names == ("tools",)
         assert tools[1].output_schema_bytes is not None
 
+    def test_parse_reply_tolerates_empty_or_odd_result_shapes(self):
+        assert parse_tools_list_reply("srv", '{"jsonrpc": "2.0", "id": 1, "result": {}}') == ([], None)
+        assert parse_tools_list_reply("srv", '{"result": {"tools": []}}') == ([], None)
+        assert parse_tools_list_reply("srv", '{"result": {"tools": [], "nextCursor": ""}}') == ([], None)
+        assert parse_tools_list_reply("srv", '{"other": {"deep": {"tools": [1]}}}') == ([], None)
+
     def test_parse_reply_maps_rpc_errors(self):
         with pytest.raises(StatelessListUnsupported):
             parse_tools_list_reply("srv", json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32600, "message": "Bad Request: No valid session ID"}}))
