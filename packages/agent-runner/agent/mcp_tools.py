@@ -10,8 +10,7 @@ Now a run has the same shape as an orchestrator sub-agent (see ``agent_common``)
 * **Catalogue** — each server the whitelist needs is listed with a stateless JSON-RPC
   ``tools/list`` (:func:`fetch_catalogue_stateless`, no handshake, no pydantic) and the SDK
   session (:func:`fetch_catalogue_mcp`) only as fallback. Either way the result is flattened
-  to bytes and interned in the process-wide :class:`CatalogueStore` (dedup only — a listing
-  is a per-user view); no ``mcp.types.Tool`` survives discovery.
+  to bytes; no ``mcp.types.Tool`` survives discovery.
 * **Tools** — :class:`LazyMcpTool` per whitelisted name, so only the tools the run binds
   pay for schema decoding.
 * **Credentials** — a per-run :class:`UserTokenProvider`; tool connections carry no
@@ -34,9 +33,11 @@ from agent_common.core.catalogue_ingest import (
     StatelessListUnsupported,
     fetch_catalogue_mcp,
     fetch_catalogue_stateless,
+    set_stateless_supported,
+    stateless_supported,
 )
 from agent_common.core.token_provider import UserTokenProvider, bearer_interceptor
-from agent_common.core.tool_catalogue import ServerCatalogue, get_catalogue_store, make_lazy_tool
+from agent_common.core.tool_catalogue import ServerCatalogue, make_lazy_tool
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.sessions import StreamableHttpConnection
@@ -49,10 +50,9 @@ CONSOLE_SERVER = "console"
 # Console-backend tools (``console_*``, ``scheduler_*``) go to the console MCP; the rest to the gateway.
 is_console_tool = is_console_backend_tool
 
-# The process-wide CatalogueStore is used for *interning only*: a listing is a per-user view
-# (a Gatana profile can hide tools of a server from one user and not another), so every run
-# lists with its own token and never binds a name from a catalogue another run fetched. Runs
-# whose views are identical still share one set of schema bytes through the store.
+# A ``tools/list`` is a per-user view (a Gatana profile can hide tools of a server from one
+# user and not another), so every run lists with its own token; nothing is shared between runs
+# except the per-URL "does this endpoint serve stateless requests" memo in catalogue_ingest.
 
 
 class McpToolResolver:
@@ -106,29 +106,28 @@ class McpToolResolver:
         it asks the provider for one — the only place discovery touches a token. Whether an
         endpoint serves stateless requests is memoised per URL for the process lifetime.
         """
-        store = get_catalogue_store()
         url = self._urls[server_name]
         bearer = await self.token_provider.get(self.audience_for(server_name))
-        if self.stateless_list and store.stateless_supported(url) is not False:
+        if self.stateless_list and stateless_supported(url) is not False:
             try:
                 catalogue = await fetch_catalogue_stateless(
                     http_client, url=url, headers={"Authorization": f"Bearer {bearer}"}, server_slug=server_name
                 )
             except StatelessListUnsupported as e:
-                store.set_stateless_supported(url, False)
+                set_stateless_supported(url, False)
                 logger.warning(
                     "MCP endpoint refuses stateless tools/list — using SDK session for '%s' (%s)", server_name, e
                 )
             except StatelessListError as e:
                 logger.warning("Stateless tools/list failed for '%s', falling back to SDK session: %s", server_name, e)
             else:
-                store.set_stateless_supported(url, True)
+                set_stateless_supported(url, True)
                 self.stats["source"][server_name] = "stateless"
-                return store.intern(catalogue)
+                return catalogue
         client = MultiServerMCPClient({server_name: self._connection(server_name, bearer=bearer)})
         catalogue = await fetch_catalogue_mcp(lambda: client.session(server_name), server_slug=server_name)
         self.stats["source"][server_name] = "mcp"
-        return store.intern(catalogue)
+        return catalogue
 
     # -- resolution ----------------------------------------------------------------------
     async def resolve(self, wanted: Iterable[str]) -> list[BaseTool]:

@@ -21,7 +21,6 @@ from agent_common.core.catalogue_ingest import (
     parse_tools_list_reply,
 )
 from agent_common.core.tool_catalogue import (
-    CatalogueStore,
     ServerCatalogue,
     build_lazy_tools,
     build_server_catalogue,
@@ -342,32 +341,17 @@ class TestMcpIngest:
 
 
 # --------------------------------------------------------------------------------------
-# Store
+# Endpoint capability memo
 # --------------------------------------------------------------------------------------
 
 
-class TestCatalogueStore:
-    def test_intern_shares_identical_catalogues(self):
-        store = CatalogueStore()
-        first = store.intern(_catalogue("a"))
-        again = store.intern(_catalogue("a"))
-        assert again is first, "same (server, hash) → same object, bytes shared"
-        newer = store.intern(_catalogue("a", "b"))
-        assert newer is not first
-        assert store.interned("srv") is newer
+def test_stateless_capability_memo_is_per_url():
+    from agent_common.core.catalogue_ingest import reset_stateless_memo, set_stateless_supported, stateless_supported
 
-    def test_resolve_finds_names_across_interned_catalogues(self):
-        store = CatalogueStore()
-        store.intern(_catalogue("a", "b", server="one"))
-        store.intern(_catalogue("c", server="two"))
-        found = store.resolve(["a", "c", "nope"])
-        assert set(found) == {"a", "c"}
-        assert found["a"][0].server_name == "one" and found["c"][0].server_name == "two"
-
-    def test_capability_memo(self):
-        store = CatalogueStore()
-        assert store.stateless_supported("https://gw/mcp") is None
-        store.set_stateless_supported("https://gw/mcp", False)
-        assert store.stateless_supported("https://gw/mcp") is False
-        store.clear()
-        assert store.stateless_supported("https://gw/mcp") is None
+    reset_stateless_memo()
+    assert stateless_supported("https://gw/mcp") is None
+    set_stateless_supported("https://gw/mcp", False)
+    assert stateless_supported("https://gw/mcp") is False
+    assert stateless_supported("https://other/mcp") is None
+    reset_stateless_memo()
+    assert stateless_supported("https://gw/mcp") is None

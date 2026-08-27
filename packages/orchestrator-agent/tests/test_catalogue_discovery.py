@@ -12,13 +12,13 @@ from mcp.types import ListToolsResult, Tool as MCPTool
 from agent_common.core.catalogue_ingest import (
     StatelessListError,
     StatelessListUnsupported,
+    reset_stateless_memo,
 )
 from app.core.discovery import ToolDiscoveryService
 from agent_common.core.tool_catalogue import (
     LazyMcpTool,
     build_server_catalogue,
     make_catalogue_tool,
-    reset_catalogue_store,
 )
 from app.models.config import AgentSettings
 
@@ -84,7 +84,7 @@ async def _discover(config: Mock, client: Mock, servers: list[dict]) -> list[Bas
 
 class TestDiscoveryIngestPaths:
     def setup_method(self):
-        reset_catalogue_store()
+        reset_stateless_memo()
 
     @pytest.mark.asyncio
     async def test_flag_off_uses_sdk_session_only(self):
@@ -112,7 +112,9 @@ class TestDiscoveryIngestPaths:
         assert all(isinstance(t, LazyMcpTool) and not t.schema_decoded for t in tools)
 
     @pytest.mark.asyncio
-    async def test_identical_catalogues_share_bytes_across_users(self):
+    async def test_each_user_owns_their_own_listing(self):
+        """A listing is a per-user view (profiles filter tools per user): fetched per user and
+        never shared between users' tools, even when the two views happen to be identical."""
         list_calls: list[str] = []
         with patch(
             "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
@@ -120,7 +122,8 @@ class TestDiscoveryIngestPaths:
             a = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
             b = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
         assert fast.await_count == 2, "per-user listing: fetched for each user"
-        assert a[0].catalogue_entry is b[0].catalogue_entry, "…but identical bytes are interned once"
+        assert a[0].catalogue_entry is not b[0].catalogue_entry, "no process-wide catalogue registry"
+        assert a[0].catalogue_entry.schema_bytes == b[0].catalogue_entry.schema_bytes
         assert a[0] is not b[0], "per-user tool objects (they carry the user's connection)"
 
     @pytest.mark.asyncio

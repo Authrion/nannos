@@ -61,6 +61,26 @@ _MAX_LIST_PAGES = 1000
 _UNSUPPORTED_RPC_CODES = {-32600, -32601, -32602}
 
 
+# Whether an MCP endpoint serves a stateless ``tools/list``, probed once per URL for the
+# process lifetime. A property of the endpoint, not of any user — the only thing about a
+# catalogue fetch that is legitimately process-wide.
+_stateless_supported: dict[str, bool] = {}
+
+
+def stateless_supported(url: str) -> bool | None:
+    """``True``/``False`` once ``url`` has been probed, ``None`` before."""
+    return _stateless_supported.get(url)
+
+
+def set_stateless_supported(url: str, supported: bool) -> None:
+    _stateless_supported[url] = supported
+
+
+def reset_stateless_memo() -> None:
+    """Test hook."""
+    _stateless_supported.clear()
+
+
 class StatelessListUnsupported(Exception):
     """The MCP endpoint does not serve ``tools/list`` without a session — fall back for good."""
 

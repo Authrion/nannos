@@ -35,9 +35,11 @@ from agent_common.core.catalogue_ingest import (
     StatelessListUnsupported,
     fetch_catalogue_mcp,
     fetch_catalogue_stateless,
+    set_stateless_supported,
+    stateless_supported,
 )
 from agent_common.core.token_provider import UserTokenProvider, bearer_interceptor
-from agent_common.core.tool_catalogue import CatalogueStore, ServerCatalogue, build_lazy_tools, get_catalogue_store
+from agent_common.core.tool_catalogue import ServerCatalogue, build_lazy_tools
 
 logger = logging.getLogger(__name__)
 
@@ -228,11 +230,6 @@ class ToolDiscoveryService:
         self.config = config
         self.oauth2_client = oauth2_client
 
-    @property
-    def catalogue_store(self) -> CatalogueStore:
-        """Process-wide catalogue store (bytes shared across users; capability memo)."""
-        return get_catalogue_store()
-
     def _gateway_base_url(self) -> str:
         # Strip the trailing slash first: removesuffix("/mcp") is a no-op on ".../mcp/".
         return self.config.MCP_GATEWAY_URL.rstrip("/").removesuffix("/mcp")
@@ -313,27 +310,25 @@ class ToolDiscoveryService:
         connection), so the result is the same per-user listing; the stateless path just
         skips the SDK handshake and the pydantic parse. Whether an endpoint serves a
         stateless request is probed once per URL: a rejection marks it unsupported for the
-        process lifetime; any other failure falls back for this server only. Whatever the
-        path, the result is interned in the process-wide store so identical catalogues
-        share bytes across users.
+        process lifetime; any other failure falls back for this server only. The catalogue
+        is this user's view (the gateway lists per bearer, profiles filter per user) and is
+        owned by this user's discovery-cache entry — never shared with another user's.
         """
-        store = self.catalogue_store
         url = connection["url"]
-        if http_client is not None and self.config.MCP_CATALOGUE_STATELESS_LIST and store.stateless_supported(url) is not False:
+        if http_client is not None and self.config.MCP_CATALOGUE_STATELESS_LIST and stateless_supported(url) is not False:
             try:
                 catalogue = await fetch_catalogue_stateless(
                     http_client, url=url, headers=connection.get("headers"), server_slug=server_name
                 )
             except StatelessListUnsupported as e:
-                store.set_stateless_supported(url, False)
+                set_stateless_supported(url, False)
                 logger.warning(f"MCP endpoint refuses stateless tools/list — using SDK session for '{server_name}' ({e})")
             except StatelessListError as e:
                 logger.warning(f"Stateless tools/list failed for '{server_name}', falling back to SDK session: {e}")
             else:
-                store.set_stateless_supported(url, True)
-                return store.intern(catalogue)
-        catalogue = await fetch_catalogue_mcp(lambda: client.session(server_name), server_slug=server_name)
-        return store.intern(catalogue)
+                set_stateless_supported(url, True)
+                return catalogue
+        return await fetch_catalogue_mcp(lambda: client.session(server_name), server_slug=server_name)
 
     async def _get_catalogue_with_retry(
         self,

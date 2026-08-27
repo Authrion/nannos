@@ -16,9 +16,14 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from agent_common.core.catalogue_ingest import StatelessListError, StatelessListUnsupported
+from agent_common.core.catalogue_ingest import (
+    StatelessListError,
+    StatelessListUnsupported,
+    reset_stateless_memo,
+    stateless_supported,
+)
 from agent_common.core.token_provider import UserTokenProvider
-from agent_common.core.tool_catalogue import LazyMcpTool, get_catalogue_store, reset_catalogue_store
+from agent_common.core.tool_catalogue import LazyMcpTool
 
 from agent.mcp_tools import McpToolResolver
 
@@ -56,10 +61,10 @@ class Req(SimpleNamespace):
 
 
 @pytest.fixture(autouse=True)
-def _fresh_store():
-    reset_catalogue_store()
+def _fresh_memo():
+    reset_stateless_memo()
     yield
-    reset_catalogue_store()
+    reset_stateless_memo()
 
 
 @pytest.fixture
@@ -141,8 +146,8 @@ class TestStatelessListing:
         await tools["console_create_skill"]._interceptors[0](Req(server_name="console", headers={"X": "1"}), handler)
         assert seen_headers["X"] == "1" and exchanges == ["gatana", "agent-console"]
 
-        assert get_catalogue_store().stateless_supported(GATEWAY_URL) is True
-        assert get_catalogue_store().stateless_supported(CONSOLE_URL) is True
+        assert stateless_supported(GATEWAY_URL) is True
+        assert stateless_supported(CONSOLE_URL) is True
 
     @pytest.mark.asyncio
     async def test_no_mcp_types_retained_after_discovery(self, provider):
@@ -184,8 +189,8 @@ class TestStatelessListing:
 
     @pytest.mark.asyncio
     async def test_every_run_lists_with_its_own_token_and_never_binds_another_users_view(self, provider):
-        """A Gatana profile can hide tools per user: a name another run's listing put in the
-        shared store must not be bound for a user whose own listing does not offer it."""
+        """A Gatana profile can hide tools per user: a name offered by another run's listing must
+        not be bound for a user whose own listing does not offer it."""
         seen: list[httpx.Request] = []
         with _patch_http(_serve({GATEWAY_URL: ["github_search", "jira_list"]}, seen)):
             await _resolver(provider).resolve(["github_search", "jira_list"])
@@ -202,14 +207,6 @@ class TestStatelessListing:
         assert resolver.stats["unresolved"] == ["jira_list"]
 
     @pytest.mark.asyncio
-    async def test_identical_listings_share_one_interned_catalogue(self, provider):
-        with _patch_http(_serve({GATEWAY_URL: ["github_search"]}, [])):
-            (a,) = await _resolver(provider).resolve(["github_search"])
-            (b,) = await _resolver(provider).resolve(["github_search"])
-        assert a.catalogue_entry is b.catalogue_entry, "same bytes, interned once"
-        assert get_catalogue_store().interned("gateway") is not None
-
-    @pytest.mark.asyncio
     async def test_scheduler_tools_are_console_tools(self, provider, exchanges):
         seen: list[httpx.Request] = []
         with _patch_http(_serve({CONSOLE_URL: ["scheduler_list_jobs"]}, seen)):
@@ -218,7 +215,7 @@ class TestStatelessListing:
         assert tool._connection["url"] == CONSOLE_URL
 
     @pytest.mark.asyncio
-    async def test_a_failing_exchange_fails_discovery_even_on_a_store_hit(self, provider):
+    async def test_a_failing_exchange_fails_discovery_even_after_an_earlier_listing(self, provider):
         with _patch_http(_serve({GATEWAY_URL: ["github_search"]}, [])):
             await _resolver(provider).resolve(["github_search"])
 
@@ -266,7 +263,7 @@ class TestSdkFallback:
             (tool,) = await resolver.resolve(["github_search"])
             listing_connection = client_cls.call_args.args[0]["gateway"]
 
-        assert get_catalogue_store().stateless_supported(GATEWAY_URL) is False
+        assert stateless_supported(GATEWAY_URL) is False
         assert "refuses stateless tools/list" in caplog.text
         assert listing_connection["headers"]["Authorization"].startswith("Bearer "), "the SDK listing used the bearer"
         assert not (tool._connection.get("headers") or {}), "the tool still has no credential"
@@ -292,7 +289,7 @@ class TestSdkFallback:
         ):
             (tool,) = await _resolver(provider).resolve(["github_search"])
         assert tool.name == "github_search"
-        assert get_catalogue_store().stateless_supported(GATEWAY_URL) is None
+        assert stateless_supported(GATEWAY_URL) is None
 
     @pytest.mark.asyncio
     async def test_stateless_disabled_goes_straight_to_sdk(self, provider):

@@ -11,7 +11,8 @@ from mcp.types import ListToolsResult, Tool as MCPTool
 import app.core.discovery as discovery_module
 from app.core.discovery import AgentDiscoveryService, ToolDiscoveryService
 from app.models.config import AgentSettings
-from agent_common.core.tool_catalogue import LazyMcpTool, reset_catalogue_store
+from agent_common.core.catalogue_ingest import reset_stateless_memo
+from agent_common.core.tool_catalogue import LazyMcpTool
 
 
 def _mcp_tool(name: str, description: str = "") -> MCPTool:
@@ -265,7 +266,7 @@ class TestToolDiscoveryService:
         oauth2_client.exchange_token = AsyncMock(return_value="mcp_token")
         service = ToolDiscoveryService(config, oauth2_client)
 
-        reset_catalogue_store()
+        reset_stateless_memo()
         tools = [_mcp_tool("allowed_tool", "This tool is allowed"), _mcp_tool("blocked_tool", "This tool is blocked")]
 
         with patch("app.core.discovery.MultiServerMCPClient") as mock_client:
@@ -332,7 +333,7 @@ class TestToolDiscoveryService:
             await asyncio.sleep(0)
             in_flight -= 1
 
-        reset_catalogue_store()
+        reset_stateless_memo()
         with patch("app.core.discovery.MultiServerMCPClient") as mock_client:
             mock_client.return_value = _mock_mcp_client(on_list=on_list)
             service.fetch_available_servers = AsyncMock(return_value=servers)
