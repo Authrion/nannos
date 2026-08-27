@@ -355,3 +355,87 @@ def test_stateless_capability_memo_is_per_url():
     assert stateless_supported("https://other/mcp") is None
     reset_stateless_memo()
     assert stateless_supported("https://gw/mcp") is None
+
+
+class TestFetchCatalogueStrategy:
+    """stateless → per-URL memo → SDK fallback, shared by orchestrator discovery and agent-runner."""
+
+    def setup_method(self):
+        from agent_common.core.catalogue_ingest import reset_stateless_memo
+
+        reset_stateless_memo()
+
+    @staticmethod
+    def _session_factory(*names: str):
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, MagicMock
+
+        from mcp.types import ListToolsResult, Tool as MCPTool
+
+        session = MagicMock()
+        session.list_tools = AsyncMock(
+            return_value=ListToolsResult(tools=[MCPTool(name=n, inputSchema=SCHEMA) for n in names], nextCursor=None)
+        )
+
+        @asynccontextmanager
+        async def _cm():
+            yield session
+
+        return _cm, session
+
+    @pytest.mark.asyncio
+    async def test_stateless_success_is_remembered_and_skips_the_sdk(self):
+        from unittest.mock import patch
+
+        from agent_common.core.catalogue_ingest import fetch_catalogue, stateless_supported
+
+        factory, session = self._session_factory("via_sdk")
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", return_value=_catalogue("fast")) as fast:
+            cat = await fetch_catalogue(
+                server_slug="srv", url="https://gw/mcp", headers={"Authorization": "Bearer t"}, http_client=object(), session_factory=factory
+            )
+        assert cat.tools.keys() == {"fast"}
+        assert fast.await_args.kwargs == {"url": "https://gw/mcp", "headers": {"Authorization": "Bearer t"}, "server_slug": "srv"}
+        assert stateless_supported("https://gw/mcp") is True
+        session.list_tools.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refusal_marks_url_and_falls_back_for_good(self):
+        from unittest.mock import patch
+
+        from agent_common.core.catalogue_ingest import fetch_catalogue, stateless_supported
+
+        factory, session = self._session_factory("via_sdk")
+        with patch(
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=StatelessListUnsupported("400")
+        ) as fast:
+            first = await fetch_catalogue(server_slug="srv", url="https://gw/mcp", headers=None, http_client=object(), session_factory=factory)
+            second = await fetch_catalogue(server_slug="srv", url="https://gw/mcp", headers=None, http_client=object(), session_factory=factory)
+        assert first.source == second.source == "mcp" and first.tools.keys() == {"via_sdk"}
+        assert fast.await_count == 1, "never probed again once refused"
+        assert stateless_supported("https://gw/mcp") is False
+        assert session.list_tools.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_transient_error_falls_back_without_marking_the_url(self):
+        from unittest.mock import patch
+
+        from agent_common.core.catalogue_ingest import fetch_catalogue, stateless_supported
+
+        factory, _ = self._session_factory("via_sdk")
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=StatelessListError("502")):
+            cat = await fetch_catalogue(server_slug="srv", url="https://gw/mcp", headers=None, http_client=object(), session_factory=factory)
+        assert cat.source == "mcp"
+        assert stateless_supported("https://gw/mcp") is None
+
+    @pytest.mark.asyncio
+    async def test_stateless_disabled_or_no_http_client_goes_straight_to_sdk(self):
+        from unittest.mock import patch
+
+        from agent_common.core.catalogue_ingest import fetch_catalogue
+
+        factory, _ = self._session_factory("via_sdk")
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=AssertionError("must not probe")):
+            a = await fetch_catalogue(server_slug="srv", url="https://gw/mcp", headers=None, http_client=object(), session_factory=factory, stateless=False)
+            b = await fetch_catalogue(server_slug="srv", url="https://gw/mcp", headers=None, http_client=None, session_factory=factory)
+        assert a.source == b.source == "mcp"

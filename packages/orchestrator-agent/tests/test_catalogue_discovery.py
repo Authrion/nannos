@@ -89,7 +89,7 @@ class TestDiscoveryIngestPaths:
     @pytest.mark.asyncio
     async def test_flag_off_uses_sdk_session_only(self):
         list_calls: list[str] = []
-        with patch("app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock) as fast:
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock) as fast:
             tools = await _discover(_settings(stateless=False), _mcp_client(list_calls), [{"slug": "s1"}])
         fast.assert_not_awaited()
         assert list_calls == ["s1"]
@@ -100,7 +100,7 @@ class TestDiscoveryIngestPaths:
         """Same URL and token the SDK would use → same per-user listing, no handshake."""
         list_calls: list[str] = []
         with patch(
-            "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
         ) as fast:
             tools = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}, {"slug": "s2"}])
         assert list_calls == [], "no SDK session on the fast path"
@@ -117,7 +117,7 @@ class TestDiscoveryIngestPaths:
         never shared between users' tools, even when the two views happen to be identical."""
         list_calls: list[str] = []
         with patch(
-            "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
         ) as fast:
             a = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
             b = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
@@ -130,7 +130,7 @@ class TestDiscoveryIngestPaths:
     async def test_refusal_falls_back_and_is_remembered_per_url(self):
         list_calls: list[str] = []
         with patch(
-            "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=StatelessListUnsupported("400 no session")
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=StatelessListUnsupported("400 no session")
         ) as fast:
             tools = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
             await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}])
@@ -147,7 +147,7 @@ class TestDiscoveryIngestPaths:
                 raise StatelessListError("502")
             return _fast_catalogue(server_slug)
 
-        with patch("app.core.discovery.fetch_catalogue_stateless", side_effect=fast):
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=fast):
             tools = await _discover(_settings(stateless=True), _mcp_client(list_calls), [{"slug": "s1"}, {"slug": "s2"}])
         assert list_calls == ["s1"]
         assert sorted(t.name for t in tools) == ["fast_s2", "mcp_s1"]
@@ -161,7 +161,7 @@ class TestDiscoveryIngestPaths:
             seen["follow_redirects"] = client.follow_redirects
             return _fast_catalogue(server_slug)
 
-        with patch("app.core.discovery.fetch_catalogue_stateless", side_effect=fast):
+        with patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=fast):
             await _discover(_settings(stateless=True), _mcp_client([]), [{"slug": "s1"}])
         assert seen["follow_redirects"] is True
 
@@ -172,7 +172,7 @@ class TestDiscoveryIngestPaths:
         config.CONSOLE_BACKEND_URL = "https://console"
         config.CONSOLE_BACKEND_CLIENT_ID = "agent-console"
         with patch(
-            "app.core.discovery.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
+            "agent_common.core.catalogue_ingest.fetch_catalogue_stateless", new_callable=AsyncMock, side_effect=lambda *a, **kw: _fast_catalogue(kw["server_slug"])
         ) as fast:
             tools = await _discover(config, _mcp_client(list_calls), [{"slug": "s1"}])
         assert sorted(c.kwargs["server_slug"] for c in fast.await_args_list) == ["console", "s1"]

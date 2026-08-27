@@ -348,3 +348,41 @@ async def fetch_catalogue_mcp(
         else:
             raise RuntimeError(f"tools/list on '{server_slug}' exceeded {_MAX_LIST_PAGES} pages")
     return build_server_catalogue(server_slug, tools, source="mcp")
+
+
+# --------------------------------------------------------------------------------------
+# Strategy: stateless first (feature-detected per URL), SDK session as fallback
+# --------------------------------------------------------------------------------------
+
+
+async def fetch_catalogue(
+    *,
+    server_slug: str,
+    url: str,
+    headers: Mapping[str, str] | None,
+    http_client: httpx.AsyncClient | None,
+    session_factory: Callable[[], AbstractAsyncContextManager[Any]],
+    stateless: bool = True,
+) -> ServerCatalogue:
+    """One server's catalogue: stateless ``tools/list`` POST first, SDK session as fallback.
+
+    Both paths hit the same MCP ``url`` with the same ``headers`` (the caller's bearer), so
+    the result is the same per-user listing; the stateless path just skips the SDK
+    handshake and the pydantic parse. Whether an endpoint serves a stateless request is
+    probed once per URL (see :func:`stateless_supported`): a refusal marks it unsupported
+    for the process lifetime, any other failure falls back for this fetch only, and every
+    fallback is logged. ``stateless=False`` (or no ``http_client``) forces the SDK path.
+    The returned catalogue's ``source`` says which path was taken.
+    """
+    if http_client is not None and stateless and stateless_supported(url) is not False:
+        try:
+            catalogue = await fetch_catalogue_stateless(http_client, url=url, headers=headers, server_slug=server_slug)
+        except StatelessListUnsupported as e:
+            set_stateless_supported(url, False)
+            logger.warning("MCP endpoint refuses stateless tools/list — using SDK session for '%s' (%s)", server_slug, e)
+        except StatelessListError as e:
+            logger.warning("Stateless tools/list failed for '%s', falling back to SDK session: %s", server_slug, e)
+        else:
+            set_stateless_supported(url, True)
+            return catalogue
+    return await fetch_catalogue_mcp(session_factory, server_slug=server_slug)

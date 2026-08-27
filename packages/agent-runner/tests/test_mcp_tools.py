@@ -244,8 +244,8 @@ class TestSdkFallback:
     async def test_refusal_marks_endpoint_and_falls_back_to_sdk(self, provider, caplog):
         fallback = AsyncMock()
         with (
-            patch("agent.mcp_tools.fetch_catalogue_stateless", side_effect=StatelessListUnsupported("HTTP 400")),
-            patch("agent.mcp_tools.fetch_catalogue_mcp", fallback),
+            patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=StatelessListUnsupported("HTTP 400")),
+            patch("agent_common.core.catalogue_ingest.fetch_catalogue_mcp", fallback),
             patch("agent.mcp_tools.MultiServerMCPClient") as client_cls,
         ):
             from agent_common.core.tool_catalogue import build_server_catalogue, make_catalogue_tool
@@ -283,8 +283,8 @@ class TestSdkFallback:
             source="mcp",
         )
         with (
-            patch("agent.mcp_tools.fetch_catalogue_stateless", side_effect=StatelessListError("502")),
-            patch("agent.mcp_tools.fetch_catalogue_mcp", AsyncMock(return_value=cat)),
+            patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=StatelessListError("502")),
+            patch("agent_common.core.catalogue_ingest.fetch_catalogue_mcp", AsyncMock(return_value=cat)),
             patch("agent.mcp_tools.MultiServerMCPClient"),
         ):
             (tool,) = await _resolver(provider).resolve(["github_search"])
@@ -305,8 +305,8 @@ class TestSdkFallback:
             source="mcp",
         )
         with (
-            patch("agent.mcp_tools.fetch_catalogue_stateless", side_effect=AssertionError("must not be called")),
-            patch("agent.mcp_tools.fetch_catalogue_mcp", AsyncMock(return_value=cat)),
+            patch("agent_common.core.catalogue_ingest.fetch_catalogue_stateless", side_effect=AssertionError("must not be called")),
+            patch("agent_common.core.catalogue_ingest.fetch_catalogue_mcp", AsyncMock(return_value=cat)),
             patch("agent.mcp_tools.MultiServerMCPClient"),
         ):
             (tool,) = await _resolver(provider, stateless_list=False).resolve(["github_search"])

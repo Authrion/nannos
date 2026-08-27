@@ -28,14 +28,7 @@ from typing import Any
 
 import httpx
 from agent_common.agents.dynamic_agent import is_console_backend_tool
-from agent_common.core.catalogue_ingest import (
-    StatelessListError,
-    StatelessListUnsupported,
-    fetch_catalogue_mcp,
-    fetch_catalogue_stateless,
-    set_stateless_supported,
-    stateless_supported,
-)
+from agent_common.core.catalogue_ingest import fetch_catalogue
 from agent_common.core.token_provider import UserTokenProvider, bearer_interceptor
 from agent_common.core.tool_catalogue import ServerCatalogue, make_lazy_tool
 from langchain_core.tools import BaseTool
@@ -100,33 +93,22 @@ class McpToolResolver:
 
     # -- listing -------------------------------------------------------------------------
     async def _list_server(self, server_name: str, http_client: httpx.AsyncClient) -> ServerCatalogue:
-        """``tools/list`` for one server: stateless POST first, SDK session as fallback.
+        """``tools/list`` for one server via ``catalogue_ingest.fetch_catalogue`` (stateless → SDK).
 
         The listing itself needs a bearer (the gateway filters the catalogue per user), so
-        it asks the provider for one — the only place discovery touches a token. Whether an
-        endpoint serves stateless requests is memoised per URL for the process lifetime.
+        it asks the provider for one — the only place discovery touches a token.
         """
-        url = self._urls[server_name]
         bearer = await self.token_provider.get(self.audience_for(server_name))
-        if self.stateless_list and stateless_supported(url) is not False:
-            try:
-                catalogue = await fetch_catalogue_stateless(
-                    http_client, url=url, headers={"Authorization": f"Bearer {bearer}"}, server_slug=server_name
-                )
-            except StatelessListUnsupported as e:
-                set_stateless_supported(url, False)
-                logger.warning(
-                    "MCP endpoint refuses stateless tools/list — using SDK session for '%s' (%s)", server_name, e
-                )
-            except StatelessListError as e:
-                logger.warning("Stateless tools/list failed for '%s', falling back to SDK session: %s", server_name, e)
-            else:
-                set_stateless_supported(url, True)
-                self.stats["source"][server_name] = "stateless"
-                return catalogue
         client = MultiServerMCPClient({server_name: self._connection(server_name, bearer=bearer)})
-        catalogue = await fetch_catalogue_mcp(lambda: client.session(server_name), server_slug=server_name)
-        self.stats["source"][server_name] = "mcp"
+        catalogue = await fetch_catalogue(
+            server_slug=server_name,
+            url=self._urls[server_name],
+            headers={"Authorization": f"Bearer {bearer}"},
+            http_client=http_client,
+            session_factory=lambda: client.session(server_name),
+            stateless=self.stateless_list,
+        )
+        self.stats["source"][server_name] = catalogue.source
         return catalogue
 
     # -- resolution ----------------------------------------------------------------------
