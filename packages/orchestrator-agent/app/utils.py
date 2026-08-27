@@ -67,6 +67,10 @@ def _pre_resolved_tools_for(config: Any, tool_registry: dict[str, Any]) -> dict[
     token exchanges and a gateway-wide ``tools/list``. Hand them over instead: the
     whitelist (``config.mcp_tools``) plus the console self-improvement tools every
     sub-agent gets. Names not in the registry are left for the sub-agent to discover.
+
+    ``tool_registry`` must be the registry *before* the orchestrator wraps the skill tools
+    with ``agent_name="orchestrator"``: the sub-agent applies its own default, and a raw
+    tool without one behaves exactly like the tool it used to discover itself.
     """
     from langchain_core.tools import BaseTool
 
@@ -299,6 +303,11 @@ def build_runtime_context(
         "console_import_skill",
         "console_activate_skill",
     }
+    # Snapshot BEFORE the orchestrator-specific wrap below: sub-agents get the raw tools
+    # (see _pre_resolved_tools_for) and apply their own agent_name default, otherwise a
+    # sub-agent whose whitelist names a skill tool would silently edit the orchestrator's
+    # skills/playbook.
+    unwrapped_registry = dict(tool_registry)
     for tool_name in _SKILL_TOOLS_NEEDING_AGENT_NAME:
         if tool_name in tool_registry:
             tool_registry[tool_name] = _wrap_tool_with_agent_name(tool_registry[tool_name], "orchestrator")
@@ -506,7 +515,7 @@ def build_runtime_context(
                         config=config,
                         model=subagent_model,
                         orchestrator_tools=orchestrator_tools,
-                        pre_resolved_tools=_pre_resolved_tools_for(config, tool_registry),
+                        pre_resolved_tools=_pre_resolved_tools_for(config, unwrapped_registry),
                         oauth2_client=oauth2_client,
                         user_token=user_config.access_token.get_secret_value() if user_config.access_token else None,
                         checkpointer=checkpointer,

@@ -34,3 +34,17 @@ def test_no_whitelist_still_hands_over_self_improvement_tools():
     registry["github_get_me"] = _tool("github_get_me")
     handed = _pre_resolved_tools_for(SimpleNamespace(mcp_tools=None), registry)
     assert set(handed) == set(DynamicLocalAgentRunnable._CONSOLE_SELF_IMPROVEMENT_TOOLS)
+
+
+def test_build_runtime_context_hands_sub_agents_the_unwrapped_skill_tools():
+    """The orchestrator wraps skill tools with agent_name="orchestrator" for itself; sub-agents
+    must receive the raw tool so their own agent_name default applies (round-2 review B)."""
+    import inspect
+
+    from app import utils
+
+    src = inspect.getsource(utils.build_runtime_context)
+    wrap_at = src.index('_wrap_tool_with_agent_name(tool_registry[tool_name], "orchestrator")')
+    snapshot_at = src.index("unwrapped_registry = dict(tool_registry)")
+    handover_at = src.index("_pre_resolved_tools_for(config, unwrapped_registry)")
+    assert snapshot_at < wrap_at < handover_at
