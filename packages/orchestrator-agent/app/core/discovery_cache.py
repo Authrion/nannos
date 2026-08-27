@@ -18,8 +18,8 @@ entitled to *and* that the cached value actually depends on::
 
 Note that the per-user *tool whitelist* (``tool_names``) is deliberately NOT part of the
 key: discovery runs unfiltered (``white_list=None``) and the whitelist is applied later in
-``build_runtime_context``, so the cached ``(tools, sub_agents)`` value does not depend on
-it. Keying on it would only fragment the cache. A whitelist change (or any other per-user
+``build_runtime_context``, so the cached ``(tools, sub_agents, token_provider)`` value does not depend
+on it. Keying on it would only fragment the cache. A whitelist change (or any other per-user
 entitlement field carried on the cached ``User`` — role, bypass rules, catalog access) is
 propagated by console-backend calling ``invalidate_users`` for the affected user(s); see
 ``main.invalidate_discovery_cache``.
@@ -165,7 +165,7 @@ _user_cache: TtlTokenCache | None = None
 
 
 def get_discovery_cache(ttl_seconds: float | None = None) -> TtlTokenCache:
-    """Process-wide cache of discovered (tools, sub_agents) tuples."""
+    """Process-wide cache of discovered ``(tools, sub_agents, token_provider)`` tuples."""
     global _discovery_cache
     if _discovery_cache is None:
         _discovery_cache = TtlTokenCache(ttl_seconds if ttl_seconds is not None else 300.0, name="DISCOVERY-CACHE")

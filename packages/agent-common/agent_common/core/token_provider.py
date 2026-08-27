@@ -11,7 +11,9 @@ expiring in the middle of a long turn.
 
 This module inverts that. A :class:`UserTokenProvider` is the single place that mints
 exchanged tokens for one user: it memoises them per audience and re-exchanges when the
-memoised one is within ``leeway`` seconds of its ``exp``. Tools carry **no** bearer in
+memoised one is within ``leeway`` seconds of its ``exp``. Reuse needs a readable ``exp``:
+an opaque (non-JWT) token has no known lifetime and is therefore re-exchanged on every
+ask — correct, just not cached. Tools carry **no** bearer in
 their connection; :func:`bearer_interceptor` asks the provider for a token for the
 tool's server on every call and injects the ``Authorization`` header for that call only
 (the same ``request.override(headers=…)`` hook the console attribution interceptor
