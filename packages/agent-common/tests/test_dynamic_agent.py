@@ -1,5 +1,6 @@
 """Unit tests for DynamicLocalAgentRunnable and LocalSubAgentConfig."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -767,6 +768,64 @@ class TestDiscoverMcpTools:
 
         assert tools["some_gateway_tool"]._connection["headers"]["Authorization"] == "Bearer tok-gatana"
         assert tools["console_create_skill"]._connection["headers"]["Authorization"] == "Bearer tok-agent-console"
+
+    @pytest.mark.asyncio
+    async def test_with_a_token_provider_tools_are_token_free_and_mint_per_call(self, gateway_config, mock_model):
+        """Given the orchestrator's UserTokenProvider, the sub-agent exchanges through it and the
+        tools it discovers itself carry no bearer — an interceptor mints one per call."""
+        from agent_common.core.token_provider import UserTokenProvider
+        from agent_common.core.tool_catalogue import reset_catalogue_store
+
+        reset_catalogue_store()
+        exchanges: list[str] = []
+
+        import base64
+        import json
+        import time
+
+        def _jwt(aud: str) -> str:
+            seg = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).rstrip(b"=").decode()  # noqa: E731
+            return f"{seg({'alg': 'none'})}.{seg({'exp': time.time() + 900, 'aud': aud})}.sig"
+
+        minted: dict[str, str] = {}
+
+        async def exchange(*, subject_token, target_client_id, requested_scopes):
+            exchanges.append(target_client_id)
+            return minted.setdefault(target_client_id, _jwt(target_client_id))
+
+        provider = UserTokenProvider("user-token", exchange)
+        oauth2_client = MagicMock()
+        oauth2_client.exchange_token = AsyncMock(side_effect=AssertionError("must go through the provider"))
+        runnable = DynamicLocalAgentRunnable(
+            config=gateway_config,
+            model=mock_model,
+            oauth2_client=oauth2_client,
+            user_token="user-token",
+            mcp_gateway_url="https://gateway.example/mcp",
+            mcp_gateway_client_id="gatana",
+            token_provider=provider,
+        )
+        with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
+            _install_list_tools(mock_client_cls, return_value=[Tool(name="some_gateway_tool", description="d", func=lambda x: x)])
+            (tool,) = await runnable._discover_mcp_tools()
+            listing_connection = mock_client_cls.call_args.kwargs["connections"]["gatana"]
+
+        assert exchanges == ["gatana"], "one exchange, via the provider"
+        assert listing_connection["headers"] == {"Authorization": f"Bearer {minted['gatana']}"}, "listing used the bearer"
+        assert not (tool._connection.get("headers") or {}), "the tool's connection carries no credential"
+        assert tool._interceptors and len(tool._interceptors) == 1
+        seen = {}
+
+        class Req(SimpleNamespace):
+            def override(self, **kw):
+                return Req(**{**self.__dict__, **kw})
+
+        async def handler(req):
+            seen.update(req.headers)
+            return "ok"
+
+        await tool._interceptors[0](Req(server_name="gatana", headers=None), handler)
+        assert seen == {"Authorization": f"Bearer {minted['gatana']}"} and exchanges == ["gatana"], "memoised: no second exchange"
 
     @pytest.mark.asyncio
     async def test_pre_resolved_tools_skip_exchange_and_discovery_entirely(self, gateway_config, mock_model):

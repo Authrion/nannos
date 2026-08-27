@@ -32,18 +32,14 @@ and every entry is recomputed.
 
 Token-expiry safety
 -------------------
-Discovered tools embed an *exchanged* bearer token (gatana/console) in their MCP connection,
-and the registry data was fetched with the user token, so a cache entry must not outlive
-those tokens. Each entry is bounded by ``min(ttl, user_token.exp - margin)``.
-
-The user token's ``exp`` is used as the bound because the exchanged tokens are not available
-at ``put`` time. This is safe **only while** the exchanged gatana/console tokens are minted
-with a lifetime at least as long as the user token's remaining validity — which holds when
-those OIDC clients use (at least) the realm's default access-token lifespan. To keep that
-assumption robust the default TTL is kept well below a typical realm access-token lifespan,
-so an entry can never outlive a freshly-minted exchanged token even if a client is
-configured with a shorter lifespan. If you shorten the gatana/console token lifespan below
-``AGENT_DISCOVERY_CACHE_TTL``, lower the TTL to match.
+Discovered tools carry **no** bearer token: each call mints one through the user's
+``UserTokenProvider`` (``agent_common.core.token_provider``), which is cached alongside the
+tools and given the user's current token at the start of every turn. The registry data,
+however, was fetched with the user token and reflects entitlements tied to it, so a cache
+entry is still bounded by ``min(ttl, user_token.exp - margin)``: it never outlives the user
+token it was built for. The TTL itself is therefore purely a *catalogue-freshness* knob (how
+long before a changed gateway catalogue or group→server policy is picked up), not a
+credential bound.
 """
 
 from __future__ import annotations

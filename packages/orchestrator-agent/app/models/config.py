@@ -262,6 +262,11 @@ class UserConfig(BaseModel):
         description="Discovered remote A2A sub-agents (CompiledSubAgent TypedDicts with name, description, runnable)",
     )
     tools: Optional[list] = Field(default=None, description="Discovered MCP tools")
+    token_provider: Optional[Any] = Field(
+        default=None,
+        description="Per-user UserTokenProvider that mints MCP bearer tokens at call time (shared with sub-agents)",
+        exclude=True,
+    )
     local_subagents: Optional[list[LocalSubAgentConfig]] = Field(
         default=None,
         description="User-configured local sub-agents",

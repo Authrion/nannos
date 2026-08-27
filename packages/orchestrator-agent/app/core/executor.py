@@ -270,8 +270,13 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             policy_version=AgentSettings.ENTITLEMENT_POLICY_VERSION,
         )
         cached = cache.get(dkey)
+        user_token_value = user_config.access_token.get_secret_value()
         if cached is not None:
-            tools, sub_agents = cached
+            tools, sub_agents, token_provider = cached
+            # The provider mints this user's MCP bearers at call time; hand it the token the
+            # user presented *this* turn so exchanges never run against a rotated-out one.
+            if token_provider is not None:
+                token_provider.update_subject_token(user_token_value)
             logger.info(
                 "[DISCOVERY-CACHE] hit for user_sub=%s (%d tools, %d sub-agents) — skipping discovery",
                 user_config.user_sub,
@@ -287,14 +292,17 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             # Discover ALL tools (without whitelist)
             # The whitelist will be applied later in build_runtime_context for orchestrator binding
             # Server info is stored in tool.metadata["server_name"] by MultiServerMCPClient
-            tools = await self.agent.tool_discovery_service.discover_tools(
-                user_config.access_token.get_secret_value(),
+            discovery = self.agent.tool_discovery_service
+            token_provider = discovery.make_token_provider(user_token_value) if discovery.oauth2_client else None
+            tools = await discovery.discover_tools(
+                user_token_value,
                 white_list=None,  # Don't filter here - GP agent needs access to all tools
+                token_provider=token_provider,
             )
             cache.put(
                 dkey,
-                (tools, sub_agents),
-                user_config.access_token.get_secret_value(),
+                (tools, sub_agents, token_provider),
+                user_token_value,
                 owner=user_config.user_sub,
             )
             logger.info(
@@ -309,6 +317,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         # Update user_config with discovered data
         user_config.tools = tools
         user_config.sub_agents = sub_agents
+        user_config.token_provider = token_provider
 
         logger.debug(f"Built complete UserConfig with {len(user_config.sub_agents)} sub-agents")
 

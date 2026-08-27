@@ -90,6 +90,7 @@ from agent_common.core.graph_utils import (
 )
 from agent_common.core.model_factory import get_model_input_capabilities
 from agent_common.core.catalogue_ingest import fetch_catalogue_mcp
+from agent_common.core.token_provider import UserTokenProvider, bearer_interceptor
 from agent_common.core.tool_catalog import TOOL_CATALOG_PROMPT_ADDENDUM, ToolCatalogMiddleware
 from agent_common.core.tool_catalogue import get_catalogue_store, make_lazy_tool
 from agent_common.middleware.conversation_context_tools_middleware import ContextGatedTool
@@ -244,6 +245,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         inject_all_tools: Optional[List[BaseTool]] = None,
         tool_catalog: Optional[dict[str, BaseTool]] = None,
         pre_resolved_tools: Optional[Mapping[str, BaseTool]] = None,
+        token_provider: UserTokenProvider | None = None,
         risk_scorer: RiskScorerFn | None = None,
         tool_risk_cache: ToolRiskCache | None = None,
         tool_bypass_rules: dict[str, Any] | None = None,
@@ -271,6 +273,8 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             user_id: User's stable database ID (for playbook loading)
             group_ids: User's group IDs for group playbook loading (all groups)
             extra_middlewares: Optional list of middleware instances to prepend to the standard stack.
+            token_provider: Optional per-user UserTokenProvider; exchanges go through it and
+                self-discovered tools mint their bearer per call instead of embedding one.
             pre_resolved_tools: Optional name -> tool map of already-authenticated MCP tools
                 discovered by the orchestrator for this user; whitelisted names present here
                 are reused without any token exchange or ``tools/list`` (missing ones are still
@@ -327,6 +331,11 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         # as-is — same user, same audience, same token — so a delegation performs no token
         # exchange and no tools/list of its own; only names missing here are discovered.
         self.pre_resolved_tools: Mapping[str, BaseTool] = pre_resolved_tools or {}
+        # The user's per-turn-refreshed provider of exchanged MCP bearers (from the embedding
+        # orchestrator). When present, this runnable's own exchanges go through it and the
+        # tools it discovers itself are built token-free with a per-call bearer interceptor,
+        # exactly like the orchestrator's. Standalone (agent-runner) keeps exchanging directly.
+        self.token_provider = token_provider
         self._risk_scorer: RiskScorerFn | None = risk_scorer
         self._tool_risk_cache: ToolRiskCache | None = tool_risk_cache
         self._tool_bypass_rules: dict[str, Any] = tool_bypass_rules if tool_bypass_rules is not None else {}
@@ -636,6 +645,8 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         MCP discovery — see _TokenExchangeError for why that matters.
         """
         try:
+            if self.token_provider is not None:
+                return await self.token_provider.get(target_client_id)
             return await self.oauth2_client.exchange_token(
                 subject_token=self.user_token,
                 target_client_id=target_client_id,
@@ -898,6 +909,25 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         store = get_catalogue_store()
         callbacks = client.callbacks
         tools: list[BaseTool] = []
+        # With a provider, tools must not embed the listing bearer: strip it from the connection
+        # they call on and mint per call instead (same as the orchestrator's tools).
+        interceptors: list[Any] | None = None
+        if self.token_provider is not None:
+            provider = self.token_provider
+
+            console_audience = self.console_backend_client_id or "agent-console"
+            gateway_audience = self.mcp_gateway_client_id or "gatana"
+
+            def _audience(server_name: str) -> str:
+                return console_audience if server_name == "console" else gateway_audience
+
+            interceptors = [bearer_interceptor(provider, _audience)]
+
+        def _call_connection(connection: Any) -> Any:
+            if interceptors is None or not isinstance(connection, dict) or not connection.get("headers"):
+                return connection
+            headers = {k: v for k, v in connection["headers"].items() if k.lower() != "authorization"}
+            return {**connection, "headers": headers or None}
 
         def _connection_for(tool_name: str, server_name: str | None = None) -> Any | None:
             """Pick the connection that can reach ``tool_name`` — by key, never by position.
@@ -921,7 +951,13 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
             if connection is None:
                 continue  # whitelisted but this agent has no connection that can reach it
             tools.append(
-                make_lazy_tool(held_entry, server_name=held.server_name, connection=connection, callbacks=callbacks)
+                make_lazy_tool(
+                    held_entry,
+                    server_name=held.server_name,
+                    connection=_call_connection(connection),
+                    callbacks=callbacks,
+                    tool_interceptors=interceptors,
+                )
             )
         missing = {n for n in wanted if n not in resolved and _connection_for(n) is not None}
 
@@ -944,7 +980,13 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
                     if entry is None:
                         continue
                     tools.append(
-                        make_lazy_tool(entry, server_name=catalogue.server_name, connection=connection, callbacks=callbacks)
+                        make_lazy_tool(
+                            entry,
+                            server_name=catalogue.server_name,
+                            connection=_call_connection(connection),
+                            callbacks=callbacks,
+                            tool_interceptors=interceptors,
+                        )
                     )
                     fetched += 1
         logger.info(
@@ -1046,11 +1088,7 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         try:
             console_headers: dict[str, str] = {}
             if self.oauth2_client and self.user_token:
-                console_token = await self.oauth2_client.exchange_token(
-                    subject_token=self.user_token,
-                    target_client_id=self.console_backend_client_id,
-                    requested_scopes=["openid", "profile", "offline_access"],
-                )
+                console_token = await self._exchange_token_for(self.console_backend_client_id or "agent-console")
                 console_headers["Authorization"] = f"Bearer {console_token}"
             elif self.user_token:
                 console_headers["Authorization"] = f"Bearer {self.user_token}"
@@ -1886,6 +1924,7 @@ def create_dynamic_local_subagent(
     inject_all_tools: Optional[List[BaseTool]] = None,
     tool_catalog: Optional[dict[str, BaseTool]] = None,
     pre_resolved_tools: Optional[Mapping[str, BaseTool]] = None,
+    token_provider: UserTokenProvider | None = None,
     risk_scorer: RiskScorerFn | None = None,
     tool_risk_cache: ToolRiskCache | None = None,
     tool_bypass_rules: dict[str, Any] | None = None,
@@ -1959,6 +1998,7 @@ def create_dynamic_local_subagent(
         inject_all_tools=inject_all_tools,
         tool_catalog=tool_catalog,
         pre_resolved_tools=pre_resolved_tools,
+        token_provider=token_provider,
         risk_scorer=risk_scorer,
         tool_risk_cache=tool_risk_cache,
         tool_bypass_rules=tool_bypass_rules,

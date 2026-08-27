@@ -516,6 +516,7 @@ def build_runtime_context(
                         model=subagent_model,
                         orchestrator_tools=orchestrator_tools,
                         pre_resolved_tools=_pre_resolved_tools_for(config, unwrapped_registry),
+                        token_provider=user_config.token_provider,
                         oauth2_client=oauth2_client,
                         user_token=user_config.access_token.get_secret_value() if user_config.access_token else None,
                         checkpointer=checkpointer,

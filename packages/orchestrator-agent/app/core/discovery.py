@@ -36,6 +36,7 @@ from agent_common.core.catalogue_ingest import (
     fetch_catalogue_mcp,
     fetch_catalogue_stateless,
 )
+from agent_common.core.token_provider import UserTokenProvider, bearer_interceptor
 from agent_common.core.tool_catalogue import CatalogueStore, ServerCatalogue, build_lazy_tools, get_catalogue_store
 
 logger = logging.getLogger(__name__)
@@ -406,35 +407,47 @@ class ToolDiscoveryService:
         # Should never reach here, but just in case
         raise last_error or Exception(f"Failed to load MCP tools from {server_name}")
 
+    def make_token_provider(self, token: str) -> UserTokenProvider:
+        """A per-user provider of exchanged MCP bearer tokens (see agent_common.core.token_provider)."""
+        return UserTokenProvider(token, self.oauth2_client.exchange_token)
+
+    def _audience_for_server(self, server_name: str) -> str:
+        """OAuth audience a server's calls must carry: console-backend's client id for the
+        console MCP server, the gateway client for everything else."""
+        return self.config.CONSOLE_BACKEND_CLIENT_ID if server_name == "console" else "gatana"
+
     async def discover_tools(
         self,
         token: str,
         white_list: Optional[List[str]] = None,
         include_server_slugs: Optional[List[str]] = None,
+        token_provider: UserTokenProvider | None = None,
     ) -> List[BaseTool]:
         """Discover available MCP tools with optional server filtering.
 
-        Performs token exchange to obtain a token for the gatana client
-        in the same Keycloak realm, then uses that token to authenticate with
-        MCP services.
+        Tokens: the user's token is exchanged for the gateway / console audiences through a
+        per-user :class:`UserTokenProvider`. The exchanged token is used to *list* tools now;
+        the tools themselves are built on token-free connections and mint a fresh bearer on
+        every call via an interceptor, so a tool's credential is never older than the
+        provider's leeway — however long the tool object lives (discovery cache, sub-agent
+        hand-over).
 
         Args:
             token: User's access token from the orchestrator
             white_list: Optional list of tool names to filter to (post-discovery filtering)
             include_server_slugs: Optional list of server slugs to include tools from
+            token_provider: The user's provider (created here when not given; the executor
+                passes the one it keeps across turns)
 
         Returns:
             List of discovered tools with server_name in metadata
         """
         logger.debug("Discovering tools for orchestrator deep agent")
         try:
+            provider = token_provider or self.make_token_provider(token)
             # Exchange user token for gatana token
             # The target client is 'gatana' in the same Keycloak realm
-            mcp_gateway_token = await self.oauth2_client.exchange_token(
-                subject_token=token,
-                target_client_id="gatana",
-                requested_scopes=["openid", "profile", "offline_access"],
-            )
+            mcp_gateway_token = await provider.get("gatana")
             logger.info("Successfully exchanged token for gatana")
 
             # Fetch available servers to create per-server connections
@@ -462,19 +475,24 @@ class ToolDiscoveryService:
                 logger.debug(f"Filtered to {len(servers)} servers: {[s.get('slug') for s in servers]}")
 
             # Create one connection per MCP server
-            # This allows MultiServerMCPClient to naturally track which tools come from which server
-            connections = {}
+            # This allows MultiServerMCPClient to naturally track which tools come from which server.
+            # `connections` carry the bearer for *listing* (this request); `call_connections` are the
+            # same URLs without credentials — the tools built on them mint a bearer per call.
+            connections: dict[str, Any] = {}
+            call_connections: dict[str, Any] = {}
             for server in servers:
                 server_slug = server.get("slug")
                 if not server_slug:
                     continue
 
                 # Each connection uses the gateway URL but filtered to one server
+                url = f"{self.config.MCP_GATEWAY_URL}?includeOnlyServerSlugs={server_slug}"
                 connections[server_slug] = StreamableHttpConnection(
                     transport="streamable_http",
-                    url=f"{self.config.MCP_GATEWAY_URL}?includeOnlyServerSlugs={server_slug}",
+                    url=url,
                     headers={"Authorization": f"Bearer {mcp_gateway_token}"},
                 )
+                call_connections[server_slug] = StreamableHttpConnection(transport="streamable_http", url=url)
 
             if not connections:
                 logger.warning("No valid server connections created, returning empty tool list")
@@ -484,16 +502,13 @@ class ToolDiscoveryService:
             # Exchange token for agent-console audience (separate from gatana)
             if self.config.CONSOLE_BACKEND_URL:
                 console_mcp_url = f"{self.config.CONSOLE_BACKEND_URL}/mcp"
-                console_token = await self.oauth2_client.exchange_token(
-                    subject_token=token,
-                    target_client_id=self.config.CONSOLE_BACKEND_CLIENT_ID,
-                    requested_scopes=["openid", "profile", "offline_access"],
-                )
+                console_token = await provider.get(self.config.CONSOLE_BACKEND_CLIENT_ID)
                 connections["console"] = StreamableHttpConnection(
                     transport="streamable_http",
                     url=console_mcp_url,
                     headers={"Authorization": f"Bearer {console_token}"},
                 )
+                call_connections["console"] = StreamableHttpConnection(transport="streamable_http", url=console_mcp_url)
                 logger.debug(f"Added agent-console MCP connection: {console_mcp_url}")
 
             logger.debug(f"Created {len(connections)} MCP server connections: {list(connections.keys())}")
@@ -505,11 +520,15 @@ class ToolDiscoveryService:
             client = MultiServerMCPClient(
                 connections=connections,
                 callbacks=Callbacks(on_progress=on_mcp_progress),
-                # Stamp x-nannos-context (conversation_id, …) on every console tool call so
-                # console-backend tools that hit the gateway (console_web_search) bill to the right
-                # conversation instead of "Direct API Calls". Scoped to the console server inside.
-                tool_interceptors=[_console_attribution_interceptor],
             )
+            # Per-call interceptors for the tools: a fresh bearer for the server's audience, then
+            # x-nannos-context (conversation_id, …) on console tool calls so console-backend tools
+            # that hit the gateway (console_web_search) bill to the right conversation instead of
+            # "Direct API Calls" (scoped to the console server inside).
+            tool_interceptors = [
+                bearer_interceptor(provider, self._audience_for_server),
+                _console_attribution_interceptor,
+            ]
 
             # Gather tools from all servers with retry logic.
             # Use asyncio.gather with return_exceptions=True to handle partial failures gracefully.
@@ -561,9 +580,9 @@ class ToolDiscoveryService:
                     tools.extend(
                         build_lazy_tools(
                             result,
-                            connection=connections[slug],
+                            connection=call_connections[slug],
                             callbacks=client.callbacks,
-                            tool_interceptors=client.tool_interceptors,
+                            tool_interceptors=tool_interceptors,
                             extra_metadata=extra_metadata,
                         )
                     )
