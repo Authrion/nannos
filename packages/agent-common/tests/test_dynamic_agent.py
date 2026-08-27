@@ -721,6 +721,54 @@ class TestDiscoverMcpTools:
         assert held.source == "mcp"
 
     @pytest.mark.asyncio
+    async def test_store_hits_bind_to_the_gateway_connection_by_key_not_position(self, gateway_config, mock_model):
+        """The gateway connection is looked up by mcp_gateway_client_id; a console tool by 'console'.
+        Dict order must not matter (regression for a positional gateway[0] pick)."""
+        from agent_common.core.tool_catalogue import (
+            build_server_catalogue,
+            get_catalogue_store,
+            make_catalogue_tool,
+            reset_catalogue_store,
+        )
+
+        reset_catalogue_store()
+        store = get_catalogue_store()
+        store.intern(
+            build_server_catalogue(
+                "github",
+                [make_catalogue_tool(server_name="github", name="some_gateway_tool", description="", input_schema={"type": "object"})],
+                source="stateless",
+            )
+        )
+        store.intern(
+            build_server_catalogue(
+                "console",
+                [make_catalogue_tool(server_name="console", name="console_create_skill", description="", input_schema={"type": "object"})],
+                source="mcp",
+            )
+        )
+        config = LocalLangGraphSubAgentConfig(
+            type="langgraph", name="g", description="x", system_prompt="x", mcp_tools=["some_gateway_tool", "console_create_skill"]
+        )
+        oauth2_client = MagicMock()
+        oauth2_client.exchange_token = AsyncMock(side_effect=lambda **kw: f"tok-{kw['target_client_id']}")
+        runnable = DynamicLocalAgentRunnable(
+            config=config,
+            model=mock_model,
+            oauth2_client=oauth2_client,
+            user_token="user-token",
+            mcp_gateway_url="https://gateway.example/mcp",
+            mcp_gateway_client_id="gatana",
+        )
+        runnable.console_backend_mcp_url = "https://console.example/mcp"
+        with patch("agent_common.agents.dynamic_agent.MultiServerMCPClient") as mock_client_cls:
+            _install_list_tools(mock_client_cls, side_effect=AssertionError("store must serve both"))
+            tools = {t.name: t for t in await runnable._discover_mcp_tools()}
+
+        assert tools["some_gateway_tool"]._connection["headers"]["Authorization"] == "Bearer tok-gatana"
+        assert tools["console_create_skill"]._connection["headers"]["Authorization"] == "Bearer tok-agent-console"
+
+    @pytest.mark.asyncio
     async def test_pre_resolved_tools_skip_exchange_and_discovery_entirely(self, gateway_config, mock_model):
         """When the orchestrator hands over its already-authenticated tools, a delegation must
         perform no token exchange, build no MCP client and open no tools/list."""

@@ -899,15 +899,25 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         callbacks = client.callbacks
         tools: list[BaseTool] = []
 
-        def _connection_for(tool_name: str) -> Any | None:
+        def _connection_for(tool_name: str, server_name: str | None = None) -> Any | None:
+            """Pick the connection that can reach ``tool_name`` — by key, never by position.
+
+            Console-backend tools go to the ``console`` connection. Everything else is a
+            gateway tool: prefer a connection keyed by the tool's own server slug (an agent
+            wired with per-server connections), else the gateway-wide connection keyed by
+            ``mcp_gateway_client_id`` (how this runnable builds it). ``None`` means this agent
+            has no connection that can reach the tool, so it is skipped rather than guessed.
+            """
             if is_console_backend_tool(tool_name):
                 return connections.get("console")
-            gateway = [c for name, c in connections.items() if name != "console"]
-            return gateway[0] if gateway else None
+            if server_name and server_name != "console" and server_name in connections:
+                return connections[server_name]
+            gateway_key = self.mcp_gateway_client_id
+            return connections.get(gateway_key) if gateway_key else None
 
         resolved = store.resolve(wanted)
         for name, (held, held_entry) in resolved.items():
-            connection = _connection_for(name)
+            connection = _connection_for(name, held.server_name)
             if connection is None:
                 continue  # whitelisted but this agent has no connection that can reach it
             tools.append(
