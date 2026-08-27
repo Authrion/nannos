@@ -904,7 +904,9 @@ class DynamicLocalAgentRunnable(StructuredResponseMixin, LocalA2ARunnable):
         hold trigger an MCP ``tools/list`` on this agent's own connection(s), and that
         result is interned too (flattened to bytes, pydantic objects dropped) so the next
         delegation is served from the store. Every returned tool is a :class:`LazyMcpTool`
-        bound to *this agent's* connection (its own exchanged token), whatever the source.
+        bound to *this agent's* connection, whatever the source — token-free with a per-call
+        bearer interceptor when a token provider is configured, else carrying this agent's own
+        exchanged token (standalone execution).
         """
         store = get_catalogue_store()
         callbacks = client.callbacks

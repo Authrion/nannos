@@ -62,9 +62,9 @@ def _pre_resolved_tools_for(config: Any, tool_registry: dict[str, Any]) -> dict[
     """The orchestrator's already-authenticated tools a sub-agent can reuse, by name.
 
     A delegated sub-agent runs as the same user against the same MCP gateway/console, so
-    the tools the orchestrator discovered this turn (connections carrying this user's
-    exchanged tokens) are exactly what the sub-agent would rebuild with two or three more
-    token exchanges and a gateway-wide ``tools/list``. Hand them over instead: the
+    the tools the orchestrator discovered this turn (token-free connections whose calls are
+    authenticated by this user's token provider) are exactly what the sub-agent would rebuild
+    with two or three more token exchanges and a gateway-wide ``tools/list``. Hand them over instead: the
     whitelist (``config.mcp_tools``) plus the console self-improvement tools every
     sub-agent gets. Names not in the registry are left for the sub-agent to discover.
 

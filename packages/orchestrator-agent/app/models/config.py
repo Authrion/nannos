@@ -323,11 +323,13 @@ class AgentSettings:
     # No env var or hardcoded alias: models are registered at runtime.
 
     # Cache configuration.
-    # Per-user discovery + registry cache TTL (seconds). Kept well below a typical realm
-    # access-token lifespan so a cache entry can never outlive the exchanged gatana/console
-    # tokens embedded in the discovered tools (see discovery_cache "Token-expiry safety"),
-    # and so an entitlement *revocation* that only reaches one replica (the invalidation POST
-    # is in-process / single-replica) self-heals fleet-wide within the TTL.
+    # Per-user discovery + registry cache TTL (seconds). Discovered tools carry no credential
+    # (bearers are minted at call time by the per-user token provider), so this is purely a
+    # freshness bound: how long a catalogue change made *outside* the console (on the MCP
+    # gateway itself) may go unnoticed, and how long an entitlement change may lag on replicas
+    # the console's invalidation POST did not reach (it is in-process, one replica). Changes
+    # made through the console invalidate the receiving replica immediately. Entries are
+    # additionally bounded by the user token's expiry.
     AGENT_DISCOVERY_CACHE_TTL = _int_env("AGENT_DISCOVERY_CACHE_TTL", 60)
     # Cross-cutting invalidation lever for the discovery/registry caches: bump this (env)
     # or call discovery_cache.invalidate_all() when a group→server/tool access policy

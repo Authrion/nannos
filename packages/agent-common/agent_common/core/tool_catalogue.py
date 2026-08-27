@@ -202,9 +202,11 @@ class LazyMcpTool(BaseTool):
       and delegates to its coroutine, so interceptors / progress callbacks / result
       conversion are byte-for-byte the upstream behaviour.
 
-    The MCP connection (which carries the user's exchanged bearer token) is a private
-    attribute on the tool, never on the shared catalogue — catalogue bytes are shared
-    across users, connections are not.
+    The MCP connection and the per-call interceptors (which mint the user's bearer for
+    each call — see ``agent_common.core.token_provider``) are private attributes on the
+    tool, never on the shared catalogue: catalogue bytes are shared across users,
+    connections and credentials are not. A connection may still carry a static bearer
+    when no token provider is configured (standalone execution).
     """
 
     server_name: str

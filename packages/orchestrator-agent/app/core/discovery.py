@@ -569,7 +569,7 @@ class ToolDiscoveryService:
 
             # Process results - filter out exceptions and log failures. Each catalogue
             # is wrapped into per-user LazyMcpTools bound to this user's connection
-            # (which carries the exchanged token); the catalogue bytes themselves are
+            # (token-free: a bearer is minted per call via the interceptors); the catalogue bytes themselves are
             # shared across users via the store.
             tools: list[BaseTool] = []
             failed_servers = []

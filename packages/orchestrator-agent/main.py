@@ -444,7 +444,8 @@ async def invalidate_discovery_cache(request: Request) -> JSONResponse:
     issuer configured, dev only) there is no token to check and the call is allowed.
 
     Multi-replica note: the cache is in-process, so one call flushes one replica. Behind a
-    load balancer the other replicas fall back to the TTL (kept short for this reason) or a
+    load balancer the other replicas fall back to the TTL (which bounds that lag; fan-out to
+    every replica is tracked in #171) or a
     ``ENTITLEMENT_POLICY_VERSION`` bump for a fleet-wide flush. A fan-out/pub-sub broadcast
     is the follow-up for instant fleet-wide invalidation.
     """
