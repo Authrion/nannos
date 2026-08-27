@@ -58,6 +58,28 @@ def _wrap_tool_with_agent_name(tool: Any, agent_name: str) -> Any:
     )
 
 
+def _pre_resolved_tools_for(config: Any, tool_registry: dict[str, Any]) -> dict[str, Any]:
+    """The orchestrator's already-authenticated tools a sub-agent can reuse, by name.
+
+    A delegated sub-agent runs as the same user against the same MCP gateway/console, so
+    the tools the orchestrator discovered this turn (token-free connections whose calls are
+    authenticated by this user's token provider) are exactly what the sub-agent would rebuild
+    with two or three more token exchanges and a gateway-wide ``tools/list``. Hand them over instead: the
+    whitelist (``config.mcp_tools``) plus the console self-improvement tools every
+    sub-agent gets. Names not in the registry are left for the sub-agent to discover.
+
+    ``tool_registry`` must be the registry *before* the orchestrator wraps the skill tools
+    with ``agent_name="orchestrator"``: the sub-agent applies its own default, and a raw
+    tool without one behaves exactly like the tool it used to discover itself.
+    """
+    from langchain_core.tools import BaseTool
+
+    from agent_common.agents.dynamic_agent import DynamicLocalAgentRunnable
+
+    wanted = set(config.mcp_tools or []) | set(DynamicLocalAgentRunnable._CONSOLE_SELF_IMPROVEMENT_TOOLS)
+    return {name: tool_registry[name] for name in wanted if isinstance(tool_registry.get(name), BaseTool)}
+
+
 def _gp_tool_catalog_enabled() -> bool:
     """Whether the GP agent gets its registry as a lazy catalog (default on).
 
@@ -223,11 +245,16 @@ def build_runtime_context(
 
     # Auto-include scheduler tools and console tools (always available from MCP)
     # These are essential for the orchestrator to delegate to task-scheduler sub-agent
+    #
+    # Deliberately NOT here: console_list_mcp_servers / console_grep_mcp_tools. They date
+    # from when the orchestrator ran the scheduler itself and needed tool names for job
+    # configs; that moved into the task-scheduler sub-agent (#108), whose seed whitelists
+    # both listers (agent-creator's too). On the orchestrator they only tempted the model
+    # to discover tools it cannot call — the right move for anything outside its own
+    # whitelist is a `task` delegation, and it knows the sub-agents from the task enum.
     allowed_orchestrator_tools = {
         "console_list_sub_agents",
         "console_update_sub_agent",
-        "console_list_mcp_servers",
-        "console_grep_mcp_tools",
         "console_create_bug_report",
         "console_create_skill",
         "console_update_skill",
@@ -276,6 +303,11 @@ def build_runtime_context(
         "console_import_skill",
         "console_activate_skill",
     }
+    # Snapshot BEFORE the orchestrator-specific wrap below: sub-agents get the raw tools
+    # (see _pre_resolved_tools_for) and apply their own agent_name default, otherwise a
+    # sub-agent whose whitelist names a skill tool would silently edit the orchestrator's
+    # skills/playbook.
+    unwrapped_registry = dict(tool_registry)
     for tool_name in _SKILL_TOOLS_NEEDING_AGENT_NAME:
         if tool_name in tool_registry:
             tool_registry[tool_name] = _wrap_tool_with_agent_name(tool_registry[tool_name], "orchestrator")
@@ -483,6 +515,8 @@ def build_runtime_context(
                         config=config,
                         model=subagent_model,
                         orchestrator_tools=orchestrator_tools,
+                        pre_resolved_tools=_pre_resolved_tools_for(config, unwrapped_registry),
+                        token_provider=user_config.token_provider,
                         oauth2_client=oauth2_client,
                         user_token=user_config.access_token.get_secret_value() if user_config.access_token else None,
                         checkpointer=checkpointer,

@@ -262,6 +262,11 @@ class UserConfig(BaseModel):
         description="Discovered remote A2A sub-agents (CompiledSubAgent TypedDicts with name, description, runnable)",
     )
     tools: Optional[list] = Field(default=None, description="Discovered MCP tools")
+    token_provider: Optional[Any] = Field(
+        default=None,
+        description="Per-user UserTokenProvider that mints MCP bearer tokens at call time (shared with sub-agents)",
+        exclude=True,
+    )
     local_subagents: Optional[list[LocalSubAgentConfig]] = Field(
         default=None,
         description="User-configured local sub-agents",
@@ -318,11 +323,13 @@ class AgentSettings:
     # No env var or hardcoded alias: models are registered at runtime.
 
     # Cache configuration.
-    # Per-user discovery + registry cache TTL (seconds). Kept well below a typical realm
-    # access-token lifespan so a cache entry can never outlive the exchanged gatana/console
-    # tokens embedded in the discovered tools (see discovery_cache "Token-expiry safety"),
-    # and so an entitlement *revocation* that only reaches one replica (the invalidation POST
-    # is in-process / single-replica) self-heals fleet-wide within the TTL.
+    # Per-user discovery + registry cache TTL (seconds). Discovered tools carry no credential
+    # (bearers are minted at call time by the per-user token provider), so this is purely a
+    # freshness bound: how long a catalogue change made *outside* the console (on the MCP
+    # gateway itself) may go unnoticed, and how long an entitlement change may lag on replicas
+    # the console's invalidation POST did not reach (it is in-process, one replica). Changes
+    # made through the console invalidate the receiving replica immediately. Entries are
+    # additionally bounded by the user token's expiry.
     AGENT_DISCOVERY_CACHE_TTL = _int_env("AGENT_DISCOVERY_CACHE_TTL", 60)
     # Cross-cutting invalidation lever for the discovery/registry caches: bump this (env)
     # or call discovery_cache.invalidate_all() when a group→server/tool access policy
@@ -354,6 +361,23 @@ class AgentSettings:
     # single request.  Bounding it trades a little cold-start latency for a peak that
     # no longer scales with the size of the gateway catalogue.
     MCP_DISCOVERY_CONCURRENCY = max(1, _int_env("MCP_DISCOVERY_CONCURRENCY", 5))
+
+    # Tool-catalogue ingest (agent_common.core.tool_catalogue / catalogue_ingest).
+    #
+    # The catalogue is always held as raw bytes + cards; this only selects how it is
+    # *fetched*. When true (default), discovery lists each server with a single stateless
+    # JSON-RPC ``tools/list`` POST — the standard MCP method, same URL and token as the
+    # SDK path, so the gateway applies per-user entitlements/overrides exactly as usual —
+    # but without the SDK handshake or its pydantic parse (~0.5 s instead of ~3 s for ~30
+    # servers). Whether an endpoint accepts a stateless request is probed once per URL;
+    # refusal or any other failure falls back to the SDK session. Set false to force the
+    # SDK session everywhere (bisecting lever).
+    MCP_CATALOGUE_STATELESS_LIST = os.getenv("MCP_CATALOGUE_STATELESS_LIST", "true").strip().lower() in {"1", "true", "yes"}
+
+    # MCP bearer tokens are minted at call time by a per-user provider and reused only while at
+    # least this many seconds of validity remain (bounded by the user token's exp). Raise it
+    # above the exchanged tokens' lifetime to force an exchange on every call (QA lever).
+    MCP_TOKEN_LEEWAY_SECONDS = max(0, _int_env("MCP_TOKEN_LEEWAY_SECONDS", 90))
 
     # Gatana compression: slug of the MCP server that provides compression utilities.
     # When tools from compression-enabled servers are in use, all tools from this

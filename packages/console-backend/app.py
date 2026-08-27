@@ -246,7 +246,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.mcp_session_manager = StreamableHTTPSessionManager(
         app=mcp.server,
         json_response=False,  # SSE so intermediate keepalive notifications stream
-        stateless=False,  # keep optional session support, matching fastapi_mcp's mount_http
+        # Stateless: no Mcp-Session-Id required, so a bare `POST tools/list` (the
+        # orchestrator's raw-bytes catalogue fast path) is served, and requests are not
+        # pinned to one ECS task behind the ALB. Progress/keepalive notifications still
+        # stream on the calling request's SSE response; we never push notifications
+        # between requests, so nothing depends on session state.
+        stateless=True,
     )
     app.state.mcp_sm_stack = AsyncExitStack()
     await app.state.mcp_sm_stack.enter_async_context(app.state.mcp_session_manager.run())

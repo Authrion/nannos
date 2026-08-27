@@ -29,6 +29,15 @@ from ringier_a2a_sdk.utils.mcp_errors import (
 from ringier_a2a_sdk.utils.mcp_progress import on_mcp_progress
 
 from ..models.config import AgentSettings
+from agent_common.core.catalogue_ingest import (
+    STATELESS_TIMEOUT_S,
+    StatelessListError,
+    StatelessListUnsupported,
+    fetch_catalogue_mcp,
+    fetch_catalogue_stateless,
+)
+from agent_common.core.token_provider import UserTokenProvider, bearer_interceptor
+from agent_common.core.tool_catalogue import CatalogueStore, ServerCatalogue, build_lazy_tools, get_catalogue_store
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +228,15 @@ class ToolDiscoveryService:
         self.config = config
         self.oauth2_client = oauth2_client
 
+    @property
+    def catalogue_store(self) -> CatalogueStore:
+        """Process-wide catalogue store (bytes shared across users; capability memo)."""
+        return get_catalogue_store()
+
+    def _gateway_base_url(self) -> str:
+        # Strip the trailing slash first: removesuffix("/mcp") is a no-op on ".../mcp/".
+        return self.config.MCP_GATEWAY_URL.rstrip("/").removesuffix("/mcp")
+
     async def fetch_available_servers(self, token: str) -> List[Dict[str, Any]]:
         """Fetch list of available MCP servers from the gateway.
 
@@ -235,10 +253,7 @@ class ToolDiscoveryService:
         logger.debug("Fetching available MCP servers from gateway")
         try:
             # Call the MCP gateway API to get server list
-            # Extract base URL from MCP_GATEWAY_URL (remove /mcp path). Strip the
-            # trailing slash first: removesuffix("/mcp") is a no-op on ".../mcp/".
-            base_url = self.config.MCP_GATEWAY_URL.rstrip("/").removesuffix("/mcp")
-            servers_url = f"{base_url}/api/v1/mcp-servers"
+            servers_url = f"{self._gateway_base_url()}/api/v1/mcp-servers"
 
             logger.debug(f"Fetching servers from: {servers_url}")
 
@@ -284,26 +299,67 @@ class ToolDiscoveryService:
             _DISCOVERY_SEMAPHORE_LIMIT = limit
         return _DISCOVERY_SEMAPHORE
 
-    async def _get_tools_with_retry(
+    async def _ingest_server(
+        self,
+        server_name: str,
+        client: MultiServerMCPClient,
+        connection: StreamableHttpConnection,
+        *,
+        http_client: httpx.AsyncClient | None,
+    ) -> ServerCatalogue:
+        """Fetch one server's catalogue: stateless ``tools/list`` POST → SDK session.
+
+        Both paths hit the same MCP URL with the same bearer token (the server's
+        connection), so the result is the same per-user listing; the stateless path just
+        skips the SDK handshake and the pydantic parse. Whether an endpoint serves a
+        stateless request is probed once per URL: a rejection marks it unsupported for the
+        process lifetime; any other failure falls back for this server only. Whatever the
+        path, the result is interned in the process-wide store so identical catalogues
+        share bytes across users.
+        """
+        store = self.catalogue_store
+        url = connection["url"]
+        if http_client is not None and self.config.MCP_CATALOGUE_STATELESS_LIST and store.stateless_supported(url) is not False:
+            try:
+                catalogue = await fetch_catalogue_stateless(
+                    http_client, url=url, headers=connection.get("headers"), server_slug=server_name
+                )
+            except StatelessListUnsupported as e:
+                store.set_stateless_supported(url, False)
+                logger.warning(f"MCP endpoint refuses stateless tools/list — using SDK session for '{server_name}' ({e})")
+            except StatelessListError as e:
+                logger.warning(f"Stateless tools/list failed for '{server_name}', falling back to SDK session: {e}")
+            else:
+                store.set_stateless_supported(url, True)
+                return store.intern(catalogue)
+        catalogue = await fetch_catalogue_mcp(lambda: client.session(server_name), server_slug=server_name)
+        return store.intern(catalogue)
+
+    async def _get_catalogue_with_retry(
         self,
         client: MultiServerMCPClient,
         server_name: str,
+        connection: StreamableHttpConnection,
+        *,
+        http_client: httpx.AsyncClient | None = None,
         max_retries: int = 3,
         initial_delay: float = 1.0,
-    ) -> list:
-        """Get tools from MCP server with exponential backoff retry for transient errors.
+    ) -> ServerCatalogue:
+        """Fetch a server's catalogue with exponential backoff retry for transient errors.
 
         Retries on HTTP 502, 503, 504 errors with exponential backoff.
         Non-retryable errors (4xx, connection refused, etc.) fail immediately.
 
         Args:
-            client: MultiServerMCPClient instance
+            client: MultiServerMCPClient instance (owns the per-server MCP connections)
             server_name: Name of the server to get tools from
+            connection: The server's MCP connection (URL + auth headers)
+            http_client: Shared httpx client for the stateless fast path (None = SDK only)
             max_retries: Maximum number of retry attempts (default: 3)
             initial_delay: Initial delay between retries in seconds (default: 1.0)
 
         Returns:
-            List of tools from the server
+            The server's catalogue (bytes + cards)
 
         Raises:
             Exception: If all retries are exhausted or a non-retryable error occurs
@@ -317,16 +373,11 @@ class ToolDiscoveryService:
                 # backoff sleep below would let a few flaky servers idle away the
                 # whole budget while healthy ones wait on a user-facing path.
                 async with self._discovery_semaphore():
-                    server_tools = await client.get_tools(server_name=server_name)
-                # Tag tools with server_name metadata
-                for tool in server_tools:
-                    if tool.metadata is None:
-                        tool.metadata = {}
-                    tool.metadata["server_name"] = server_name
+                    catalogue = await self._ingest_server(server_name, client, connection, http_client=http_client)
 
                 if attempt > 0:
                     logger.info(f"Successfully loaded MCP tools from {server_name} on attempt {attempt + 1}")
-                return server_tools
+                return catalogue
 
             except Exception as e:
                 last_error = e
@@ -356,35 +407,54 @@ class ToolDiscoveryService:
         # Should never reach here, but just in case
         raise last_error or Exception(f"Failed to load MCP tools from {server_name}")
 
+    def make_token_provider(self, token: str) -> UserTokenProvider:
+        """A per-user provider of exchanged MCP bearer tokens (see agent_common.core.token_provider).
+
+        ``MCP_TOKEN_LEEWAY_SECONDS`` sets how much validity a memoised token must keep to be
+        reused. Setting it above the exchanged tokens' lifetime forces a fresh exchange on
+        *every* call — a QA lever to watch the call-time path work without waiting for expiry.
+        """
+        return UserTokenProvider(
+            token, self.oauth2_client.exchange_token, leeway_seconds=self.config.MCP_TOKEN_LEEWAY_SECONDS
+        )
+
+    def _audience_for_server(self, server_name: str) -> str:
+        """OAuth audience a server's calls must carry: console-backend's client id for the
+        console MCP server, the gateway client for everything else."""
+        return self.config.CONSOLE_BACKEND_CLIENT_ID if server_name == "console" else "gatana"
+
     async def discover_tools(
         self,
         token: str,
         white_list: Optional[List[str]] = None,
         include_server_slugs: Optional[List[str]] = None,
+        token_provider: UserTokenProvider | None = None,
     ) -> List[BaseTool]:
         """Discover available MCP tools with optional server filtering.
 
-        Performs token exchange to obtain a token for the gatana client
-        in the same Keycloak realm, then uses that token to authenticate with
-        MCP services.
+        Tokens: the user's token is exchanged for the gateway / console audiences through a
+        per-user :class:`UserTokenProvider`. The exchanged token is used to *list* tools now;
+        the tools themselves are built on token-free connections and mint a fresh bearer on
+        every call via an interceptor, so a tool's credential is never older than the
+        provider's leeway — however long the tool object lives (discovery cache, sub-agent
+        hand-over).
 
         Args:
             token: User's access token from the orchestrator
             white_list: Optional list of tool names to filter to (post-discovery filtering)
             include_server_slugs: Optional list of server slugs to include tools from
+            token_provider: The user's provider (created here when not given; the executor
+                passes the one it keeps across turns)
 
         Returns:
             List of discovered tools with server_name in metadata
         """
         logger.debug("Discovering tools for orchestrator deep agent")
         try:
+            provider = token_provider or self.make_token_provider(token)
             # Exchange user token for gatana token
             # The target client is 'gatana' in the same Keycloak realm
-            mcp_gateway_token = await self.oauth2_client.exchange_token(
-                subject_token=token,
-                target_client_id="gatana",
-                requested_scopes=["openid", "profile", "offline_access"],
-            )
+            mcp_gateway_token = await provider.get("gatana")
             logger.info("Successfully exchanged token for gatana")
 
             # Fetch available servers to create per-server connections
@@ -412,19 +482,24 @@ class ToolDiscoveryService:
                 logger.debug(f"Filtered to {len(servers)} servers: {[s.get('slug') for s in servers]}")
 
             # Create one connection per MCP server
-            # This allows MultiServerMCPClient to naturally track which tools come from which server
-            connections = {}
+            # This allows MultiServerMCPClient to naturally track which tools come from which server.
+            # `connections` carry the bearer for *listing* (this request); `call_connections` are the
+            # same URLs without credentials — the tools built on them mint a bearer per call.
+            connections: dict[str, Any] = {}
+            call_connections: dict[str, Any] = {}
             for server in servers:
                 server_slug = server.get("slug")
                 if not server_slug:
                     continue
 
                 # Each connection uses the gateway URL but filtered to one server
+                url = f"{self.config.MCP_GATEWAY_URL}?includeOnlyServerSlugs={server_slug}"
                 connections[server_slug] = StreamableHttpConnection(
                     transport="streamable_http",
-                    url=f"{self.config.MCP_GATEWAY_URL}?includeOnlyServerSlugs={server_slug}",
+                    url=url,
                     headers={"Authorization": f"Bearer {mcp_gateway_token}"},
                 )
+                call_connections[server_slug] = StreamableHttpConnection(transport="streamable_http", url=url)
 
             if not connections:
                 logger.warning("No valid server connections created, returning empty tool list")
@@ -434,16 +509,13 @@ class ToolDiscoveryService:
             # Exchange token for agent-console audience (separate from gatana)
             if self.config.CONSOLE_BACKEND_URL:
                 console_mcp_url = f"{self.config.CONSOLE_BACKEND_URL}/mcp"
-                console_token = await self.oauth2_client.exchange_token(
-                    subject_token=token,
-                    target_client_id=self.config.CONSOLE_BACKEND_CLIENT_ID,
-                    requested_scopes=["openid", "profile", "offline_access"],
-                )
+                console_token = await provider.get(self.config.CONSOLE_BACKEND_CLIENT_ID)
                 connections["console"] = StreamableHttpConnection(
                     transport="streamable_http",
                     url=console_mcp_url,
                     headers={"Authorization": f"Bearer {console_token}"},
                 )
+                call_connections["console"] = StreamableHttpConnection(transport="streamable_http", url=console_mcp_url)
                 logger.debug(f"Added agent-console MCP connection: {console_mcp_url}")
 
             logger.debug(f"Created {len(connections)} MCP server connections: {list(connections.keys())}")
@@ -455,11 +527,15 @@ class ToolDiscoveryService:
             client = MultiServerMCPClient(
                 connections=connections,
                 callbacks=Callbacks(on_progress=on_mcp_progress),
-                # Stamp x-nannos-context (conversation_id, …) on every console tool call so
-                # console-backend tools that hit the gateway (console_web_search) bill to the right
-                # conversation instead of "Direct API Calls". Scoped to the console server inside.
-                tool_interceptors=[_console_attribution_interceptor],
             )
+            # Per-call interceptors for the tools: a fresh bearer for the server's audience, then
+            # x-nannos-context (conversation_id, …) on console tool calls so console-backend tools
+            # that hit the gateway (console_web_search) bill to the right conversation instead of
+            # "Direct API Calls" (scoped to the console server inside).
+            tool_interceptors = [
+                bearer_interceptor(provider, self._audience_for_server),
+                _console_attribution_interceptor,
+            ]
 
             # Gather tools from all servers with retry logic.
             # Use asyncio.gather with return_exceptions=True to handle partial failures gracefully.
@@ -479,26 +555,56 @@ class ToolDiscoveryService:
                 f"Discovering tools from {len(connections)} MCP servers "
                 f"(max {self.config.MCP_DISCOVERY_CONCURRENCY} concurrent, process-wide)"
             )
-            results = await asyncio.gather(
-                *[self._get_tools_with_retry(client, slug) for slug in connections], return_exceptions=True
-            )
+            # follow_redirects: a mount such as console-backend's ``/mcp`` answers ``307 → /mcp/``;
+            # the SDK transport follows it, so the stateless path must too or it falls back for
+            # the wrong reason.
+            async with httpx.AsyncClient(timeout=STATELESS_TIMEOUT_S, follow_redirects=True) as http_client:
+                results = await asyncio.gather(
+                    *[
+                        self._get_catalogue_with_retry(client, slug, connection, http_client=http_client)
+                        for slug, connection in connections.items()
+                    ],
+                    return_exceptions=True,
+                )
 
-            # Process results - filter out exceptions and log failures
-            tools = []
+            # Process results - filter out exceptions and log failures. Each catalogue
+            # is wrapped into per-user LazyMcpTools bound to this user's connection
+            # (token-free: a bearer is minted per call via the interceptors); the catalogue bytes themselves are
+            # shared across users via the store.
+            tools: list[BaseTool] = []
             failed_servers = []
+            source_by_server: dict[str, str] = {}
             for slug, result in zip(connections.keys(), results):
-                if isinstance(result, Exception):
-                    error_msg = format_mcp_error(result)
+                if isinstance(result, BaseException):
+                    error_msg = format_mcp_error(result) if isinstance(result, Exception) else str(result)
                     logger.error(f"Failed to discover tools from server '{slug}': {error_msg}")
                     failed_servers.append(slug)
-                elif isinstance(result, list):
-                    # Tag tools from compression-enabled servers
-                    if compression_server_slugs and slug in compression_server_slugs:
-                        for tool in result:
-                            if tool.metadata is None:
-                                tool.metadata = {}
-                            tool.metadata["compression_enabled"] = True
-                    tools.extend(result)
+                elif isinstance(result, ServerCatalogue):
+                    source_by_server[slug] = result.source
+                    extra_metadata = (
+                        {"compression_enabled": True} if compression_server_slugs and slug in compression_server_slugs else None
+                    )
+                    tools.extend(
+                        build_lazy_tools(
+                            result,
+                            connection=call_connections[slug],
+                            callbacks=client.callbacks,
+                            tool_interceptors=tool_interceptors,
+                            extra_metadata=extra_metadata,
+                        )
+                    )
+
+            # Which ingest path each server took must be visible: a silent fall-back to
+            # the slow path would look like the optimisation simply not working.
+            fast = sorted(s for s, src in source_by_server.items() if src == "stateless")
+            slow = sorted(s for s, src in source_by_server.items() if src == "mcp")
+            logger.info(
+                "Tool catalogue ingest: %d server(s) via stateless tools/list %s, %d via SDK session %s",
+                len(fast),
+                fast,
+                len(slow),
+                slow,
+            )
 
             if failed_servers:
                 logger.warning(

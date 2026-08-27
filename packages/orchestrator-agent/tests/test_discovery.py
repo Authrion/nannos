@@ -1,15 +1,64 @@
 """Unit tests for discovery services."""
 
 import asyncio
-
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
+from mcp.types import ListToolsResult, Tool as MCPTool
 
 import app.core.discovery as discovery_module
 from app.core.discovery import AgentDiscoveryService, ToolDiscoveryService
 from app.models.config import AgentSettings
+from agent_common.core.tool_catalogue import LazyMcpTool, reset_catalogue_store
+
+
+def _mcp_tool(name: str, description: str = "") -> MCPTool:
+    return MCPTool(name=name, description=description, inputSchema={"type": "object", "properties": {}})
+
+
+def _mock_mcp_client(tools_by_server=None, on_list=None):
+    """A MultiServerMCPClient stand-in whose ``session(name)`` yields a session with ``list_tools``.
+
+    ``tools_by_server`` maps slug -> list[MCPTool] (default: one tool named after the slug);
+    ``on_list(server_name)`` is awaited before each list for instrumentation.
+    """
+    client = Mock()
+    client.callbacks = None
+    client.tool_interceptors = []
+
+    def session(server_name: str):
+        @asynccontextmanager
+        async def _cm():
+            if on_list is not None:
+                await on_list(server_name)
+            sess = Mock()
+            tools = (tools_by_server or {}).get(server_name, [_mcp_tool(f"tool_{server_name}")])
+            sess.list_tools = AsyncMock(return_value=ListToolsResult(tools=tools, nextCursor=None))
+            yield sess
+
+        return _cm()
+
+    client.session = session
+    return client
+
+
+def _settings(**overrides):
+    config = Mock(spec=AgentSettings)
+    config.get_oidc_client_id.return_value = "test_client_id"
+    config.get_oidc_client_secret.return_value = Mock()
+    config.get_oidc_client_secret.return_value.get_secret_value.return_value = "test_secret"
+    config.get_oidc_issuer.return_value = "https://test.oidc.com"
+    config.MCP_GATEWAY_URL = "https://mock-gateway/mcp"
+    config.CONSOLE_BACKEND_URL = None
+    config.MCP_DISCOVERY_CONCURRENCY = 5
+    config.MCP_CATALOGUE_STATELESS_LIST = False
+    config.MCP_TOKEN_LEEWAY_SECONDS = 90
+    for k, v in overrides.items():
+        setattr(config, k, v)
+    return config
+
 
 
 class TestAgentDiscoveryService:
@@ -189,10 +238,7 @@ class TestToolDiscoveryService:
         service = ToolDiscoveryService(config, oauth2_client)
 
         with patch("app.core.discovery.MultiServerMCPClient") as mock_client:
-            # Mock MCP client
-            mock_client_instance = Mock()
-            mock_client_instance.get_tools = AsyncMock(return_value=[])
-            mock_client.return_value = mock_client_instance
+            mock_client.return_value = _mock_mcp_client()
 
             token = "test_token"
             result = await service.discover_tools(token)
@@ -212,27 +258,18 @@ class TestToolDiscoveryService:
         config.MCP_GATEWAY_URL = "https://mock-gateway/mcp"
         config.CONSOLE_BACKEND_URL = None
         config.MCP_DISCOVERY_CONCURRENCY = 5
+        config.MCP_CATALOGUE_STATELESS_LIST = False
+        config.MCP_TOKEN_LEEWAY_SECONDS = 90
 
         oauth2_client = AsyncMock()
         oauth2_client.exchange_token = AsyncMock(return_value="mcp_token")
         service = ToolDiscoveryService(config, oauth2_client)
 
-        # Mock tools from MCP
-        mock_tool1 = Mock()
-        mock_tool1.name = "allowed_tool"
-        mock_tool1.description = "This tool is allowed"
-        mock_tool1.metadata = None
-
-        mock_tool2 = Mock()
-        mock_tool2.name = "blocked_tool"
-        mock_tool2.description = "This tool is blocked"
-        mock_tool2.metadata = None
+        reset_catalogue_store()
+        tools = [_mcp_tool("allowed_tool", "This tool is allowed"), _mcp_tool("blocked_tool", "This tool is blocked")]
 
         with patch("app.core.discovery.MultiServerMCPClient") as mock_client:
-            mock_client_instance = Mock()
-            # Called as: await client.get_tools(server_name=slug)
-            mock_client_instance.get_tools = AsyncMock(return_value=[mock_tool1, mock_tool2])
-            mock_client.return_value = mock_client_instance
+            mock_client.return_value = _mock_mcp_client({"mock-server": tools})
 
             # Mock fetch_available_servers so no real HTTP call is made
             service.fetch_available_servers = AsyncMock(return_value=[{"slug": "mock-server"}])
@@ -243,6 +280,9 @@ class TestToolDiscoveryService:
 
             assert len(result) == 1
             assert result[0].name == "allowed_tool"
+            assert isinstance(result[0], LazyMcpTool)
+            assert result[0].metadata["server_name"] == "mock-server"
+            assert not result[0].schema_decoded, "discovery must not decode any schema"
             oauth2_client.exchange_token.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -264,6 +304,8 @@ class TestToolDiscoveryService:
         config.MCP_GATEWAY_URL = "https://mock-gateway/mcp"
         config.CONSOLE_BACKEND_URL = None
         config.MCP_DISCOVERY_CONCURRENCY = 3
+        config.MCP_CATALOGUE_STATELESS_LIST = False
+        config.MCP_TOKEN_LEEWAY_SECONDS = 90
 
         oauth2_client = AsyncMock()
         oauth2_client.exchange_token = AsyncMock(return_value="mcp_token")
@@ -279,7 +321,7 @@ class TestToolDiscoveryService:
         max_in_flight = 0
         visited: list[str] = []
 
-        async def fake_get_tools(server_name: str):
+        async def on_list(server_name: str):
             nonlocal in_flight, max_in_flight
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
@@ -289,15 +331,10 @@ class TestToolDiscoveryService:
             # would pass even with an unbounded gather.
             await asyncio.sleep(0)
             in_flight -= 1
-            tool = Mock()
-            tool.name = f"tool_{server_name}"
-            tool.metadata = None
-            return [tool]
 
+        reset_catalogue_store()
         with patch("app.core.discovery.MultiServerMCPClient") as mock_client:
-            mock_client_instance = Mock()
-            mock_client_instance.get_tools = AsyncMock(side_effect=fake_get_tools)
-            mock_client.return_value = mock_client_instance
+            mock_client.return_value = _mock_mcp_client(on_list=on_list)
             service.fetch_available_servers = AsyncMock(return_value=servers)
 
             result = await service.discover_tools("test_token")
@@ -351,10 +388,7 @@ class TestDiscoveryIntegration:
         token = "test_token"
 
         with patch("app.core.discovery.MultiServerMCPClient") as mock_mcp_client:
-            # Mock MCP client
-            mock_mcp_instance = Mock()
-            mock_mcp_instance.get_tools = AsyncMock(return_value=[])
-            mock_mcp_client.return_value = mock_mcp_instance
+            mock_mcp_client.return_value = _mock_mcp_client()
 
             # Run both discoveries concurrently
             import asyncio
