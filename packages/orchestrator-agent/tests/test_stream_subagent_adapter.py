@@ -49,7 +49,7 @@ def _agent() -> OrchestratorDeepAgent:
     return OrchestratorDeepAgent.__new__(OrchestratorDeepAgent)
 
 
-async def _collect(agent, runnable, *, resume=None, client_objects=None, config=None):
+async def _collect(agent, runnable, *, resume=None, config=None):
     out = []
     async for item in agent.stream_subagent(
         runnable,
@@ -57,7 +57,6 @@ async def _collect(agent, runnable, *, resume=None, client_objects=None, config=
         config=config if config is not None else {},
         context_id="conv-1",
         resume=resume,
-        client_objects=client_objects,
     ):
         out.append(item)
     return out
@@ -95,6 +94,27 @@ async def test_maps_work_plan_client_action_and_activity_log():
     assert items[1].metadata["client_action"] == directive
     assert items[2].metadata["activity_log"] is True
     assert items[2].content == "Using cockpit_api…"
+    # A mechanical line carries no kind — only a notify_user note does (below).
+    assert "kind" not in items[2].metadata
+
+
+@pytest.mark.asyncio
+async def test_maps_mid_turn_note_with_its_kind_marker():
+    """A notify_user note rides the activity-log channel with kind='note', so clients
+    can style the agent's own words apart from a tool label. The task stays WORKING."""
+    runnable = _FakeRunnable(
+        events=[
+            TaskUpdate(
+                status_text="Understood — I'll pull last week's numbers first.",
+                event_metadata=ActivityLogMeta(kind="note"),
+            )
+        ]
+    )
+    items = await _collect(_agent(), runnable)
+    assert len(items) == 1
+    assert items[0].state == TaskState.TASK_STATE_WORKING
+    assert items[0].metadata == {"activity_log": True, "kind": "note"}
+    assert items[0].content == "Understood — I'll pull last week's numbers first."
 
 
 @pytest.mark.asyncio
@@ -161,8 +181,10 @@ async def test_graph_interrupt_maps_auth_required_with_authorize_url():
 
 
 @pytest.mark.asyncio
-async def test_client_objects_injected_into_config_metadata():
+async def test_config_metadata_passed_through_untouched():
+    """The executor is the single writer of client_objects/page_context into
+    config metadata; stream_subagent must hand the config on as-is."""
     runnable = _FakeRunnable(events=[])
-    cfg: dict = {"metadata": {}}
-    await _collect(_agent(), runnable, client_objects=[{"type": "form", "id": "c1"}], config=cfg)
-    assert cfg["metadata"]["client_objects"] == [{"type": "form", "id": "c1"}]
+    cfg: dict = {"metadata": {"client_objects": [{"type": "form", "id": "c1"}]}}
+    await _collect(_agent(), runnable, config=cfg)
+    assert cfg["metadata"] == {"client_objects": [{"type": "form", "id": "c1"}]}

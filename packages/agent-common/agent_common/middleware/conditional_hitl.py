@@ -46,6 +46,7 @@ from langchain_core.tools import BaseTool
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
+from agent_common.core.client_action_tool import CLIENT_ACTION_TOOL_NAME, render_client_action_result
 from agent_common.core.tool_risk_cache import ToolRiskCache, ToolRiskEntry
 from agent_common.middleware.ptc_guard import PTC_CODE_INTERPRETER_TOOL_NAME
 
@@ -78,6 +79,42 @@ class _RiskMetadata(TypedDict, total=False):
     matched_pattern: str | None
     server_slug: str
     allowed_actions: list[str]
+
+
+def _client_action_tool_message(decision: dict[str, Any], tool_call: ToolCall) -> ToolMessage | None:
+    """The ``client_action`` shortcut: the browser ALREADY did it.
+
+    A risk-gated ``client_action`` used to cost two pauses. The gate asked, the
+    graph resumed, the tool ran and then interrupted a SECOND time to ask the
+    browser for its result. Both pauses are a full A2A resume, and the first one
+    replays this node — so the user waited through it twice for one form write.
+
+    The embed SDK now executes the directive when the user approves the card and
+    sends the outcome back on the decision itself (``client_action_result``,
+    see ``approval-codec.ts``). There is nothing left for the tool to do: we hand
+    the model the same prose the tool would have returned and let the agent loop
+    skip the call (a tool call that already has a ToolMessage is never dispatched
+    — ``langchain.agents.factory``, ``pending_tool_calls``).
+
+    Returns None whenever the shortcut does not apply — a reject, a different
+    tool, or an SDK that sent no result. The tool then runs and interrupts for
+    the result exactly as before, so an older client keeps working.
+    """
+    if tool_call["name"] != CLIENT_ACTION_TOOL_NAME:
+        return None
+    if decision.get("type") != "approve":
+        return None
+    result = decision.get("client_action_result")
+    if not isinstance(result, dict):
+        return None
+
+    kind = str((tool_call.get("args") or {}).get("kind") or "")
+    return ToolMessage(
+        content=render_client_action_result(kind, result),
+        name=tool_call["name"],
+        tool_call_id=tool_call["id"],
+        status="success" if result.get("ok") else "error",
+    )
 
 
 class ConditionalHumanInTheLoopMiddleware(HumanInTheLoopMiddleware[StateT, ContextT, ResponseT]):
@@ -211,6 +248,10 @@ class ConditionalHumanInTheLoopMiddleware(HumanInTheLoopMiddleware[StateT, Conte
                 decision_idx += 1
 
                 revised_tool_call, tool_message = self._process_decision(decision, tool_call, config)
+                # An approved client_action the browser already executed answers
+                # itself — no second pause. See _client_action_tool_message.
+                if tool_message is None:
+                    tool_message = _client_action_tool_message(decision, tool_call)
                 if revised_tool_call is not None:
                     revised_tool_calls.append(revised_tool_call)
                 if tool_message:
@@ -379,6 +420,12 @@ class ConditionalHumanInTheLoopMiddleware(HumanInTheLoopMiddleware[StateT, Conte
         if not action_requests:
             return None
 
+        # Attach a plain-language summary to each action request so the client
+        # can show non-technical users what the tool would do. Display-only
+        # (rides in args like _risk_metadata) and best-effort: on failure the
+        # client falls back to rendering the raw args.
+        await self._attach_summaries(action_requests, runtime)
+
         # Create single HITLRequest with all actions and configs
         hitl_request = HITLRequest(
             action_requests=action_requests,
@@ -417,6 +464,10 @@ class ConditionalHumanInTheLoopMiddleware(HumanInTheLoopMiddleware[StateT, Conte
                     config = {"allowed_decisions": entry_actions}
 
                 revised_tool_call, tool_message = self._process_decision(decision, tool_call, config)
+                # An approved client_action the browser already executed answers
+                # itself — no second pause. See _client_action_tool_message.
+                if tool_message is None:
+                    tool_message = _client_action_tool_message(decision, tool_call)
                 if revised_tool_call is not None:
                     revised_tool_calls.append(revised_tool_call)
                 if tool_message:
@@ -444,6 +495,22 @@ class ConditionalHumanInTheLoopMiddleware(HumanInTheLoopMiddleware[StateT, Conte
         last_ai_msg.tool_calls = revised_tool_calls
 
         return {"messages": [last_ai_msg, *artificial_tool_messages]}
+
+    async def _attach_summaries(self, action_requests: list[ActionRequest], runtime: Runtime[ContextT]) -> None:
+        """Stamp a plain-language ``_summary`` into each action request's args.
+
+        Makes one batched fast-LLM call for the whole interrupt (in the user's
+        language from runtime context). Best-effort: any failure leaves the
+        action requests untouched.
+        """
+        from agent_common.core.tool_call_summarizer import attach_summaries
+
+        context: Any = getattr(runtime, "context", None)
+        await attach_summaries(
+            action_requests,
+            language=getattr(context, "language", None) or "en",
+            describe=lambda name: getattr(self._get_tool_instance(name, context), "description", None) or "",
+        )
 
     # ------------------------------------------------------------------
     # Helper methods for dynamic risk scoring

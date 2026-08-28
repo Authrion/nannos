@@ -25,6 +25,7 @@ from langsmith import traceable
 from pydantic import BaseModel, Field
 
 from agent_common.core.client_action_tool import CLIENT_ACTION_TOOL_NAME
+from agent_common.core.notify_user_tool import NOTIFY_USER_TOOL_NAME
 from agent_common.core.tool_risk_cache import ParamRiskProfile, ToolRiskCache, ToolRiskEntry
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,21 @@ async def score_tool_risk(
     # actions (the SDK no longer has its own approval card). Score it deterministically
     # by `kind` — never via the LLM/cache — so an ``apply`` (writes into the user's form)
     # always interrupts for approval while ``highlight``/``navigate`` (benign) never do.
+    # notify_user only writes one sentence onto the user's own screen: it touches no
+    # backend, returns no data to the model, and cannot be made risky by its args.
+    # Score it deterministically at 0 so an approval card can never appear in front of
+    # a progress note — and so the LLM scorer is never paid for it.
+    if tool_name == NOTIFY_USER_TOOL_NAME:
+        now = datetime.now(timezone.utc)
+        return 0.0, ToolRiskEntry(
+            base_score=0.0,
+            risk_factors={},
+            allowed_actions=["approve", "reject"],
+            schema_hash="",
+            updated_at=now,
+            last_accessed_at=now,
+        )
+
     if tool_name == CLIENT_ACTION_TOOL_NAME:
         kind = (args or {}).get("kind")
         score = _CLIENT_ACTION_KIND_SCORES.get(kind, _CLIENT_ACTION_DEFAULT_SCORE)
@@ -146,6 +162,17 @@ async def score_tool_risk(
     entry = cache.get(tool_name, server_slug, current_hash)
     if entry is not None:
         score = entry.match_args(args)
+        # The floor must hold on the HIT path too: the incident entry
+        # (`alloy-riad_delete_campaign_by_id` at 0.75) is already persisted with an
+        # unchanged schema hash, so it never reaches the LLM branch below where
+        # the floor was first applied. Flooring the returned score (not the entry)
+        # keeps the stored estimate intact for diagnostics.
+        floor = _destructive_floor(tool_name)
+        if floor > score:
+            logger.info(
+                "Flooring destructive tool '%s' cached risk %.2f -> %.2f", tool_name, score, floor
+            )
+            score = floor
         return score, entry
 
     # 2. Cache miss — try API (implemented by caller injecting api_client into cache)
@@ -251,12 +278,17 @@ async def _score_tool_via_llm(
         f"Assess the risk level of this tool."
     )
 
-    result: ToolRiskOutput = await structured_model.ainvoke(
-        [
-            {"role": "system", "content": _SCORING_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ]
-    )
+    # Side-channel call (not through the agent middleware stack): attribute the
+    # gateway spend from the run config's tags, like GatewayAttributionMiddleware.
+    from agent_common.middleware.gateway_attribution_middleware import run_config_attribution_scope
+
+    with run_config_attribution_scope():
+        result: ToolRiskOutput = await structured_model.ainvoke(
+            [
+                {"role": "system", "content": _SCORING_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
 
     # Convert LLM output to ToolRiskEntry
     risk_factors: dict[str, ParamRiskProfile] = {}
@@ -300,6 +332,9 @@ _CLIENT_ACTION_KIND_SCORES: dict[str | None, float] = {
     "invalidate": 0.9,
     "highlight": 0.1,
     "navigate": 0.1,
+    # Read-only by construction: the SDK answers from host-registered readers
+    # through the same sanitizer as the page snapshot (deny list + caps).
+    "read_current_page": 0.1,
 }
 _CLIENT_ACTION_DEFAULT_SCORE = 0.9  # unknown kind → gate (fail safe)
 

@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ from fastapi_mcp import FastApiMCP
 from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.struct_pb2 import Value
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from opentelemetry import trace as otel_trace
 from rcplus_alloy_common.logging import (
     configure_existing_logger,
     configure_logger,
@@ -92,6 +94,7 @@ from console_backend.routers.voice_agent_router import router as voice_agent_rou
 from console_backend.routers.web_search_mcp_tools import router as web_search_mcp_router
 from console_backend.service_instances import cleanup_services, initialize_services
 from console_backend.services.conversation_service import ConversationService
+from console_backend.services.conversation_summary import maybe_summarize_conversation
 from console_backend.services.messages_service import MessagesService, _parse_task_state
 from console_backend.services.socket_notification_manager import SocketNotificationManager
 from console_backend.utils.connection_pool import connection_pool
@@ -206,6 +209,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Lifespan context manager for startup and shutdown events."""
     # Startup
     logger.info("Application starting up...")
+
+    # Keep per-ASGI-message and transaction-bookkeeping spans out of the trace
+    # export. Runs here, not at import: the injected auto-instrumentation must
+    # already have built the tracer provider we wrap.
+    from ringier_a2a_sdk.telemetry.span_filter import install_span_export_filter
+
+    install_span_export_filter()
 
     # Initialize PostgreSQL database connection
     await init_db()
@@ -599,6 +609,114 @@ active_tasks: dict[str, ActiveTaskInfo] = {}
 # Intermediate output (with urn:nannos:a2a:intermediate-output:1.0 extensions) are NOT accumulated.
 _streaming_buffers: dict[str, str] = {}
 
+# The answer text this turn already persisted from the assembled streaming
+# artifact, keyed by context_id. Read by _repeats_persisted_answer to drop a
+# terminal status that merely re-sends the same answer. Cleared with the rest of
+# the turn state.
+_persisted_answer: dict[str, str] = {}
+
+# Detached work that must outlive the turn that started it (conversation titling).
+# asyncio keeps no strong reference to a bare create_task, so a task can be
+# garbage-collected mid-flight; holding it here until it completes is the fix.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro, *, name: str) -> None:
+    """Run a coroutine detached from the caller, keeping it alive to completion."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+# Conversations whose titling task is running right now (see the trigger).
+_titling_in_flight: set[str] = set()
+
+
+async def _title_conversation(conversation_id: str, user_id: str, answer: str) -> None:
+    """Name a conversation after the answer just given — detached from the turn."""
+    try:
+        await maybe_summarize_conversation(
+            sio.app_instance.state.conversation_service,  # type: ignore[attr-defined]
+            conversation_id,
+            user_id,
+            answer=answer,
+            # The socket session's user_id IS the OIDC sub, which is what the
+            # gateway attributes spend by.
+            user_sub=user_id,
+            on_stored=_conversation_title_notifier(conversation_id),
+        )
+    finally:
+        _titling_in_flight.discard(conversation_id)
+
+
+def _answer_text_of(response_data: dict[str, Any]) -> str:
+    """The assistant text carried by a turn-ending event, or ''.
+
+    Covers the shape the streaming buffer does not: a final answer riding a
+    status message (`status.message.parts`), which is how a fallback answer and a
+    non-streamed reply arrive.
+    """
+    status = response_data.get("status")
+    message = status.get("message") if isinstance(status, dict) else None
+    parts = message.get("parts") if isinstance(message, dict) else None
+    if not isinstance(parts, list):
+        return ""
+    return "\n".join(
+        part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str)
+    ).strip()
+
+
+def _repeats_persisted_answer(response_data: dict[str, Any], context_id: str) -> bool:
+    """Whether this status merely re-sends the answer this turn already stored.
+
+    The A2A contract lets a terminal status carry the final answer, and a
+    well-behaved agent leaves it out once the answer has streamed in full (see the
+    orchestrator's _close_streaming_artifact_and_respond). But console-backend
+    talks to agent cards it does not own, so the repeat still arrives — and it used
+    to be stored as a second row under its own id, which made a reloaded
+    conversation show one answer as two bubbles. Drop it here, the same way the
+    live path already drops it on the wire.
+
+    Only a PLAIN-TEXT message can be a repeat. A structured payload (a HITL
+    approval, a client action) carries data parts or extensions that the widget
+    needs to be restored on reload, so it is stored even when its description
+    happens to echo the answer.
+    """
+    stored = _persisted_answer.get(context_id)
+    if not stored or response_data.get("kind") != "status-update":
+        return False
+    status = response_data.get("status")
+    message = status.get("message") if isinstance(status, dict) else None
+    if not isinstance(message, dict) or message.get("extensions"):
+        return False
+    parts = message.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return False
+    if any(not (isinstance(part, dict) and isinstance(part.get("text"), str)) for part in parts):
+        return False
+    echoed = _answer_text_of(response_data)
+    # Equal, or shorter and a prefix: adds nothing that is not already stored. A
+    # text that EXTENDS what was stored is new content and must be kept.
+    return bool(echoed) and stored.startswith(echoed)
+
+
+def _conversation_title_notifier(conversation_id: str):
+    """Push a freshly written title/summary to everyone viewing the conversation.
+
+    The name lands a second or two after the answer, so without this push the
+    panel would keep showing the first-message placeholder until its next list
+    load. Room-targeted, so other tabs and surfaces update too.
+    """
+
+    async def notify(title: str, summary: str) -> None:
+        await sio.emit(
+            SocketEvents.CONVERSATION_UPDATED,
+            {"conversationId": conversation_id, "title": title, "summary": summary},
+            to=_conversation_room(conversation_id),
+        )
+
+    return notify
+
 # Buffer for accumulating intermediate-output chunks (sub-agent thoughts) per conversation.
 # Keyed by "{context_id}:{agent_name}". Persisted when the conversation turn ends
 # (terminal status or main artifact last_chunk) so reasoning blocks survive page reload.
@@ -614,6 +732,98 @@ _intermediate_buffer_ts: dict[str, datetime] = {}
 # while it was disconnected — otherwise the turn would hang waiting on input the user
 # never saw. Value is the raw agent_response payload of the prompt event.
 _pending_interactions: dict[str, dict[str, Any]] = {}
+
+
+_tracer = otel_trace.get_tracer("console-backend.chat")
+
+
+def _xray_trace_id(span: otel_trace.Span) -> str | None:
+    """OTel trace id in the form X-Ray search expects: ``1-<8 hex>-<24 hex>``.
+
+    X-Ray splits the 128-bit id into a 32-bit epoch prefix and a 96-bit
+    remainder; ``batch-get-traces`` and the console only accept that dashed
+    form, so logging the raw 32-hex id would leave a manual conversion between
+    a log line and the trace it points at.
+    """
+    context = span.get_span_context()
+    if not context.trace_id:
+        return None
+    raw = format(context.trace_id, "032x")
+    return f"1-{raw[:8]}-{raw[8:]}"
+
+
+def _traced_chat_message(handler):  # type: ignore[no-untyped-def]
+    """Start a NEW trace for every incoming chat message.
+
+    Messages arrive as events on one long-lived socket.io connection, which HTTP
+    auto-instrumentation cannot see — without this, a turn is invisible and the
+    orchestrator's spans hang in a trace of their own. The span is a fresh root
+    on purpose: parenting to the connection would merge every message of a
+    session into one giant trace. It stays current for the whole handler (which
+    awaits the full turn), so the auto-instrumented httpx call to the
+    orchestrator becomes a child and carries the trace context downstream.
+    Without the injected OTel agent (local dev, tests) this is a no-op.
+
+    The [TRACE] log line is the durable half of this. A trace can go missing —
+    the ids below ride in span METADATA, which X-Ray does not index (custom
+    annotations need Transaction Search, currently off), so a conversation id
+    cannot be searched for; and a root segment exported only when the turn ends
+    is the first casualty when a span-heavy turn overruns the export pipeline.
+    Emitting the pairing to logs makes conversation → trace a Logs Insights
+    query that holds even when the segment never arrives:
+
+        fields @timestamp, log
+        | filter log like "<conversation-id>" and log like "[TRACE]"
+        | sort @timestamp asc
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(sid: str, json_data: dict[str, Any]) -> Any:
+        no_parent = otel_trace.set_span_in_context(otel_trace.INVALID_SPAN)
+        # Attributes must be set at span CREATION: the sampler only sees these,
+        # not ones added later. "nannos.chat" is the hook for the X-Ray sampling
+        # rule that keeps every chat turn (the default rule keeps only ~5%, and
+        # an unsampled root drops the orchestrator's whole trace with it).
+        attributes: dict[str, str] = {"nannos.chat": "true"}
+        conversation_id = ""
+        message_id = ""
+        if isinstance(json_data, dict):
+            conversation_id = str(json_data.get("conversationId", ""))
+            message_id = str(json_data.get("id", ""))
+            attributes["nannos.conversation_id"] = conversation_id
+            attributes["nannos.message_id"] = message_id
+        event = handler.__name__.removeprefix("handle_")
+        with _tracer.start_as_current_span(
+            event,
+            context=no_parent,
+            kind=otel_trace.SpanKind.SERVER,
+            attributes=attributes,
+        ) as span:
+            # Logged at the START of the turn on purpose: a turn that never
+            # finishes (crash, disconnect, timeout) is exactly the one worth
+            # finding, and an end-only line would not exist for it.
+            trace_id = _xray_trace_id(span)
+            logger.info(
+                f"[TRACE] {event} start conversation={conversation_id or '-'} "
+                f"message={message_id or '-'} trace_id={trace_id or 'unsampled'}"
+            )
+            started = time.monotonic()
+            outcome = "ok"
+            try:
+                return await handler(sid, json_data)
+            except BaseException as exc:  # noqa: BLE001 - re-raised; only labels the log line
+                # BaseException, not Exception: a cancelled turn (client gone,
+                # shutdown) is the common non-ok ending here.
+                outcome = type(exc).__name__
+                raise
+            finally:
+                logger.info(
+                    f"[TRACE] {event} end conversation={conversation_id or '-'} "
+                    f"message={message_id or '-'} trace_id={trace_id or 'unsampled'} "
+                    f"outcome={outcome} duration_s={time.monotonic() - started:.3f}"
+                )
+
+    return wrapper
 
 
 def _conversation_room(conversation_id: str) -> str:
@@ -667,6 +877,7 @@ def _clear_turn_state(context_id: str, *, preserve_pending_interaction: bool = F
     starts the next turn (handle_send_message) or when a later turn ends without asking.
     """
     _streaming_buffers.pop(context_id, None)
+    _persisted_answer.pop(context_id, None)
     if not preserve_pending_interaction:
         _pending_interactions.pop(context_id, None)
     prefix = f"{context_id}:"
@@ -831,6 +1042,28 @@ async def _flush_intermediate_buffers(
         )
 
 
+def _assembled_answer_payload(text: str, kind: str, state: str | None) -> str:
+    """A stored payload for an answer the backend ASSEMBLED from stream chunks.
+
+    No single wire frame carries it — each frame held a fragment — so these rows
+    used to be the only ones persisted with an empty `raw_payload`. That made
+    them unnameable in the dev wire log: with nothing to read, it fell back to
+    its catch-all "event", so the assembled answer and its echo did not read as
+    the pair they were. Mirrors the synthetic payload
+    _flush_intermediate_buffers writes for sub-agent thoughts.
+    """
+    payload: dict[str, Any] = {
+        "kind": kind,
+        "artifact": {"parts": [{"kind": "text", "text": text}]},
+        # Marks a payload the backend built, so nobody mistakes it for a frame
+        # the agent actually sent.
+        "assembledByConsole": True,
+    }
+    if state:
+        payload["status"] = {"state": state}
+    return json.dumps(payload)
+
+
 async def _process_a2a_response(
     client_event: Any,
     sid: str,
@@ -943,7 +1176,12 @@ async def _process_a2a_response(
                 # that (re)subscribes mid-turn can restore a prompt that arrived while it was
                 # disconnected — otherwise the turn hangs on input the user never saw. Kept in
                 # memory keyed by conversation; cleared when the turn ends without asking.
-                if is_feedback_request or status_state == "input-required":
+                #
+                # A message-less input-required is NOT a prompt: it means the agent already
+                # delivered its whole answer as a streamed artifact and merely ended the turn
+                # in that state. Capturing it would make the conversation report itself
+                # in-flight forever and hand a reconnecting client an empty payload to replay.
+                if is_feedback_request or (status_state == "input-required" and status_message):
                     _pending_interactions[effective_context_id] = response_data
 
                 # Orchestrator reply chunks are accumulated into _streaming_buffers earlier
@@ -1013,6 +1251,9 @@ async def _process_a2a_response(
                                     task_id=task_id,
                                     state=TaskState.TASK_STATE_COMPLETED,
                                     kind="artifact-update",
+                                    raw_payload=_assembled_answer_payload(
+                                        accumulated, "artifact-update", status_state
+                                    ),
                                 )
                                 # Inject persisted message_id into response so frontend
                                 # can associate its msg-* placeholder with the real DB ID
@@ -1032,12 +1273,19 @@ async def _process_a2a_response(
                                     task_id=task_id,
                                     state=_parse_task_state(status_state),
                                     kind="status-update",
+                                    raw_payload=_assembled_answer_payload(
+                                        accumulated, "status-update", status_state
+                                    ),
                                 )
                                 response_data["persistedMessageId"] = saved_msg.message_id
                                 # For HITL interrupts (input-required), don't block save_agent_response:
                                 # the HITL event carries action_requests/review_configs/extensions in its
                                 # raw payload that must be persisted so the widget can be restored on reload.
                                 safety_net_saved = status_state != "input-required"
+                            # Whichever branch stored it, remember the text: a terminal
+                            # status that re-sends the same answer is dropped below
+                            # instead of landing as a second copy.
+                            _persisted_answer[effective_context_id] = accumulated.strip()
                         elif is_last_chunk:
                             logger.warning(
                                 f"[STREAMING] last_chunk=True but accumulated content is empty "
@@ -1058,25 +1306,58 @@ async def _process_a2a_response(
                 # ── Persist non-streaming responses ──
                 # Skip: work-plan (transient), artifact chunks (accumulated above),
                 # bare completion signals (no content to save), safety-net (already saved).
-                is_bare_completion_signal = (
+                # A terminal status with no message carries nothing to store. Saving it
+                # anyway produced a junk placeholder row ("Status: TASK_STATE_… at …",
+                # see messages_service._parse_status_update) under a fresh uuid7, so it
+                # was not even idempotent. input-required and auth-required belong here
+                # too: an agent that already streamed its whole answer now ends the turn
+                # on a bare status in those states as well.
+                _TERMINAL_STATES = ("completed", "failed", "canceled", "input-required", "auth-required")
+                is_bare_terminal_signal = (
                     response_data.get("kind") == "status-update"
                     and status_obj
-                    and status_state in ("completed", "failed", "canceled")
+                    and status_state in _TERMINAL_STATES
                     and not status_obj.get("message")
                 )
+                repeats_stored_answer = _repeats_persisted_answer(response_data, effective_context_id)
+                if repeats_stored_answer:
+                    logger.info(
+                        "[STREAMING] Dropping status that repeats the stored answer "
+                        "(state=%s) for context %s",
+                        status_state,
+                        effective_context_id,
+                    )
 
                 if (
                     not is_work_plan
                     and not is_feedback_request
                     and not is_artifact_update
-                    and not is_bare_completion_signal
+                    and not is_bare_terminal_signal
                     and not safety_net_saved
+                    and not repeats_stored_answer
                 ):
                     await messages_service.save_agent_response(
                         response_data=response_data,
                         conversation_id=effective_context_id,
                         user_id=user_id,
                     )
+
+                # ── Name the conversation after what it is about ──
+                # The answer text is taken from THIS event, not read back from the
+                # database: whichever way the turn ended, we already have it here.
+                # 'input-required' is not an ending — the turn paused for an approval
+                # and has no answer yet, so a later completed turn titles it instead.
+                if is_turn_ending and status_state != "input-required":
+                    answer_text = (accumulated or "").strip() or _answer_text_of(response_data)
+                    # A turn can end twice on the wire (a last_chunk artifact, then a
+                    # completed status). The DB flag stops the second RUN; this set stops
+                    # a second concurrent gateway CALL before the first has written.
+                    if answer_text and effective_context_id not in _titling_in_flight:
+                        _titling_in_flight.add(effective_context_id)
+                        _spawn_background(
+                            _title_conversation(effective_context_id, user_id, answer_text),
+                            name=f"title:{effective_context_id}",
+                        )
         except Exception as db_error:
             # Log but don't fail the response if DB write fails
             logger.error(f"Failed to save agent response to DynamoDB: {db_error}", exc_info=True)
@@ -1858,6 +2139,7 @@ async def _send_steering_message_to_agent(
 
 @sio.on(SocketEvents.SEND_MESSAGE)  # type: ignore
 @require_socket_auth(sio)
+@_traced_chat_message
 async def handle_send_message(sid: str, json_data: dict[str, Any]) -> dict[str, Any] | None:
     """Handle the 'send_message' socket.io event.
 
@@ -1926,6 +2208,7 @@ async def handle_send_message(sid: str, json_data: dict[str, Any]) -> dict[str, 
 
         if socket_session.user_id:
             metadata["user_id"] = socket_session.user_id
+            otel_trace.get_current_span().set_attribute("enduser.id", socket_session.user_id)
         else:
             error_response = create_error_response(
                 SocketError.SESSION_NOT_FOUND,
@@ -1972,6 +2255,9 @@ async def handle_send_message(sid: str, json_data: dict[str, Any]) -> dict[str, 
         # conversation on creation so the console can label it and render it
         # read-only (its turns assume a live host page with registered objects).
         embedded_sub_agent_id = metadata.get("executeOnlySubAgentId") or metadata.get("subAgentId")
+        # Where the conversation STARTED (embed SDK metadata.pageContext) — stamped on
+        # creation only, so the list can say "this one began on campaign 123".
+        page_context = metadata.get("pageContext") if isinstance(metadata, dict) else None
         try:
             await conversation_service.get_or_create_conversation(
                 conversation_id=context_id,
@@ -1980,6 +2266,7 @@ async def handle_send_message(sid: str, json_data: dict[str, Any]) -> dict[str, 
                 message=message_text,
                 sub_agent_config_hash=sub_agent_config_hash,
                 embedded_sub_agent_id=str(embedded_sub_agent_id) if embedded_sub_agent_id is not None else None,
+                page_context=page_context if isinstance(page_context, dict) else None,
             )
         except (ConversationOwnershipError, IntegrityError):
             logger.warning(

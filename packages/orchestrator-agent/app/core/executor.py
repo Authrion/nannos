@@ -45,6 +45,7 @@ from .a2a_extensions import (
     WORK_PLAN_EXTENSION,
     new_activity_log_message,
     new_client_action_message,
+    new_client_action_request_message,
     new_feedback_request_message,
     new_hitl_interrupt_message,
     new_work_plan_message,
@@ -197,6 +198,31 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                 resume_map[intr.id] = {"decisions": per}
                 tool_names = [ar.get("name") for ar in action_requests if isinstance(ar, dict)]
                 logger.info(f"Resuming HITL interrupt {intr.id} for tools {tool_names} with {len(per)} decision(s)")
+            elif isinstance(intr_value, dict) and "client_action_request" in intr_value:
+                # Client-action round trip: resume the paused client_action tool
+                # with the browser's result, matched by the request id the SDK
+                # echoed on its decision. A resume WITHOUT a result (the user
+                # typed a message while the turn was parked, or the request id
+                # got lost) hands the tool an explicit no-result so it reports
+                # honestly instead of assuming success.
+                request = intr_value.get("client_action_request") or {}
+                decision = decisions_by_id.get(request.get("id"))
+                if not isinstance(decision, dict) or "client_action_result" not in decision:
+                    # Id-less fallback: a single result-bearing decision still resolves.
+                    decision = next(
+                        (d for d in hitl_decisions if isinstance(d, dict) and "client_action_result" in d),
+                        None,
+                    )
+                result = decision.get("client_action_result") if isinstance(decision, dict) else None
+                resume_map[intr.id] = (
+                    result
+                    if isinstance(result, dict)
+                    else {"ok": False, "reason": "no-result"}
+                )
+                logger.info(
+                    f"Resuming client-action interrupt {intr.id} "
+                    f"({'with result' if isinstance(result, dict) else 'WITHOUT result'})"
+                )
             else:
                 resume_map[intr.id] = query
                 logger.info(f"Resuming non-HITL interrupt {intr.id}")
@@ -217,6 +243,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         enable_thinking: bool | None = None,
         thinking_level: str | None = None,
         client_objects: list | None = None,
+        page_context: dict | None = None,
     ) -> UserConfig:
         """Build complete UserConfig with all data and discovered capabilities.
 
@@ -261,6 +288,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             user_system_role=user.system_role,
             tool_bypass_rules=user.tool_bypass_rules,
             client_objects=client_objects,
+            page_context=page_context,
         )
 
         # Discover capabilities (tools and sub-agents), memoized per-user to avoid
@@ -544,6 +572,23 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         if client_objects:
             logger.info(f"[CLIENT-OBJECTS] Manifest received: {client_objects}")
 
+        # Embedded Nannos: the page the user is CURRENTLY on ({key, label?,
+        # description?, data?}), published by the host on navigation and sent
+        # with every turn. Same protobuf-Struct unwrap caveat as the manifest.
+        raw_page_context = request_metadata.get("pageContext")
+        page_context: dict | None = None
+        if raw_page_context is not None:
+            if hasattr(raw_page_context, "DESCRIPTOR"):
+                from google.protobuf.json_format import MessageToDict
+
+                converted_page = MessageToDict(raw_page_context)
+                if isinstance(converted_page, dict) and converted_page:
+                    page_context = converted_page
+            elif isinstance(raw_page_context, dict) and raw_page_context:
+                page_context = raw_page_context
+        if page_context:
+            logger.info(f"[PAGE-CONTEXT] Current page received: {page_context}")
+
         # Embedded Nannos (execute-only, ADR-0004): the console-backend maps the
         # embedding app-id → a scoped domain sub-agent and passes its id here. When
         # present we run THAT sub-agent as the top-level graph — bypassing the routing
@@ -669,6 +714,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                 enable_thinking=enable_thinking,
                 thinking_level=thinking_level,
                 client_objects=client_objects,
+                page_context=page_context,
             )
 
             # Extract message parts for multimodal support (text + files)
@@ -746,13 +792,19 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                 )
                 embedded_runnable = ecache.get(ekey)
                 if embedded_runnable is None:
-                    # Mark as the embedded entrypoint (adds the client_action tool +
-                    # <client_objects> rendering) and isolate to just this agent —
-                    # execute-only means no routing and no peer sub-agents. Copy first:
-                    # the config instance is shared by reference with the per-user cache,
-                    # so an in-place mutation would leak the embedded-only flag into
-                    # subsequent non-embedded turns for this user.
-                    embedded_target = embedded_target.model_copy(update={"client_action_enabled": True})
+                    # Mark as the embedded entrypoint and isolate to just this agent —
+                    # execute-only means no routing and no peer sub-agents. Two distinct
+                    # flags, deliberately: ``embedded_entrypoint`` says this agent IS the
+                    # top-level graph and so owns talking to the user (notify_user), while
+                    # ``client_action_enabled`` says it may drive on-screen objects
+                    # (client_action + <client_objects>). Both are true for an embed today;
+                    # a future user-facing surface without on-screen objects would set only
+                    # the first. Copy first: the config instance is shared by reference with
+                    # the per-user cache, so an in-place mutation would leak the
+                    # embedded-only flags into subsequent non-embedded turns for this user.
+                    embedded_target = embedded_target.model_copy(
+                        update={"embedded_entrypoint": True, "client_action_enabled": True}
+                    )
                     user_config.local_subagents = [embedded_target]
                     runtime_context = self.agent.build_runtime_context(
                         user_config, sandbox_pool=self.agent.sandbox_pool
@@ -848,9 +900,12 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                     f"conversation:{task.context_id}",
                 ],
             }
-            # ClientObjectsMiddleware reads the on-screen manifest from config metadata.
+            # ClientObjectsMiddleware reads the on-screen manifest AND the
+            # current page from config metadata.
             if embedded_runnable is not None and client_objects:
                 config["metadata"]["client_objects"] = client_objects
+            if embedded_runnable is not None and page_context:
+                config["metadata"]["page_context"] = page_context
 
             current_state = await graph.aget_state(config)  # type: ignore
 
@@ -907,7 +962,11 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                 streaming_artifact_id = str(uuid.uuid4())
                 first_chunk_sent = False  # Track if we've sent the initial MAIN artifact chunk
                 first_intermediate_chunk_sent = False  # Track if we've sent the initial INTERMEDIATE artifact chunk
-                streamed_chars = 0  # Total chars streamed via the MAIN artifact (code points, not wire bytes; for completion diagnostics)
+                # The MAIN artifact text itself. A char count is enough to tell whether
+                # a `completed` turn already delivered its answer (the answer IS what
+                # streamed), but an interrupt's terminal message can be a different,
+                # shorter text — so the single-source check compares content there.
+                streamed_text = ""
                 deferred_terminal_item = None
                 # Per-round carrier: the agent populates this from its single
                 # end-of-stream aget_state, so the phantom / feedback / terminal
@@ -924,7 +983,6 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                         context_id=task.context_id,
                         resume=resume_value,
                         turn_state=turn_state,
-                        client_objects=client_objects,
                     )
                 else:
                     stream_source = self.agent.stream(
@@ -952,7 +1010,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                         # go to a separate "-thought" artifact and aren't part of the
                         # main response stream the client renders).
                         if not metadata.get("intermediate_output") and item.content:
-                            streamed_chars += len(item.content)
+                            streamed_text += item.content
 
                     # Pass per-artifact first_chunk_sent flags and update after each chunk
                     first_chunk_sent, first_intermediate_chunk_sent = await self._handle_stream_item(
@@ -964,7 +1022,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                         first_chunk_sent=first_chunk_sent,
                         first_intermediate_chunk_sent=first_intermediate_chunk_sent,
                         active_extensions=requested_extensions,
-                        streamed_chars=streamed_chars,
+                        streamed_text=streamed_text,
                     )
 
                 # Check for steering messages that arrived after the last abefore_model
@@ -1075,7 +1133,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                         first_chunk_sent=first_chunk_sent,
                         first_intermediate_chunk_sent=first_intermediate_chunk_sent,
                         active_extensions=requested_extensions,
-                        streamed_chars=streamed_chars,
+                        streamed_text=streamed_text,
                     )
                 break  # Done — no re-invocation needed
         except asyncio.CancelledError:
@@ -1135,7 +1193,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         first_chunk_sent: bool = False,
         first_intermediate_chunk_sent: bool = False,
         active_extensions: set[str] | None = None,
-        streamed_chars: int = 0,
+        streamed_text: str = "",
     ) -> tuple[bool, bool]:
         """Handle a stream item from the agent and update the task accordingly.
 
@@ -1175,7 +1233,12 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             if not _ext_active(ACTIVITY_LOG_EXTENSION):
                 return first_chunk_sent, first_intermediate_chunk_sent  # Client didn't request this extension
             source = metadata.get("source")
-            logger.info(f"[ACTIVITY_LOG] Emitting status update: source={source}, content: {content[:50]}")
+            # "note" marks a mid-turn note the agent wrote for the user (notify_user);
+            # ordinary tool/delegation lines carry no kind.
+            kind = metadata.get("kind")
+            logger.info(
+                f"[ACTIVITY_LOG] Emitting status update: source={source}, kind={kind}, content: {content[:50]}"
+            )
             await updater.update_status(
                 TaskState.TASK_STATE_WORKING,
                 new_activity_log_message(
@@ -1183,6 +1246,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                     task.context_id,
                     task.id,
                     source=source,
+                    kind=kind,
                 ),
             )
             return first_chunk_sent, first_intermediate_chunk_sent  # Don't modify flags
@@ -1308,7 +1372,28 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         elif state == TaskState.TASK_STATE_INPUT_REQUIRED:
             # User input required - leave task in input_required state
             action_requests = item.action_requests
-            if action_requests and _ext_active(HUMAN_IN_THE_LOOP_EXTENSION):
+            client_action_request = getattr(item, "client_action_request", None)
+            if client_action_request and _ext_active(CLIENT_ACTION_EXTENSION):
+                # Client-action round trip: the tool paused awaiting the browser's
+                # result. Same stream-sealing rule as HITL — a turn that streamed
+                # tokens before pausing must not leave the artifact open.
+                if first_chunk_sent:
+                    await updater.add_artifact(
+                        [Part(text="")],
+                        artifact_id=streaming_artifact_id,
+                        append=True,
+                        last_chunk=True,
+                        metadata={},
+                    )
+                await updater.update_status(
+                    TaskState.TASK_STATE_INPUT_REQUIRED,
+                    new_client_action_request_message(
+                        client_action_request,
+                        context_id=task.context_id,
+                        task_id=task.id,
+                    ),
+                )
+            elif action_requests and _ext_active(HUMAN_IN_THE_LOOP_EXTENSION):
                 # Structured HITL interrupt via extension — any A2A client can respond
                 # review_configs are provided by the ConditionalHumanInTheLoopMiddleware
                 review_configs = item.review_configs or [
@@ -1344,15 +1429,13 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             else:
                 # Generic input_required (no HITL extension or not subscribed).
                 #
-                # CONTRACT FOR CLIENTS: Mirror the `completed` path — the terminal
-                # input_required status ALWAYS carries the authoritative
-                # FinalResponseSchema.message in its message body, and (if the
-                # orchestrator streamed token chunks this turn) we close the
-                # streaming artifact cleanly first. This guarantees the user
-                # receives the orchestrator's reply even if intermediate SSE
-                # artifact frames were dropped or the client only renders status
-                # messages. The `final_answer_source: "fallback"` metadata flag
-                # signals well-behaved clients to dedupe against the artifact.
+                # CONTRACT FOR CLIENTS: Mirror the `completed` path — the answer
+                # is delivered EXACTLY ONCE. If the orchestrator streamed the whole
+                # answer as token chunks this turn, the artifact is closed cleanly
+                # and the terminal status is BARE (state only). Otherwise the status
+                # carries the authoritative FinalResponseSchema.message, tagged
+                # `final_answer_source: "fallback"` when a partial prefix streamed
+                # too, so clients can dedupe against what they already rendered.
                 final_answer = content if content else "Additional input is required to continue."
                 msg = new_text_message(final_answer, context_id=task.context_id, task_id=task.id)
                 if item.interrupt_reason:
@@ -1363,7 +1446,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                     msg,
                     streaming_artifact_id=streaming_artifact_id,
                     first_chunk_sent=first_chunk_sent,
-                    streamed_chars=streamed_chars,
+                    streamed_text=streamed_text,
                     final_message_len=len(final_answer),
                     base_metadata=metadata,
                 )
@@ -1371,13 +1454,11 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         elif state == TaskState.TASK_STATE_AUTH_REQUIRED:
             # Authentication required - leave task in auth_required state.
             #
-            # CONTRACT FOR CLIENTS: Mirror the `completed` path — the terminal
-            # auth_required status ALWAYS carries the authoritative
-            # FinalResponseSchema.message in its message body, and (if the
-            # orchestrator streamed token chunks this turn) we close the
-            # streaming artifact cleanly first. The `final_answer_source:
-            # "fallback"` metadata flag signals well-behaved clients to dedupe
-            # against the artifact text they already rendered.
+            # CONTRACT FOR CLIENTS: Mirror the `completed` path — the answer is
+            # delivered EXACTLY ONCE. A fully streamed answer closes its artifact
+            # and ends on a BARE terminal status; otherwise the status carries the
+            # authoritative FinalResponseSchema.message, tagged
+            # `final_answer_source: "fallback"` when a partial prefix streamed too.
             final_answer = content if content else "Authentication is required to continue."
             await self._close_streaming_artifact_and_respond(
                 updater,
@@ -1385,7 +1466,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                 new_text_message(final_answer, context_id=task.context_id, task_id=task.id),
                 streaming_artifact_id=streaming_artifact_id,
                 first_chunk_sent=first_chunk_sent,
-                streamed_chars=streamed_chars,
+                streamed_text=streamed_text,
                 final_message_len=len(final_answer),
                 base_metadata=metadata,
             )
@@ -1394,15 +1475,12 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
             # Task completed successfully.
             #
             # CONTRACT FOR CLIENTS: The terminal `completed` status ALWAYS carries the
-            # authoritative final answer in its message body (the validated
-            # FinalResponseSchema.message). This is true for both the streamed and
-            # non-streamed branches. Clients that already rendered the streamed
-            # artifact chunks should treat this terminal message as the source of
-            # truth (dedupe / replace) rather than appending it — the
-            # `final_answer_source: "fallback"` metadata flag on the status update
-            # signals that the same text was also delivered via artifact-append.
-            # This guarantees the user receives the reply even if any intermediate
-            # SSE artifact frame fails to parse on the client side.
+            # authoritative final answer in its message body — UNLESS the whole
+            # answer already streamed as artifact chunks, in which case the status
+            # is bare and the artifact is the answer. When the status does carry
+            # text alongside a streamed prefix it is tagged
+            # `final_answer_source: "fallback"`, and clients should treat it as the
+            # source of truth (dedupe / replace) rather than appending it.
             final_answer = content if content else "Task completed successfully"
             # Streamed and non-streamed completions converge here: the helper
             # closes the streaming artifact (only when token chunks were streamed
@@ -1415,7 +1493,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                 new_text_message(final_answer, context_id=task.context_id, task_id=task.id),
                 streaming_artifact_id=streaming_artifact_id,
                 first_chunk_sent=first_chunk_sent,
-                streamed_chars=streamed_chars,
+                streamed_text=streamed_text,
                 final_message_len=len(final_answer),
                 base_metadata=metadata,
             )
@@ -1447,7 +1525,7 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         *,
         streaming_artifact_id: str,
         first_chunk_sent: bool,
-        streamed_chars: int,
+        streamed_text: str,
         final_message_len: int,
         base_metadata: dict | None,
     ) -> None:
@@ -1461,21 +1539,46 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
         chunks, the streamed artifact *is* the answer — re-sending it in the
         terminal ``status.message`` would duplicate it for every consumer (web
         render + persistence, slack, google-chat). So in that case emit a BARE
-        completion (state only) and let clients use the streamed artifact.
+        terminal status (state only) and let clients use the streamed artifact.
+        This holds for every state routed through here, ``input_required`` and
+        ``auth_required`` included: how a turn ENDS says nothing about whether its
+        answer was already delivered.
 
         The terminal message stays authoritative only when the answer was NOT
         fully streamed:
-        - interrupts (``input_required`` / ``auth_required`` carry the message);
         - answers assembled at the terminal (e.g. ``include_subagent_output``,
           where nothing — or only a partial prefix — was streamed to the main
           artifact). A streamed partial prefix is tagged ``final_answer_source``
-          so consumers can still dedupe it.
+          so consumers can still dedupe it;
+        - interrupts that never streamed a token (the message is all there is).
+
+        Structured HITL prompts do NOT come through here — they carry
+        action_requests / review_configs that clients need, and their branch emits
+        the message directly.
         """
+        # Applies to EVERY terminal state, not only `completed`. An interrupt turn
+        # streams its answer exactly the same way, so gating this on `completed`
+        # alone meant an `input_required` / `auth_required` turn always re-sent the
+        # whole answer: the console stored it twice, and a reloaded conversation
+        # showed one answer as two bubbles.
+        #
+        # The extra content check is what makes that safe. For `completed` the
+        # terminal message IS the streamed answer, so the char count settles it.
+        # An interrupt's message may be a DIFFERENT, shorter text — an auth prompt
+        # ("Please sign in to Jira to continue.") after a long streamed answer —
+        # and a length check alone would call that already-delivered and drop a
+        # prompt the client has to render. So compare the text itself there.
+        terminal_text = "".join(
+            part.text for part in msg.parts if part.WhichOneof("content") == "text"
+        ).strip()
         answer_fully_streamed = (
-            state == TaskState.TASK_STATE_COMPLETED
-            and first_chunk_sent
+            first_chunk_sent
             and final_message_len > 0
-            and streamed_chars >= final_message_len
+            and len(streamed_text) >= final_message_len
+            and (
+                state == TaskState.TASK_STATE_COMPLETED
+                or (bool(terminal_text) and streamed_text.strip().startswith(terminal_text))
+            )
         )
         if first_chunk_sent:
             await updater.add_artifact(
@@ -1489,15 +1592,20 @@ class OrchestratorDeepAgentExecutor(AgentExecutor):
                 "[STREAMING] Completion: artifact_id=%s streamed_chars=%d "
                 "final_message_len=%d task_state=%s fully_streamed=%s",
                 streaming_artifact_id,
-                streamed_chars,
+                len(streamed_text),
                 final_message_len,
                 state,
                 answer_fully_streamed,
             )
         if answer_fully_streamed:
             # Answer already delivered via the streamed artifact — emit a bare
-            # completion (no message) so it isn't re-sent / re-persisted / re-rendered.
-            await updater.update_status(state, None, metadata=(base_metadata or None))
+            # terminal status (no message) so it isn't re-sent / re-persisted / re-rendered.
+            bare_metadata = dict(base_metadata) if base_metadata else {}
+            # The status is now the only frame left, so anything the dropped message
+            # carried has to ride on it — e.g. `interrupt_reason` on a generic
+            # input_required, which the client needs to explain why the turn paused.
+            bare_metadata.update(dict(msg.metadata))
+            await updater.update_status(state, None, metadata=bare_metadata or None)
         else:
             status_metadata = dict(base_metadata) if base_metadata else {}
             if first_chunk_sent:

@@ -20,7 +20,12 @@ from ringier_a2a_sdk.models import TodoItem
 # ---------------------------------------------------------------------------
 
 ACTIVITY_LOG_EXTENSION = "urn:nannos:a2a:activity-log:1.0"
-"""Tool usage and delegation status events displayed as a timeline."""
+"""Tool usage, delegation, and mid-turn note events displayed as a timeline.
+
+Message metadata may carry ``kind``: absent for a mechanical line ("Using
+search…", "Delegating to …"), ``"note"`` for a line the agent wrote for the user
+itself through the ``notify_user`` tool. Both keep the task in ``working`` —
+neither ends the turn."""
 
 WORK_PLAN_EXTENSION = "urn:nannos:a2a:work-plan:1.0"
 """Structured progress tracking with a todo checklist."""
@@ -166,6 +171,7 @@ def new_activity_log_message(
     context_id: str | None = None,
     task_id: str | None = None,
     source: str | None = None,
+    kind: str | None = None,
 ) -> Message:
     """Build a Message for an activity-log status update (tool usage, delegation).
 
@@ -173,10 +179,17 @@ def new_activity_log_message(
       - A TextPart with the human-readable status text
       - extensions=[ACTIVITY_LOG_EXTENSION] for client classification
       - Optional source attribution in message metadata
+      - Optional ``kind`` in message metadata: absent for the ordinary mechanical
+        line (a tool ran, work was delegated), ``"note"`` when the agent itself
+        addressed the user mid-turn via the ``notify_user`` tool. Clients that
+        ignore it still render the line; clients that read it can style the
+        agent's own words apart from a tool label.
     """
     metadata = {}
     if source:
         metadata["source"] = source
+    if kind:
+        metadata["kind"] = kind
 
     return Message(
         role=Role.ROLE_AGENT,
@@ -231,6 +244,34 @@ def new_client_action_message(
         parts=[
             Part(
                 data=ParseDict({"directive": directive}, Value()),
+                metadata={"media_type": "application/json"},
+            )
+        ],
+        message_id=str(uuid.uuid4()),
+        context_id=context_id or "",
+        task_id=task_id or "",
+        extensions=[CLIENT_ACTION_EXTENSION],
+    )
+
+
+def new_client_action_request_message(
+    request: dict,
+    context_id: str | None = None,
+    task_id: str | None = None,
+) -> Message:
+    """Build a Message carrying a client-action REQUEST awaiting a result.
+
+    Distinct from ``new_client_action_message`` (fire-and-forget ``{"directive"}``):
+    this one is emitted with the ``input_required`` task state and carries
+    ``{"request": {"id", "directive"}}``. The Embed SDK executes the directive and
+    resumes the turn with a ``{"decisions": [{"id", "type": "approve",
+    "client_action_result": {...}}]}`` DataPart — the same channel HITL uses.
+    """
+    return Message(
+        role=Role.ROLE_AGENT,
+        parts=[
+            Part(
+                data=ParseDict({"request": request}, Value()),
                 metadata={"media_type": "application/json"},
             )
         ],

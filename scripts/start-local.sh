@@ -713,6 +713,17 @@ cd "$ROOT_DIR/packages/console-frontend"
 npm install --silent 2>/dev/null
 ok "Frontend dependencies installed"
 
+# @nannos/embed-sdk is a workspace package whose exports point at dist/. The dev
+# server reads the SDK's SOURCE (serve-only aliases in the console's
+# vite.config.ts), but tsconfig has no paths mapping — so the IDE and `tsc -b`
+# still typecheck against dist/*.d.ts, and `npm run build` still bundles dist.
+# Build once here so both are valid; the "embed-sdk" mprocs process then keeps
+# only the .d.ts and the stylesheet fresh (see the note there).
+log "Building embed-sdk..."
+(cd "$ROOT_DIR/packages/embed-sdk" && npm run build --silent >/dev/null 2>&1) \
+  || err "embed-sdk build failed — run 'npm run build' in packages/embed-sdk"
+ok "embed-sdk built"
+
 # ─── 7b. Local Model Gateway (LiteLLM proxy) ───────────────────────
 # Gateway-only architecture: all LLM calls route through the proxy,
 # there is no per-provider fallback. Auto-launch a local proxy fronting whatever
@@ -754,11 +765,6 @@ _GW_CONFIG=$(mktemp /tmp/nannos-litellm-XXXXXX).yaml
 cat > "$_GW_CONFIG" <<'EOF'
 litellm_settings:
   callbacks: custom_logger.proxy_handler_instance
-  # Allow MCP OpenAPI backends on the docker host (Embedded Nannos: cockpit
-  # MCP hosted by this gateway). NOTE: v1.90.0 only honors this under
-  # litellm_settings — the SSRF error message says general_settings, which is
-  # wrong (verified 2026-07-06).
-  user_url_allowed_hosts: ["host.docker.internal", "192.168.65.254"]
   # Total per-request bound for non-streaming calls; streaming hangs are caught by the
   # client-side inter-chunk watchdog (Bedrock ignores stream_timeout).
   request_timeout: 600
@@ -1249,6 +1255,18 @@ procs:
       LANGSMITH_PROJECT: "$LANGSMITH_PROJECT"
       LANGSMITH_ENDPOINT: "$LANGSMITH_ENDPOINT"
       LOG_LEVEL: "INFO"
+
+  # `dev:link`, NOT `build:watch`. The console dev server compiles the SDK's
+  # source directly, so a `vite build --watch` here would rebuild a dist nobody
+  # reads — while rewriting it non-atomically with renumbered rollup chunks,
+  # which is what used to wedge the dev server mid-rebuild. dev:link keeps the
+  # .d.ts (editor/tsc) and dist/styles.css (shadow-DOM embed mounts) in sync and
+  # leaves dist/*.js alone. Consequence: dist JS goes stale during a session —
+  # re-run `npm run build` in packages/embed-sdk before a console prod build.
+  embed-sdk:
+    cwd: "$ROOT_DIR/packages/embed-sdk"
+    shell: "npm run dev:link 2>&1 | tee $_LOG_DIR/embed-sdk.log"
+    stop: "SIGKILL"
 
   frontend:
     cwd: "$ROOT_DIR/packages/console-frontend"

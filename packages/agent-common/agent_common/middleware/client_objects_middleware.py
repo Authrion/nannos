@@ -1,15 +1,16 @@
 """Shared `<client_objects>` rendering for Embedded Nannos.
 
-Renders the on-screen ontology manifest into the system prompt for *any* agent —
+Renders the on-screen ontology manifest as a trailing per-call message for *any* agent —
 the orchestrator main graph or a LOCAL domain sub-agent (the embedded entrypoint).
 The manifest is read from the **RunnableConfig metadata** (provider-neutral), so a
 single implementation serves every build path without depending on the
 orchestrator's typed `GraphRuntimeContext`.
 
 Manifest entry shape: `{type, id, scope, label?, fields?, fieldSpecs?, values?}`.
-The orchestrator's `UserPreferencesMiddleware` reuses `render_client_objects_block`
+The orchestrator's `UserPreferencesMiddleware` reuses `inject_embedded_context`
 (it sources the manifest from its context); `ClientObjectsMiddleware` is for
-sub-agents that get the manifest via config metadata.
+sub-agents that get the manifest via config metadata. Both place the block the
+same way — see `inject_embedded_context`.
 """
 
 from __future__ import annotations
@@ -27,13 +28,19 @@ from langchain.agents.middleware.types import (
 )
 from langgraph.config import get_config
 
-from .utils import append_to_last_human_message, append_to_system_message
+from .utils import append_volatile_context_message
 
 logger = logging.getLogger(__name__)
 
 # Metadata keys the manifest may arrive under (camelCase from the A2A wire,
 # snake_case when plumbed server-side).
 CLIENT_OBJECTS_METADATA_KEYS = ("client_objects", "clientObjects")
+
+# Same convention for the live page context the embedding client publishes —
+# the page the user is on RIGHT NOW: {key, title?, breadcrumbs?, entity?,
+# view?, visible?}, merged from the host's layers and sanitized client-side
+# (SDK core/page-context.ts).
+PAGE_CONTEXT_METADATA_KEYS = ("page_context", "pageContext")
 
 
 def _render_field(spec: object) -> str:
@@ -92,38 +99,104 @@ def render_client_objects_block(client_objects: Any) -> str | None:
     )
 
 
-def _client_objects_from_config() -> Any:
-    """Pull the manifest from the current RunnableConfig metadata (provider-neutral)."""
+def render_current_page_block(page_context: Any) -> str | None:
+    """Render the `<current_page>` prompt section, or None if empty/invalid.
+
+    ``page_context`` is the live page descriptor the embedding client sends
+    with every turn: {key, title?, breadcrumbs?, entity?, view?, visible?}
+    (sanitized client-side; caps + secret-key deny list). It rides the last
+    human message for the same reason as the manifest: it changes as the user
+    navigates, and the cached system prefix must stay byte-stable.
+    """
+    if not isinstance(page_context, dict) or not page_context.get("key"):
+        return None
+    lines = [f"- path: {page_context['key']}"]
+    if page_context.get("title"):
+        lines.append(f"- title: {page_context['title']}")
+    breadcrumbs = page_context.get("breadcrumbs")
+    if isinstance(breadcrumbs, list) and breadcrumbs:
+        lines.append(f"- breadcrumbs: {' > '.join(str(b) for b in breadcrumbs)}")
+    # The entity resolves "this campaign" to an id the tools accept.
+    entity = page_context.get("entity")
+    if isinstance(entity, dict) and entity.get("type") and entity.get("id"):
+        described = f"- on-screen entity: {entity['type']} id={entity['id']}"
+        if entity.get("name"):
+            described += f" name={entity['name']!r}"
+        lines.append(described)
+    # Active tab / filter / selection, as the page declared them.
+    view = page_context.get("view")
+    if isinstance(view, dict) and view:
+        try:
+            rendered_view = json.dumps(view, default=str, ensure_ascii=False)
+        except Exception:
+            rendered_view = str(view)
+        lines.append(f"- view state: {rendered_view}")
+    # Names of what the user can see, so "the second one" can be resolved.
+    visible = page_context.get("visible")
+    if isinstance(visible, list) and visible:
+        lines.append(f"- visible items: {', '.join(str(v) for v in visible)}")
+    return (
+        "<current_page>\n"
+        "The user is currently on this page in the application. It updates as they "
+        "navigate, so earlier messages in the conversation may have been sent from "
+        "other pages. Resolve references like \"this page\", \"here\", \"this "
+        "campaign\", or \"the second one\" against it.\n"
+        + "\n".join(lines)
+        + "\n</current_page>"
+    )
+
+
+def _from_config_metadata(keys: tuple[str, ...]) -> Any:
+    """Pull a value from the current RunnableConfig metadata (provider-neutral)."""
     try:
         config = get_config()
     except Exception:
         return None
     metadata = (config or {}).get("metadata") or {}
-    for key in CLIENT_OBJECTS_METADATA_KEYS:
+    for key in keys:
         if metadata.get(key):
             return metadata[key]
     return None
 
 
+def _client_objects_from_config() -> Any:
+    return _from_config_metadata(CLIENT_OBJECTS_METADATA_KEYS)
+
+
+def _page_context_from_config() -> Any:
+    return _from_config_metadata(PAGE_CONTEXT_METADATA_KEYS)
+
+
+def inject_embedded_context(
+    request: ModelRequest,
+    page_context: Any,
+    client_objects: Any,
+) -> ModelRequest:
+    """Attach the embedded-client context (`<current_page>` then `<client_objects>`)
+    to a model request as ONE trailing, flagged human message.
+
+    Single placement policy for both injection sites (orchestrator
+    `UserPreferencesMiddleware`, sub-agent `ClientObjectsMiddleware`). The block is
+    volatile on-screen state that is never checkpointed, so it must come AFTER all
+    persisted messages to keep the provider prompt cache warm — see
+    `agent_common.middleware.utils.append_volatile_context_message` for why the
+    previous "last human message" placement busted the cache every turn.
+    Returns the request unchanged when there is nothing to render.
+    """
+    blocks = [render_current_page_block(page_context), render_client_objects_block(client_objects)]
+    block = "\n\n".join(b for b in blocks if b)
+    if not block:
+        return request
+    return request.override(messages=append_volatile_context_message(request.messages, block))
+
+
 class ClientObjectsMiddleware(AgentMiddleware):
-    """Append the `<client_objects>` section to the system prompt for a LOCAL
-    sub-agent, reading the manifest from RunnableConfig metadata. Attach via
-    `build_sub_agent_graph(extra_middlewares=[...])`."""
+    """Append the embedded-client context sections (`<current_page>` and
+    `<client_objects>`) for a LOCAL sub-agent, reading both from RunnableConfig
+    metadata. Attach via `build_sub_agent_graph(extra_middlewares=[...])`."""
 
     def _apply(self, request: ModelRequest) -> ModelRequest:
-        block = render_client_objects_block(_client_objects_from_config())
-        if not block:
-            return request
-        # The manifest reflects volatile on-screen state, so ride the last human
-        # message instead of the system prompt — this keeps the cached system
-        # prefix byte-stable as the user navigates the app. Fall back to the
-        # system prompt only when there is no human message to carry it.
-        new_messages = append_to_last_human_message(request.messages, block)
-        if new_messages is not None:
-            return request.override(messages=new_messages)
-        return request.override(
-            system_message=append_to_system_message(request.system_message, "\n\n" + block)
-        )
+        return inject_embedded_context(request, _page_context_from_config(), _client_objects_from_config())
 
     def wrap_model_call(
         self,

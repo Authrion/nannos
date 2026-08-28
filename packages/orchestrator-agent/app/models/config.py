@@ -111,6 +111,11 @@ class GraphRuntimeContext:
     the `client_action` tool is registered and a <client_objects> section is
     injected into the system prompt."""
 
+    page_context: Optional[dict] = None
+    """The page the user is currently on in the embedding app ({key, label?,
+    description?, data?}), published on navigation and sent with every turn.
+    Rendered as a <current_page> section next to <client_objects>."""
+
     groups: list[str] = field(default_factory=list)
     """User's group memberships (Keycloak group paths).
     
@@ -254,6 +259,10 @@ class UserConfig(BaseModel):
     client_objects: Optional[list] = Field(
         default=None,
         description="Per-turn manifest of on-screen ontology objects from the embedding client (Embedded Nannos)",
+    )
+    page_context: Optional[dict] = Field(
+        default=None,
+        description="The page the user is currently on in the embedding client ({key, label?, description?, data?})",
     )
     sub_agent_config_hash: Optional[str] = Field(
         default=None,
@@ -429,6 +438,24 @@ class AgentSettings:
         "Never do the user's domain work yourself — not from your own knowledge and not with your own tools. "
         "Delegate it via 'task'.\n"
         "</how_you_act>\n"
+        "\n"
+        "<keep_the_user_informed>\n"
+        "Planning and delegating takes time, and until you answer the user sees only tool labels — "
+        "they cannot tell whether you understood them. Use the 'notify_user' tool to say so in your own words. "
+        "It shows one or two short sentences and the turn CONTINUES: it does not end the turn, does not ask "
+        "anything, and returns nothing you need.\n"
+        "- Call it ONLY if user made a request or asked you to do something. If user only says 'hello', do not call it.\n"
+        "- Call it ONCE at the start of any request that needs delegation or several steps: what you understood, "
+        "and what you will do first. Write it in the user's language.\n"
+        "- Emit that call in the SAME step as your first 'task' or tool call (both in one step, in parallel), so "
+        "the work does not wait on it.\n"
+        "- Call it again before a step that will take a while, and again when your plan changes — a sub-agent "
+        "failed, you switch to another one, the request turns out to be something else.\n"
+        "- Never put the answer in a note: the answer belongs in the structured response ONLY, and a note that "
+        "carries it shows the same text twice.\n"
+        "- Never ask a question in a note (nothing comes back). A question means task_state=input_required.\n"
+        "- Keep notes few and never repeat the same text. Skip them entirely for a request you can answer at once.\n"
+        "</keep_the_user_informed>\n"
         "\n"
         "<delegation_rules>\n"
         "You are primarily a planner and delegator, not a domain executor. Plan the work, then delegate it.\n"
@@ -611,7 +638,9 @@ class AgentSettings:
         "\n"
         "WORKFLOW:\n"
         "1. Analyze the user's request\n"
-        "2. Create a todo list of tasks\n"
+        "2. Create a todo list of tasks — and unless you can answer at once, call 'notify_user' with one short "
+        "sentence saying what you understood and what you will do first (same step as your first 'task' call; "
+        "it does NOT end the turn, and never carries the answer or a question)\n"
         "3. Delegate each task to a sub-agent using the 'task' tool\n"
         "4. Update todo status: in_progress → completed/failed\n"
         "5. Return final response with task_state: completed|working|input_required|failed\n"
@@ -645,7 +674,8 @@ class AgentSettings:
     # when PTC is off and the tools are natively bound.
     PTC_ORCHESTRATOR_GUIDANCE = (
         "\n\n<code_interpreter>\n"
-        "`eval` is how you DO things; `task` / `write_todos` / the response tool are how you STEER the run. "
+        "`eval` is how you DO things; `task` / `write_todos` / `notify_user` / the response tool are how you "
+        "STEER the run. "
         "Keep them separate:\n"
         "- Your working tools — the ones that perform an action and return a result (current time, file presigning, "
         "skill/playbook and console management, filesystem, and any enabled MCP tools) — are exposed as JavaScript "
@@ -653,7 +683,8 @@ class AgentSettings:
         "JavaScript in `eval` that calls it. Use `eval` ONLY to invoke these tools — never to compute or otherwise "
         "solve the user's domain task yourself.\n"
         "- Your control primitives are NOT in `eval`; call them directly as normal tools: `task` to delegate work to "
-        "a sub-agent, `write_todos` to record/update your plan, and the response tool to deliver the final answer. "
+        "a sub-agent, `write_todos` to record/update your plan, `notify_user` to tell the user mid-turn what you are "
+        "doing, and the response tool to deliver the final answer. "
         "These steer the run (they update state / dispatch / end the turn) and do nothing useful if called from "
         "inside `eval` — never wrap them in `tools.*`.\n"
         "Delegate all domain work via `task`.\n"

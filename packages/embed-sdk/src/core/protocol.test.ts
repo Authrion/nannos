@@ -52,6 +52,12 @@ describe('part shape normalization', () => {
 
   it('getFileInfo normalizes both file shapes', () => {
     expect(getFileInfo({ file: { uri: 'u', mimeType: 'm', name: 'n' } })).toEqual({ uri: 'u', mimeType: 'm', name: 'n' });
+    // Persisted user uploads: the python SDK's snake_case dump.
+    expect(getFileInfo({ kind: 'file', file: { uri: 'u', mime_type: 'image/png', name: 'n' } })).toEqual({
+      uri: 'u',
+      mimeType: 'image/png',
+      name: 'n',
+    });
     expect(getFileInfo({ url: 'u', mediaType: 'm', filename: 'n' })).toEqual({ uri: 'u', mimeType: 'm', name: 'n' });
     expect(getFileInfo({})).toBeNull();
   });
@@ -70,5 +76,20 @@ describe('part shape normalization', () => {
     expect(shouldDisplayMessageParts([{ text: '  ' }, { text: '' }])).toBe(false);
     expect(shouldDisplayMessageParts([{ text: 'hello' }])).toBe(true);
     expect(shouldDisplayMessageParts([])).toBe(false);
+  });
+});
+
+describe('getTaskState: protobuf int states (REST history rows)', () => {
+  it('maps the enum ints to the short wire names', () => {
+    expect(getTaskState(2)).toBe('working');
+    expect(getTaskState(3)).toBe('completed');
+    expect(getTaskState(6)).toBe('input-required');
+    expect(getTaskState(8)).toBe('auth-required');
+    expect(getTaskState({ state: 8 })).toBe('auth-required');
+  });
+
+  it('unknown ints and UNSPECIFIED stay unknown', () => {
+    expect(getTaskState(0)).toBe('unknown');
+    expect(getTaskState(99)).toBe('unknown');
   });
 });

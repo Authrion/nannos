@@ -1,6 +1,7 @@
 import type { ObjectRegistry } from './registry';
 import type { ApplyResult } from './types';
 import { clientActionDirective } from './schemas';
+import { sanitizeReadResult, sanitizeReadResultWithScreen } from './page-read';
 import { CLIENT_ACTION_EXT } from './extensions';
 
 export interface ClientActionDeps {
@@ -9,15 +10,29 @@ export interface ClientActionDeps {
   navigate?: (to: string) => void;
   /** Host-provided highlight hook (scroll-into-view / outline a field). */
   highlight?: (target: { type: string; id: string }, field?: string) => void;
-  /** Notified after an `apply` with which fields landed vs. were rejected, so the
-   *  host can surface "couldn't apply X". Absent → rejections are console.warn'd
-   *  (never silent). */
+  /** Notified after an `apply` that rejected AT LEAST ONE field (a clean apply
+   *  doesn't call it — the filled form is its own feedback), with which fields
+   *  landed vs. were rejected, so the host can surface "couldn't apply X".
+   *  Absent → rejections are console.warn'd (never silent).
+   *
+   *  This is the ONLY place a rejection becomes visible: there is no ack channel
+   *  back to the agent, so it reports the apply as done whatever happened here.
+   *  A host that wires nothing leaves the user with a part-filled form and no
+   *  indication of it. */
   onApplyResult?: (target: { type: string; id: string }, result: ApplyResult) => void;
+  /** Answers `read_current_page`: the raw "what does the user see" object (the
+   *  provider assembles it from the merged page context + registered readers).
+   *  Sanitized HERE (`sanitizeReadResult`) before anything leaves the browser. */
+  readCurrentPage?: () => unknown | Promise<unknown>;
+  /** The rendered page as a markdown outline within a budget (the DOM walk,
+   *  `snapshotScreenOutline`). When present, every read carries it under the
+   *  reserved `screen` key, sized to the budget the readers left. */
+  screenOutline?: (maxChars: number) => string;
 }
 
 export type ClientActionResult =
-  | { ok: true; applied?: string[]; rejected?: ApplyResult['rejected'] }
-  | { ok: false; reason: 'invalid' | 'unknown-target' };
+  | { ok: true; applied?: string[]; rejected?: ApplyResult['rejected']; content?: string }
+  | { ok: false; reason: 'invalid' | 'unknown-target' | 'unsupported' };
 
 /**
  * Sandboxed executor of `urn:nannos:a2a:client-action` directives. It runs ONLY
@@ -74,6 +89,57 @@ export async function executeClientAction(
       deps.navigate?.(directive.to);
       return { ok: true };
     }
+    case 'read_current_page': {
+      // The outline alone can answer — a host with no readers still has a screen.
+      if (!deps.readCurrentPage && !deps.screenOutline) return { ok: false, reason: 'unsupported' };
+      const raw = deps.readCurrentPage ? await deps.readCurrentPage() : {};
+      const content = deps.screenOutline
+        ? sanitizeReadResultWithScreen(raw, deps.screenOutline)
+        : sanitizeReadResult(raw);
+      return { ok: true, content };
+    }
+  }
+}
+
+/**
+ * Build a wire directive from the agent's RAW TOOL ARGS — the flat, snake_case
+ * shape the risk-gate approval card receives (`{ kind, target_type, target_id,
+ * values, field, to }`), not the nested `{ target: { type, id } }` the directive
+ * union uses.
+ *
+ * This is what lets ONE pause cover an approved `client_action`: the host runs
+ * the directive the moment the user approves the card and returns the outcome on
+ * the decision itself, instead of the agent resuming only to interrupt again for
+ * the result. It mirrors `_client_action_handler` in `client_action_tool.py`;
+ * `clientActionDirective` still validates the result, so a mismatch degrades to
+ * `null` (the caller then approves plainly and the old two-pause path runs).
+ */
+export function directiveFromToolArgs(args: unknown): unknown | null {
+  const a = args as Record<string, unknown> | null | undefined;
+  const kind = a?.kind;
+  if (typeof kind !== 'string') return null;
+  const targetType = a?.target_type;
+  const targetId = a?.target_id;
+  const target =
+    typeof targetType === 'string' && typeof targetId === 'string'
+      ? { type: targetType, id: targetId }
+      : null;
+
+  switch (kind) {
+    case 'apply':
+      if (!target) return null;
+      return { kind, target, values: a?.values ?? {} };
+    case 'highlight':
+      if (!target) return null;
+      return { kind, target, ...(typeof a?.field === 'string' && { field: a.field }) };
+    case 'navigate':
+      return typeof a?.to === 'string' ? { kind, to: a.to } : null;
+    case 'read_current_page':
+      return { kind };
+    default:
+      // An unknown kind is the agent's, not ours, to interpret: hand it back to
+      // the round trip rather than guessing a directive shape for it.
+      return null;
   }
 }
 

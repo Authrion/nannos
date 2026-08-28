@@ -71,7 +71,9 @@ from typing_extensions import NotRequired
 from agent_common.backends.attachments_store import ContextScopedAttachmentsBackend
 from agent_common.backends.indexing_store import IndexingStoreBackend
 from agent_common.backends.skills_store import SkillsStoreBackend
+from agent_common.core.client_action_tool import CLIENT_ACTION_TOOL_NAME
 from agent_common.core.model_factory import is_gemini_model
+from agent_common.core.notify_user_tool import NOTIFY_USER_TOOL_NAME
 from agent_common.core.ptc_discovery import (
     PTC_DESCRIBE_TOOL_NAME,
     PTC_SEARCH_TOOL_NAME,
@@ -298,6 +300,21 @@ _PTC_SANDBOX_TOOLS: frozenset[str] = frozenset({"execute"})
 #   - ``write_todos``: planning/UI tool whose effect is the work-plan stream.
 #   - ``FinalResponseSchema`` / ``SubAgentResponseSchema``: structured-response
 #     schema "tools" — not executable; selecting them terminates the turn.
+#   - ``client_action`` / ``notify_user``: both reach the USER, not a backend, and
+#     both do it through machinery the PTC bridge cannot provide. The bridge
+#     dispatches tools via ``asyncio.run_coroutine_threadsafe`` from a worker
+#     thread, which runs them in a FRESH context (the reason ptc_guard keeps its
+#     approval collector in a module dict rather than a ContextVar). So inside
+#     ``eval``: ``get_stream_writer()`` finds no writer, which kills
+#     ``notify_user`` and ``client_action``'s fire-and-forget kinds
+#     (navigate/highlight); and ``interrupt()`` cannot be raised cleanly, which
+#     kills the awaited round trip (``apply``/``read_current_page``) — the turn
+#     never parks, so the browser is never asked and never answers. Since every
+#     PTC-exposed tool is also STRIPPED from the model's bound list, exposing
+#     these made them unreachable by any working path: the model could only call
+#     them from inside ``eval``, where they always fail. Excluding them keeps
+#     them natively bound and running through ``ToolNode``, where both the stream
+#     writer and ``interrupt()`` work.
 # The PTC self tool (``eval``) is always auto-excluded by ``filter_tools_for_ptc``.
 _PTC_EXCLUDED_TOOL_NAMES: frozenset[str] = frozenset(
     {
@@ -305,6 +322,8 @@ _PTC_EXCLUDED_TOOL_NAMES: frozenset[str] = frozenset(
         "write_todos",
         "FinalResponseSchema",
         "SubAgentResponseSchema",
+        CLIENT_ACTION_TOOL_NAME,
+        NOTIFY_USER_TOOL_NAME,
     }
 )
 
@@ -1069,7 +1088,20 @@ class _PTCToleranceCodeInterpreterMiddleware(CodeInterpreterMiddleware):
                 # resume by interrupt id, so each interrupt() returns exactly its own
                 # decisions — no cross-eval bleed from LangGraph's multi-interrupt resume.
                 # Any count mismatch here is therefore a genuine bug, not a resume artefact.
-                decisions = interrupt(self._build_ptc_hitl_request(pending))["decisions"]
+                hitl_request = self._build_ptc_hitl_request(pending)
+                # Same plain-language summaries the normal HITL path stamps
+                # (see ConditionalHumanInTheLoopMiddleware._attach_summaries).
+                # Best-effort: on failure the client shows raw args.
+                from agent_common.core.tool_call_summarizer import attach_summaries
+
+                ptc_tools = self._ptc_tools_by_thread.get(thread_id) or ()
+                descriptions = {t.name: t.description or "" for t in ptc_tools}
+                await attach_summaries(
+                    hitl_request["action_requests"],
+                    language=getattr(context, "language", None) or "en",
+                    describe=lambda name: descriptions.get(name, ""),
+                )
+                decisions = interrupt(hitl_request)["decisions"]
                 if (n := len(decisions)) != (m := len(pending)):
                     msg = f"Number of PTC human decisions ({n}) does not match number of pending eval tool calls ({m})."
                     raise ValueError(msg)
