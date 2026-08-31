@@ -89,7 +89,18 @@ function mountThread(
   messages: NannosUIMessage[],
   devMode = false,
   send: UseNannosChatValue['send'] = () => {},
-  { layout = 'panel', isBusy = false }: { layout?: PanelLayout; isBusy?: boolean } = {},
+  {
+    layout = 'panel',
+    isBusy = false,
+    pending = [],
+    respond = async () => {},
+  }: {
+    layout?: PanelLayout;
+    isBusy?: boolean;
+    /** Open approvals — the thread renders the card at the first of them. */
+    pending?: Array<{ toolCallId: string; approvalId: string; toolName: string; input: Record<string, unknown> }>;
+    respond?: (approvalId: string, approved: boolean, reason?: string) => Promise<void>;
+  } = {},
 ) {
   vi.stubGlobal(
     'fetch',
@@ -102,6 +113,9 @@ function mountThread(
     hasOlderMessages: false,
     loadOlderMessages: async () => {},
     conversationId: 'conv-1',
+    // The thread reads the open interrupt to place the approval card and the
+    // pending pill. Empty by default: it then renders neither.
+    interrupt: { pending, reason: undefined, reviewConfigs: [], respond },
   } as unknown as UseNannosChatValue;
   const core = createNannos({}, () => new FakeSocket() as unknown as Socket);
   render(
@@ -272,6 +286,7 @@ describe('the authorization card', () => {
     document.querySelector('[data-slot="nannos-auth-action"]') as HTMLElement | null;
   const done = () => document.querySelector('[data-slot="nannos-auth-done"]') as HTMLElement | null;
   const reauthorize = () => document.querySelector('[data-slot="nannos-auth-retry"]');
+  const skip = () => document.querySelector('[data-slot="nannos-auth-skip"]') as HTMLElement | null;
 
   it('offers only the way out to the provider at first', () => {
     mountThread([authTurn()]);
@@ -297,10 +312,56 @@ describe('the authorization card', () => {
     fireEvent.click(authorize()!);
     fireEvent.click(done()!);
 
-    // Agent-facing text names the tool; the user sees the localized chip label.
+    // Agent-facing text names the tool; the user sees a localized receipt. The
+    // `receipt` display kind is what keeps that turn out of the thread as a
+    // user bubble or a context chip — the panel composed it, not the person.
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0]).toContain('gmail_send');
-    expect(send.mock.calls[0][1]).toEqual({ displayText: 'Authorization complete' });
+    expect(send.mock.calls[0][1]).toEqual({
+      displayText: 'Authorized gmail_send',
+      displayKind: 'receipt',
+      displayOutcome: 'authorized',
+      authorization: { decision: 'approved' },
+    });
+    expect(card()).toBeNull();
+  });
+
+  it('never names sandbox plumbing as the thing being authorized', () => {
+    // A `need-credentials` raised inside the sandbox is reported against `eval`.
+    // "Authorization needed for eval" / "Skipped authorizing eval" tells the
+    // user nothing true, so the receipt and the head say neither.
+    const turn = authTurn();
+    const part = (turn.parts as Array<Record<string, unknown>>).find(
+      (p) => p.type === 'data-auth-required',
+    )!;
+    part.data = { ...(part.data as Record<string, unknown>), tool: 'eval', service: 'eval' };
+    const send = vi.fn();
+    mountThread([turn], false, send);
+
+    expect(screen.getByText('Authorization needed')).toBeTruthy();
+    fireEvent.click(skip()!);
+    expect(send.mock.calls[0][1].displayText).toBe('Skipped the authorization');
+  });
+
+  it('answers the parked interrupt with an explicit refusal', () => {
+    // A refusal has nothing to say to the GATEWAY, but plenty to say to the
+    // agent: it is holding a blocked tool call and will otherwise keep pushing
+    // the same link. The decision rides a DataPart the middleware acts on, with
+    // agent-facing prose beside it for a client that never negotiated the
+    // extension.
+    const send = vi.fn();
+    mountThread([authTurn()], false, send);
+    fireEvent.click(skip()!);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toContain('not going to authorize');
+    expect(send.mock.calls[0][1]).toEqual({
+      displayText: 'Skipped authorizing gmail_send',
+      displayKind: 'receipt',
+      displayOutcome: 'skipped',
+      authorization: { decision: 'declined' },
+    });
+    // The receipt rides the turn that answer starts, so the card is done here.
     expect(card()).toBeNull();
   });
 });
@@ -529,9 +590,133 @@ describe('a turn interrupted by an approval', () => {
     expect(toolBox()).toBeNull();
   });
 
-  it('folds the acknowledgement into the step group on a page', () => {
+  it('folds the receipt into the step group, and counts it in the label', () => {
     mountThread([before, after], false, () => {}, { layout: 'page' });
-    // Two labels + the decision = one run of three machine lines.
+    // Two labels + the decision = one run of three machine lines. The decision
+    // is counted in the collapsed label so it does not vanish behind the
+    // chevron unannounced.
+    expect(screen.getByText('Worked through 3 steps · 1 approved')).toBeTruthy();
+  });
+
+  it('leaves the label alone for a group with no decisions in it', () => {
+    const plain: NannosUIMessage = { id: 'msg-0', role: 'assistant', parts: [ACTIVITY, ACTIVITY] };
+    mountThread([plain, after], false, () => {}, { layout: 'page' });
     expect(screen.getByText('Worked through 3 steps')).toBeTruthy();
+  });
+
+  it('says nothing about a client-action round trip the SDK answered itself', () => {
+    // `allow-edits` settles these to `output-available` without ever asking the
+    // user, so a receipt ("Approved client_action") and a count ("1 approved")
+    // both credit them with a decision they never made.
+    const roundTrip = {
+      type: 'dynamic-tool',
+      toolCallId: 'call-2',
+      toolName: 'client_action',
+      state: 'output-available',
+      input: { directive: { kind: 'read_current_page' }, _clientActionRequest: true },
+      output: { ok: true },
+    } as NannosUIMessage['parts'][number];
+    mountThread(
+      [{ ...before, parts: [ACTIVITY, roundTrip] } as NannosUIMessage, after],
+      false,
+      () => {},
+      { layout: 'page' },
+    );
+
+    expect(screen.queryByText(/Approved client_action/)).toBeNull();
+    expect(screen.getByText('Worked through 3 steps')).toBeTruthy();
+  });
+
+  it('renders a rejected call as a rejection, not an approval', () => {
+    const rejected = { ...(approved as Record<string, unknown>), state: 'output-denied' };
+    mountThread([{ ...before, parts: [ACTIVITY, rejected] } as NannosUIMessage, after]);
+    expect(screen.getByText('Rejected github_get_me')).toBeTruthy();
+  });
+});
+
+/**
+ * The card renders INLINE, at the part where the turn stopped — it used to dock
+ * above the composer, detached from the step that raised it. A batch is still
+ * one card, so several pending parts must not produce several heads.
+ */
+describe('a pending approval, inline', () => {
+  beforeEach(() => {
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
+  });
+
+  afterEach(cleanup);
+
+  function pendingPart(id: string, toolName: string): NannosUIMessage['parts'][number] {
+    return {
+      type: 'dynamic-tool',
+      toolCallId: id,
+      toolName,
+      state: 'approval-requested',
+      input: {},
+    } as NannosUIMessage['parts'][number];
+  }
+
+  const openApproval = (id: string, toolName: string) => ({
+    toolCallId: id,
+    approvalId: id,
+    toolName,
+    input: {},
+  });
+
+  const cards = () => document.querySelectorAll('[data-slot="nannos-approval-card"]');
+
+  it('renders the card where the turn stopped', () => {
+    mountThread(
+      [{ id: 'm', role: 'assistant', parts: [ACTIVITY, pendingPart('call-1', 'github_get_me')] }],
+      false,
+      () => {},
+      { pending: [openApproval('call-1', 'github_get_me')] },
+    );
+    expect(cards().length).toBe(1);
+    expect(screen.getByText('Approval needed for github_get_me')).toBeTruthy();
+  });
+
+  it('still renders the card in dev mode, beside the raw part', () => {
+    // Dev mode used to hide it, which was harmless while the card was docked in
+    // the panel and survived on its own. Inline, the card IS the only way to
+    // answer — hiding it left a dev session unable to decide anything.
+    mountThread(
+      [{ id: 'm', role: 'assistant', parts: [ACTIVITY, pendingPart('call-1', 'github_get_me')] }],
+      true,
+      () => {},
+      { pending: [openApproval('call-1', 'github_get_me')] },
+    );
+    expect(cards().length).toBe(1);
+    expect(document.querySelector('[data-slot="nannos-tool"]')).toBeTruthy();
+  });
+
+  it('renders nothing where no interrupt is open', () => {
+    mountThread([
+      { id: 'm', role: 'assistant', parts: [ACTIVITY, pendingPart('call-1', 'github_get_me')] },
+    ]);
+    expect(cards().length).toBe(0);
+  });
+
+  it('renders a batch as ONE card, counted rather than named', () => {
+    mountThread(
+      [
+        {
+          id: 'm',
+          role: 'assistant',
+          parts: [
+            ACTIVITY,
+            pendingPart('call-1', 'github_get_me'),
+            pendingPart('call-2', 'send_email'),
+          ],
+        },
+      ],
+      false,
+      () => {},
+      {
+        pending: [openApproval('call-1', 'github_get_me'), openApproval('call-2', 'send_email')],
+      },
+    );
+    expect(cards().length).toBe(1);
+    expect(screen.getByText('2 approvals needed')).toBeTruthy();
   });
 });

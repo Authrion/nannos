@@ -106,10 +106,23 @@ export function buildNewTurnPayload(args: {
   // Wire quirk kept from the old client: enableThinking crosses as a string.
   if (ctx.enableThinking !== undefined) metadata.enableThinking = String(ctx.enableThinking);
   if (ctx.thinkingLevel) metadata.thinkingLevel = ctx.thinkingLevel;
-  const displayLabel = userMessage.metadata?.display?.label;
-  if (displayLabel) metadata.injectedDisplayText = displayLabel;
+  // A panel-composed turn carries HOW it renders, not just its label: a receipt
+  // ("Authorized GitHub · asked Nannos to retry") reloaded as bare text came back
+  // through the context-chip path as "Context: Authorized GitHub", with the
+  // agent-facing prompt behind the chevron.
+  const display = userMessage.metadata?.display;
+  if (display?.label) {
+    metadata.injectedDisplayText = display.label;
+    metadata.injectedDisplayKind = display.kind;
+    if (display.outcome) metadata.injectedDisplayOutcome = display.outcome;
+  }
 
   const attachments = userMessage.metadata?.attachments;
+  // An answer to an `auth-required` prompt rides as a DataPart beside the text,
+  // the same way HITL decisions do. The text still goes (it is what the agent
+  // reads if the extension was never negotiated); the DataPart is what saves the
+  // middleware from having to infer a yes or a no from a sentence.
+  const authorization = userMessage.metadata?.authorization;
   return {
     id: messageId,
     conversationId,
@@ -118,6 +131,7 @@ export function buildNewTurnPayload(args: {
     metadata,
     contextId: conversationId,
     ...(attachments?.length && { fileAttachments: attachments }),
+    ...(authorization && { dataParts: [{ authorization }] }),
   };
 }
 

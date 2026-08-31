@@ -46,10 +46,19 @@ export type NannosDataParts = {
    *  (`notify_user`), not a machine label — the thread renders it as speech. */
   activity: { text: string; source?: string; kind?: 'note'; ts: number; wire?: string; wireId?: string };
   /** A tool needs the user's secondary authorization. The panel renders its OWN
-   *  localized prompt from `authUrl`/`tool`; `message` is the gateway's text,
-   *  addressed to the agent, kept only as a last-resort fallback and for dev
-   *  mode. Persisted. */
-  'auth-required': { authUrl?: string; tool?: string; message?: string; wire?: string; wireId?: string };
+   *  localized prompt from `authUrl`/`tool`/`service`; `message` is the gateway's
+   *  text, addressed to the agent, kept only as a last-resort fallback and for
+   *  dev mode. `service` (who the credential belongs to) arrives only from the
+   *  `in-task-auth` DataPart; `tool` (what needed it) from either that or the
+   *  status metadata. Persisted. */
+  'auth-required': {
+    authUrl?: string;
+    tool?: string;
+    service?: string;
+    message?: string;
+    wire?: string;
+    wireId?: string;
+  };
   /** Task status for the task panel. Transient. */
   task: { taskId?: string; state: string; progress?: number; title?: string };
   /** Proactive feedback prompt. Transient. */
@@ -60,7 +69,16 @@ export interface NannosMessageMetadata {
   /** DB id the backend injects mid-turn; used as the history dedupe key. */
   persistedMessageId?: string;
   /** Host-injected prompt rendered as a muted context chip instead of a user bubble. */
-  display?: { kind: 'context'; label: string };
+  /** How a user message renders when the panel, not the person, composed its
+   *  text. `context` is a host-injected chip; `receipt` is a decision the user
+   *  made in an interrupt card — the turn resumes the agent, but the thread must
+   *  not show it as something the user typed. */
+  display?: { kind: 'context' | 'receipt'; label: string; outcome?: 'authorized' | 'skipped' };
+  /** The user's answer to an `auth-required` prompt, sent as a DataPart so the
+   *  orchestrator's middleware acts on it instead of guessing from prose:
+   *  approved retries the blocked tool, declined tells the agent to stop asking.
+   *  Only meaningful while a turn is parked on that interrupt. */
+  authorization?: { decision: 'approved' | 'declined'; message?: string };
   /** Send-side file info (wire shape, incl. s3Url); `file` parts carry the render shape. */
   attachments?: Array<{ uri: string; mimeType: string; name: string; s3Url?: string }>;
   /** HITL envelope for the current interrupt: reason text + per-tool decision gating. */
