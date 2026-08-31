@@ -19,6 +19,7 @@ import type {
   ContextRecord,
 } from '../../storage/types.js';
 import { handleError, postMessage, finalizeStreamedTask, isInterruptedOrTerminated, isTerminatedState, isTurnDelivered } from '../../utils/taskResponseHandler.js';
+import { buildAuthRequiredWidget, readAuthRequired } from '../../utils/inTaskAuth.js';
 import { ThinkingStepsStreamer, type WorkPlanTodo } from '../../utils/thinkingStepsStreamer.js';
 import { FeedbackService } from '../../services/feedbackService.js';
 import _ from 'lodash';
@@ -943,6 +944,68 @@ export async function handleIncomingMessage(msg: NormalizedMessage, deps: Handle
                 // it would reintroduce the duplicate-message bug for HITL pauses.
                 responsePosted = true;
               }
+            }
+          }
+
+          // Handle the in-task authorization interrupt: A2A's own `auth-required`
+          // state, whose payload schema is the in-task-auth extension. The status
+          // TEXT is the MCP gateway addressing the AGENT ("You must tell the
+          // end-user to…") — the interrupt fires in middleware, before the model,
+          // so no LLM ever rewrites it. Posting it verbatim (what happened before)
+          // handed the user machine-to-machine prose. The card below is our own
+          // copy, built from the DataPart when the producer sent one and from
+          // metadata or the prose's URL when it did not.
+          if (statusEvent.status.state === 'auth-required' && !interruptWidgetPosted) {
+            const statusMeta = (statusEvent.metadata ?? statusEvent.status.message?.metadata) as
+              | Record<string, unknown>
+              | undefined;
+            const prompt = readAuthRequired(statusEvent.status.message?.parts, statusMeta);
+            logger.info(
+              { taskId: accumulatedTask.id, tool: prompt.tool, service: prompt.service, hasUrl: !!prompt.authUrl },
+              `Received in-task authorization interrupt`
+            );
+
+            // Both flags are set only AFTER the card is on screen. Setting them
+            // first (and letting a throw escape) is how the user ends up on a
+            // paused timeline with no card and no link: the flags make the code
+            // below skip finalize, so the status text — ugly, but the only other
+            // carrier of the URL — never posts either, and the kept in-flight
+            // record has the recovery loop deliver that same prose minutes later.
+            // A failed post therefore falls through to finalize deliberately.
+            try {
+              const authWidget = buildAuthRequiredWidget({
+                ...prompt,
+                taskId: accumulatedTask.id,
+                contextId: accumulatedTask.contextId || '',
+                channelId,
+                threadTs,
+                planMessageTs: streamer.planTs,
+                streamMessageTs: streamer.ts,
+              });
+
+              // PAUSE the streamed timeline (don't stop it): the turn resumes on
+              // the user's answer and continues the SAME widget. The auth-required
+              // task state keeps the finally cleanup from discarding it.
+              await streamer.pause('Awaiting your authorization');
+
+              await client.chat.postMessage({
+                channel: channelId,
+                thread_ts: threadTs,
+                text: 'Authorization needed',
+                blocks: authWidget,
+              });
+
+              interruptWidgetPosted = true;
+              // The prompt has been delivered, so the in-flight record's job is
+              // done (the resume re-enters via the IDs in the card's button
+              // payload — see inTaskAuthButton.ts). Leaving it would only let the
+              // recovery loop re-post the prompt minutes later.
+              responsePosted = true;
+            } catch (authErr) {
+              logger.error(
+                authErr,
+                `Failed to post the authorization card; falling through to the status text so the URL still reaches the user: ${authErr}`
+              );
             }
           }
 
