@@ -1,0 +1,43 @@
+# Weekly report on how far this fork has drifted from ringier-data/nannos,
+# with a separate warning when their Dockerfiles change — those edits have to
+# be carried over to our .local copies by hand.
+name: upstream-check
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare against upstream
+        run: |
+          git remote add upstream https://github.com/ringier-data/nannos.git
+          git fetch upstream main --quiet
+
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "### Behind upstream by $BEHIND commits" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$BEHIND" -eq 0 ]; then
+            echo 'In sync.' >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '#### New commits' >> $GITHUB_STEP_SUMMARY
+          git log --oneline HEAD..upstream/main | head -25 >> $GITHUB_STEP_SUMMARY
+
+          DF=$(git log --oneline HEAD..upstream/main -- \
+                 packages/orchestrator-agent/Dockerfile \
+                 packages/console-backend/Dockerfile)
+          if [ -n "$DF" ]; then
+            echo '' >> $GITHUB_STEP_SUMMARY
+            echo '#### Dockerfiles changed — refresh the .local copies' >> $GITHUB_STEP_SUMMARY
+            echo "$DF" >> $GITHUB_STEP_SUMMARY
+          fi

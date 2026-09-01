@@ -1,0 +1,6 @@
+# Env files are written on the server by the deploy workflow from repository
+# secrets; they have no business being in git.
+*.env
+!*.env.example
+*.key
+*.pem

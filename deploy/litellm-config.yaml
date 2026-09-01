@@ -1,0 +1,30 @@
+# LiteLLM gateway for the Rt3 stack — the single path for all Nannos LLM traffic.
+# Written for direct OpenAI; the upstream example (nannos/litellm-local-models.example.yaml)
+# targets Bedrock/Azure/Vertex and needs cloud credentials we do not have here.
+model_list:
+  # --- Chat ---
+  - model_name: gpt-5.6-luna
+    litellm_params:
+      model: openai/gpt-5.6-luna
+      api_key: os.environ/OPENAI_API_KEY
+      max_retries: 0
+  - model_name: gpt-5-mini
+    litellm_params:
+      model: openai/gpt-5-mini
+      api_key: os.environ/OPENAI_API_KEY
+      max_retries: 0
+
+  # --- Embeddings (document store semantic index) ---
+  - model_name: text-embedding-3-small
+    model_info:
+      mode: embedding
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+      max_retries: 0
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

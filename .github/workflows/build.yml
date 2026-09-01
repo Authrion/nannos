@@ -1,0 +1,75 @@
+# Builds the three Nannos images and pushes them to GHCR.
+# No secrets end up in the images — only code. Configuration is injected at
+# deploy time, so the same image runs in any environment.
+name: build
+
+on:
+  push:
+    branches: [main, deploy/aws]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nannos-orchestrator
+            context: packages/orchestrator-agent
+            file: packages/orchestrator-agent/Dockerfile.local
+            target: ''
+          - name: nannos-console-backend
+            context: packages/console-backend
+            file: packages/console-backend/Dockerfile.local
+            target: api
+          - name: nannos-console-frontend
+            context: packages/console-frontend
+            file: packages/console-frontend/Dockerfile
+            target: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR rejects any uppercase character in a repository name, and
+      # github.repository_owner keeps the org's original casing ("Authrion").
+      - name: Lowercase the registry namespace
+        id: ns
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          # Shared packages come in as named contexts. The same five the
+          # justfile passes: console-frontend resolves its dependencies from
+          # the root manifest and imports @nannos/embed-sdk as a workspace
+          # member, so it needs workspace-root and embed-sdk on top of the
+          # three the Python services use.
+          build-contexts: |
+            ringier-a2a-sdk=packages/ringier-a2a-sdk
+            agent-common=packages/agent-common
+            object-storage=packages/object-storage
+            embed-sdk=packages/embed-sdk
+            workspace-root=.
+          push: true
+          # The SHA tag is what makes a rollback cheap: re-run deploy with an
+          # earlier SHA and nothing has to be rebuilt.
+          tags: |
+            ghcr.io/${{ steps.ns.outputs.owner }}/${{ matrix.name }}:${{ github.sha }}
+            ghcr.io/${{ steps.ns.outputs.owner }}/${{ matrix.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

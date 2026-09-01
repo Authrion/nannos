@@ -1,0 +1,16 @@
+# The only service exposed to the internet. Obtains its Let's Encrypt
+# certificate on first start (the challenge arrives on port 80) and renews it
+# without anyone having to remember.
+{$PUBLIC_HOST} {
+	# Keycloak lives under a path so one domain and one certificate cover
+	# everything. KC_HTTP_RELATIVE_PATH in the compose file must match.
+	handle_path /auth/* {
+		reverse_proxy keycloak:8080
+	}
+
+	# Everything else is the SPA, whose own nginx forwards /api/ to
+	# console-backend.
+	handle {
+		reverse_proxy console-frontend:8081
+	}
+}

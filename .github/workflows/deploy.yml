@@ -1,0 +1,81 @@
+# Assembles the env files from repository secrets, ships them to the machine
+# and restarts the stack. Nothing is stored anywhere in between: the Actions
+# runner is disposable and goes away with its contents.
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+    branches: [main, deploy/aws]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Commit SHA or latest'
+        default: latest
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble configs and env files
+        run: |
+          mkdir -p out
+          cp deploy/docker-compose.prod.yml \
+             deploy/Caddyfile \
+             deploy/nginx.conf \
+             deploy/litellm-config.yaml \
+             deploy/realm-export.json \
+             out/
+
+          cat > out/.env <<ENVEOF
+          PUBLIC_HOST=${{ secrets.PUBLIC_HOST }}
+          TAG=${{ inputs.tag || github.event.workflow_run.head_sha || 'latest' }}
+          KEYCLOAK_ADMIN_PASSWORD=${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}
+          KC_DB_HOST=${{ secrets.KC_DB_HOST }}
+          KC_DB_NAME=${{ secrets.KC_DB_NAME }}
+          KC_DB_USER=${{ secrets.KC_DB_USER }}
+          KC_DB_PASSWORD=${{ secrets.KC_DB_PASSWORD }}
+          ENVEOF
+
+          # printf rather than echo: echo's handling of backslashes varies
+          # between shells, which would mangle a password containing one.
+          printf '%s\n' "${{ secrets.ORCHESTRATOR_ENV }}"    > out/orchestrator.env
+          printf '%s\n' "${{ secrets.CONSOLE_BACKEND_ENV }}" > out/console-backend.env
+          printf '%s\n' "${{ secrets.LITELLM_ENV }}"         > out/litellm.env
+
+          chmod 600 out/*.env out/.env
+
+      - name: Copy to the machine
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ubuntu
+          key: ${{ secrets.SSH_KEY }}
+          source: "out/*"
+          target: /opt/nannos
+          strip_components: 1
+          overwrite: true
+
+      - name: Restart the stack
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ubuntu
+          key: ${{ secrets.SSH_KEY }}
+          command_timeout: 15m
+          script: |
+            set -e
+            cd /opt/nannos
+            echo "${{ secrets.GITHUB_TOKEN }}" \
+              | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            docker image prune -f
+            echo '--- state ---'
+            docker compose -f docker-compose.prod.yml ps
