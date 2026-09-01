@@ -3,10 +3,9 @@
 # deploy time, so the same image runs in any environment.
 name: build
 
+# Manual only. Pick the branch in the Run workflow dialog; the images are
+# tagged with that branch's commit SHA plus :latest.
 on:
-  push:
-    branches: [main, deploy/aws]
-    paths-ignore: ['**.md']
   workflow_dispatch:
 
 jobs:

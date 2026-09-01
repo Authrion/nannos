@@ -1,25 +1,24 @@
-# Assembles the env files from repository secrets, ships them to the machine
-# and restarts the stack. Nothing is stored anywhere in between: the Actions
-# runner is disposable and goes away with its contents.
 name: deploy
 
+# Manual only. Ships the config and env files to the machine and restarts the
+# stack. Nothing is stored in between: the runner is disposable and goes away
+# with its contents.
 on:
-  workflow_run:
-    workflows: [build]
-    types: [completed]
-    branches: [main, deploy/aws]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Commit SHA or latest'
+        description: 'Image tag: latest, or a commit SHA to roll back to'
         default: latest
+        required: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: read
+      # The images stay private in GHCR, so the token the machine logs in with
+      # needs pull rights.
+      packages: read
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +34,7 @@ jobs:
 
           cat > out/.env <<ENVEOF
           PUBLIC_HOST=${{ secrets.PUBLIC_HOST }}
-          TAG=${{ inputs.tag || github.event.workflow_run.head_sha || 'latest' }}
+          TAG=${{ inputs.tag }}
           KEYCLOAK_ADMIN_PASSWORD=${{ secrets.KEYCLOAK_ADMIN_PASSWORD }}
           KC_DB_HOST=${{ secrets.KC_DB_HOST }}
           KC_DB_NAME=${{ secrets.KC_DB_NAME }}
