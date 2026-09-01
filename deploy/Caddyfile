@@ -2,6 +2,12 @@
 # certificate on first start (the challenge arrives on port 80) and renews it
 # without anyone having to remember.
 {$PUBLIC_HOST} {
+	# Caddy strips Accept-Encoding from proxied requests so it can act on the
+	# body, and it does not re-compress on the way out unless told to. Without
+	# this the SPA bundle went over the wire uncompressed: 4.7 MB and ~6.8s,
+	# against 1.6 MB when nginx's own gzip is allowed to apply.
+	encode zstd gzip
+
 	# Keycloak lives under a path so one domain and one certificate cover
 	# everything. KC_HTTP_RELATIVE_PATH in the compose file must match.
 	# "handle", not "handle_path": Keycloak serves under /auth itself, so the
