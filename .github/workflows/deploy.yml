@@ -48,7 +48,6 @@ jobs:
           printf '%s\n' "${{ secrets.CONSOLE_BACKEND_ENV }}" > out/console-backend.env
           printf '%s\n' "${{ secrets.LITELLM_ENV }}"         > out/litellm.env
 
-          chmod 600 out/*.env out/.env
 
       - name: Copy to the machine
         uses: appleboy/scp-action@v0.1.7
@@ -71,6 +70,9 @@ jobs:
           script: |
             set -e
             cd /opt/nannos
+            # Tightened here rather than before the copy: the scp action runs
+            # in its own container as a different user and cannot read 600.
+            chmod 600 .env ./*.env
             echo "${{ secrets.GITHUB_TOKEN }}" \
               | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             docker compose -f docker-compose.prod.yml pull
