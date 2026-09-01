@@ -53,6 +53,14 @@ services:
     restart: unless-stopped
     env_file:
       - ./orchestrator.env
+    networks:
+      default:
+        aliases:
+          # The console picks http:// or https:// for the agent card by looking
+          # for "localhost" in ORCHESTRATOR_BASE_DOMAIN — there is no separate
+          # scheme setting. Nothing terminates TLS inside the compose network,
+          # so an alias carrying that substring keeps the call on plain http.
+          - orchestrator-localhost
     volumes:
       - orchestrator-storage:/data/storage
 
