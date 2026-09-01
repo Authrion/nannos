@@ -37,7 +37,8 @@
 - [x] Файлы в репозитории
 - [x] Секреты в GitHub
 - [x] Первая сборка
-- [ ] Первый деплой
+- [x] Первый деплой
+- [x] Миграции консоли применены (83 шт., схема `console`)
 - [ ] Вход в UI работает
 - [ ] Чат отвечает
 
@@ -568,6 +569,19 @@ git show --stat HEAD | grep -i env
 `-----BEGIN OPENSSH PRIVATE KEY-----` и заканчиваться `-----END...` с переводом
 строки. Потерянная последняя строка даёт `invalid format`.
 
+> **Секрет заменяется целиком, не построчно.** GitHub не умеет править отдельную
+> строку: сохранение перезаписывает всё содержимое. Меняете один пароль — вставляйте
+> заново весь блок. Урезанный секрет ломает сервис молча: без `POSTGRES_HOST`
+> контейнер берёт дефолт образа `127.0.0.1` и уходит в цикл рестартов.
+>
+> Плейсхолдеры вида `<строка 164 realm-export.json>` подставляйте реальными
+> значениями. Такая строка попадает в конфиг как есть и даёт `unauthorized_client`.
+>
+> Проверить, что секрет доехал целиком:
+> ```bash
+> ssh ... 'cd /opt/nannos && wc -l *.env'   # ждём 24 и 30 строк
+> ```
+
 ### ORCHESTRATOR_ENV
 
 ```
@@ -743,6 +757,10 @@ docker compose -f docker-compose.prod.yml logs --tail 40 caddy
 | `relation "users" already exists` | Роль названа не как схема — миграции ушли в `public` |
 | `relation "migrations" already exists` | То же самое: rambler нашёл таблицу Elysco |
 | `Illegal header value b'Bearer '` | Нет `LITELLM_MASTER_KEY` в `CONSOLE_BACKEND_ENV` |
+| `Database not ready`, хост `127.0.0.1` | В секрете нет `POSTGRES_HOST` — образ взял свой дефолт |
+| 404 на `/auth/realms/...` | В Caddyfile `handle_path` вместо `handle` — префикс срезается |
+| 502 на `/api/` от nginx | Бэкенд перезапускался и сменил IP, nginx держит старый |
+| `unauthorized_client` при старте | `OIDC_CLIENT_SECRET` не совпадает с `realm-export.json` |
 | `is not an accepted origin` | `ORCHESTRATOR_ENVIRONMENT` не равен `local` |
 | `Invalid token: missing subject` | В realm клиентам не назначен scope `basic` |
 | `invalid_token` при входе | `OIDC_ISSUER` не совпадает посимвольно |
