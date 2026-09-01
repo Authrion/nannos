@@ -4,7 +4,9 @@
 {$PUBLIC_HOST} {
 	# Keycloak lives under a path so one domain and one certificate cover
 	# everything. KC_HTTP_RELATIVE_PATH in the compose file must match.
-	handle_path /auth/* {
+	# "handle", not "handle_path": Keycloak serves under /auth itself, so the
+	# prefix has to reach it intact. Stripping it here gives a 404 on every realm.
+	handle /auth/* {
 		reverse_proxy keycloak:8080
 	}
 
