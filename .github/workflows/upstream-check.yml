@@ -1,6 +1,6 @@
-# Раз в неделю сообщает, насколько форк отстал от ringier-data/nannos,
-# и отдельно предупреждает об изменениях в их Dockerfile — их правки
-# приходится вручную переносить в наши копии .local.
+# Weekly report on how far this fork has drifted from ringier-data/nannos,
+# with a separate warning when their Dockerfiles change — those edits have to
+# be carried over to our .local copies by hand.
 name: upstream-check
 
 on:
@@ -16,21 +16,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Сравнить с апстримом
+      - name: Compare against upstream
         run: |
           git remote add upstream https://github.com/ringier-data/nannos.git
           git fetch upstream main --quiet
 
           BEHIND=$(git rev-list --count HEAD..upstream/main)
-          echo "### Отставание от апстрима: $BEHIND коммитов" >> $GITHUB_STEP_SUMMARY
+          echo "### Behind upstream by $BEHIND commits" >> $GITHUB_STEP_SUMMARY
 
           if [ "$BEHIND" -eq 0 ]; then
-            echo 'Всё синхронно.' >> $GITHUB_STEP_SUMMARY
+            echo 'In sync.' >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
 
           echo '' >> $GITHUB_STEP_SUMMARY
-          echo '#### Новые коммиты' >> $GITHUB_STEP_SUMMARY
+          echo '#### New commits' >> $GITHUB_STEP_SUMMARY
           git log --oneline HEAD..upstream/main | head -25 >> $GITHUB_STEP_SUMMARY
 
           DF=$(git log --oneline HEAD..upstream/main -- \
@@ -38,6 +38,6 @@ jobs:
                  packages/console-backend/Dockerfile)
           if [ -n "$DF" ]; then
             echo '' >> $GITHUB_STEP_SUMMARY
-            echo '#### Изменились Dockerfile — обновите копии .local' >> $GITHUB_STEP_SUMMARY
+            echo '#### Dockerfiles changed — refresh the .local copies' >> $GITHUB_STEP_SUMMARY
             echo "$DF" >> $GITHUB_STEP_SUMMARY
           fi

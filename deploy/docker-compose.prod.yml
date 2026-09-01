@@ -1,8 +1,8 @@
-# Серверный вариант стека Nannos. Образы берутся готовыми из GHCR — сборка
-# идёт в GitHub Actions, машина на неё ресурсов не тратит.
+# Server-side Nannos stack. Images are pulled ready-built from GHCR, so the
+# machine never spends CPU or memory on a build.
 #
-# Файлы окружения (*.env) на сервер кладёт workflow deploy из секретов
-# репозитория; в git их нет.
+# The *.env files are written by the deploy workflow from repository secrets;
+# they are never committed.
 
 name: nannos
 
@@ -29,8 +29,9 @@ services:
     container_name: nannos-console-frontend
     restart: unless-stopped
     volumes:
-      # Свой конфиг вместо того, что в образе: добавляет проксирование /api/
-      # на console-backend и подменяет заголовок Origin на разрешённый.
+      # Replaces the config baked into the image: adds the /api/ proxy to
+      # console-backend and rewrites the Origin header to one the backend
+      # accepts.
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
       - console-backend
@@ -41,8 +42,8 @@ services:
     restart: unless-stopped
     env_file:
       - ./console-backend.env
-    # RAMBLER_SSLMODE не переопределяем: в образе стоит require, и для Neon
-    # это как раз верно — база принимает только TLS.
+    # RAMBLER_SSLMODE stays at the image default of "require": Neon accepts
+    # TLS connections only.
     volumes:
       - console-storage:/data/storage
 
@@ -63,23 +64,24 @@ services:
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
-      # Публичный адрес: он попадает в поле iss каждого токена, и оба сервиса
-      # сверяют его посимвольно. Должен совпадать с OIDC_ISSUER в env-файлах.
+      # This URL is baked into the "iss" claim of every token and both
+      # services compare it character by character, so it has to match
+      # OIDC_ISSUER in the env files exactly.
       KC_HOSTNAME: https://${PUBLIC_HOST}/auth
       KC_HTTP_RELATIVE_PATH: /auth
       KC_PROXY_HEADERS: xforwarded
       KC_HTTP_ENABLED: "true"
       KC_HEALTH_ENABLED: "true"
-      # Своя схема в общей базе: без внешнего хранилища пользователи и клиенты
-      # пропадут при первом же пересоздании контейнера.
+      # Its own schema in the shared database. Without external storage every
+      # user and client disappears the first time the container is recreated.
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://${KC_DB_HOST}/${KC_DB_NAME}?sslmode=require
       KC_DB_USERNAME: ${KC_DB_USER}
       KC_DB_PASSWORD: ${KC_DB_PASSWORD}
       KC_DB_SCHEMA: keycloak
     volumes:
-      # Импортируется только при первом старте с пустой схемой; дальше
-      # настройки меняются через админку Keycloak.
+      # Imported only on the first start against an empty schema; after that
+      # the admin console is the place to change things.
       - ./realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
 
   litellm:

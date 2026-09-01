@@ -1,5 +1,6 @@
-# Собирает три образа Nannos и кладёт их в GitHub Container Registry.
-# Секретов в образах нет — только код; настройки приезжают на этапе деплоя.
+# Builds the three Nannos images and pushes them to GHCR.
+# No secrets end up in the images — only code. Configuration is injected at
+# deploy time, so the same image runs in any environment.
 name: build
 
 on:
@@ -41,23 +42,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Собрать и опубликовать ${{ matrix.name }}
+      # GHCR rejects any uppercase character in a repository name, and
+      # github.repository_owner keeps the org's original casing ("Authrion").
+      - name: Lowercase the registry namespace
+        id: ns
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.name }}
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
           target: ${{ matrix.target }}
-          # Общие пакеты подключаются как именованные контексты — так же,
-          # как в локальном docker-compose.yml.
+          # Shared packages come in as named contexts, mirroring the local
+          # docker-compose.yml.
           build-contexts: |
             ringier-a2a-sdk=packages/ringier-a2a-sdk
             agent-common=packages/agent-common
             object-storage=packages/object-storage
           push: true
-          # Тег по SHA нужен для отката: запустить deploy с прежним SHA
-          # и пересборка не потребуется.
+          # The SHA tag is what makes a rollback cheap: re-run deploy with an
+          # earlier SHA and nothing has to be rebuilt.
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest
+            ghcr.io/${{ steps.ns.outputs.owner }}/${{ matrix.name }}:${{ github.sha }}
+            ghcr.io/${{ steps.ns.outputs.owner }}/${{ matrix.name }}:latest
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
