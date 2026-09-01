@@ -625,6 +625,12 @@ SUBAGENT_STREAM_STALL_TIMEOUT_SECONDS=60
 # и обмен токена падает на каждом сообщении с "Audience not found".
 MCP_GATEWAY_URL=
 MCP_GATEWAY_CLIENT_ID=gatana
+
+# Тестовый шлюз Gatana подключён в обход MCP_GATEWAY_URL: тот путь меняет
+# токен пользователя на токен аудитории gatana, а шлюз держит свой сервер
+# авторизации, где grant token-exchange не поддерживается. Прямое
+# подключение со статическим ключом в заголовке работает (177 инструментов).
+MCP_DIRECT_SERVERS=[{"slug":"gatana","url":"https://rt3-tst.gatana.ai/mcp","headers":{"Authorization":"Bearer ВАШ_КЛЮЧ"}}]
 ```
 
 ### CONSOLE_BACKEND_ENV
@@ -802,6 +808,7 @@ docker compose -f docker-compose.prod.yml logs --tail 40 caddy
 | `Missing Authorization header` | `AGENT_BASE_URL` и `ORCHESTRATOR_BASE_DOMAIN` указывают на разные имена |
 | `permission denied for table tasks` | Таблицы нет в схеме сервиса — `search_path` ушёл дальше и нашёл чужую в `public` |
 | `Failed to load MCP tools` / `Audience not found` | Не задан `MCP_GATEWAY_URL=` — код взял боевой адрес Ringier |
+| `MCP_DIRECT_SERVERS is not valid JSON` | Значение должно быть массивом в одну строку, без переносов |
 | `is not an accepted origin` | `ORCHESTRATOR_ENVIRONMENT` не равен `local` |
 | `Invalid token: missing subject` | В realm клиентам не назначен scope `basic` |
 | `invalid_token` при входе | `OIDC_ISSUER` не совпадает посимвольно |
@@ -833,7 +840,7 @@ SELECT current_user, current_schema, setting AS search_path
 
 | Что | Почему |
 |---|---|
-| Инструменты MCP | `gatana` — боевой шлюз Ringier, у нас его нет. Отключается пустым `MCP_GATEWAY_URL=` |
+| Инструменты MCP через `MCP_GATEWAY_URL` | Путь требует token-exchange, которого нет у тестового шлюза. Подключается через `MCP_DIRECT_SERVERS` |
 | Голосовой агент | Заглушка `placeholder-voice-agent` из сидовых данных, отдельный сервис не разворачивается |
 | Семантический поиск | Заработает после назначения модели для роли embedding |
 
