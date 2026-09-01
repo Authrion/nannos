@@ -771,6 +771,7 @@ docker compose -f docker-compose.prod.yml logs --tail 40 caddy
 | `unauthorized_client` при старте | `OIDC_CLIENT_SECRET` не совпадает с `realm-export.json` |
 | `Invalid parameter: redirect_uri` | `ENVIRONMENT=local` — прокси-заголовки не читаются, адрес строится как `http://` |
 | `CSRF Warning! State not equal` | Старая cookie в браузере. Смена `local`→`prod` добавила флаг `secure`, и браузер держит две cookie `session` под одним именем. Очистить данные сайта |
+| `Invalid redirect uri` при выходе | Отдельный список `post.logout.redirect.uris`. Значение `+` наследует его из `redirectUris` |
 | `is not an accepted origin` | `ORCHESTRATOR_ENVIRONMENT` не равен `local` |
 | `Invalid token: missing subject` | В realm клиентам не назначен scope `basic` |
 | `invalid_token` при входе | `OIDC_ISSUER` не совпадает посимвольно |

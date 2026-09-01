@@ -55,7 +55,7 @@
       "fullScopeAllowed": true,
       "attributes": {
         "pkce.code.challenge.method": "S256",
-        "post.logout.redirect.uris": "http://localhost:5173/*##http://localhost:5001/*",
+        "post.logout.redirect.uris": "+",
         "use.refresh.tokens": "true",
         "standard.token.exchange.enabled": "true"
       },
