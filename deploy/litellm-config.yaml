@@ -13,6 +13,18 @@ model_list:
       model: openai/gpt-5-mini
       api_key: os.environ/OPENAI_API_KEY
       max_retries: 0
+  # Measured against gpt-5-mini on this stack: 0.6s vs 1.5s for the same
+  # one-line prompt. Every agent turn pays that difference several times over.
+  - model_name: gpt-5.4-mini
+    litellm_params:
+      model: openai/gpt-5.4-mini
+      api_key: os.environ/OPENAI_API_KEY
+      max_retries: 0
+  - model_name: gpt-5.4-nano
+    litellm_params:
+      model: openai/gpt-5.4-nano
+      api_key: os.environ/OPENAI_API_KEY
+      max_retries: 0
 
   # --- Embeddings (document store semantic index) ---
   - model_name: text-embedding-3-small
