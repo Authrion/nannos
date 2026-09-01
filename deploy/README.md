@@ -242,6 +242,12 @@ END $$;
 Миграция выполняет `CREATE INDEX IF NOT EXISTS`, а это требует владения таблицей.
 Без передачи получите `must be owner of table store`.
 
+> **Роль защищает не от всего.** `search_path` равен `"$user", public`: если таблицы
+> нет в своей схеме, Postgres пойдёт искать её в `public`. Часть таблиц оркестратор
+> создаёт сам при старте (`tasks`, `store`, checkpoint-таблицы) — и если первый
+> запуск прошёл под общей учёткой, они остались в `public`, а роль потом получает
+> на них `permission denied`. Лечится созданием таблицы в своей схеме.
+
 **Проверка.** Подключитесь под ролью `console` и создайте таблицу без указания схемы:
 
 ```sql
@@ -788,6 +794,7 @@ docker compose -f docker-compose.prod.yml logs --tail 40 caddy
 | `Invalid redirect uri` при выходе | Отдельный список `post.logout.redirect.uris`. Значение `+` наследует его из `redirectUris` |
 | `SSL: WRONG_VERSION_NUMBER` | Консоль пошла к оркестратору по https. В адресе нет `localhost` — нужен алиас |
 | `Missing Authorization header` | `AGENT_BASE_URL` и `ORCHESTRATOR_BASE_DOMAIN` указывают на разные имена |
+| `permission denied for table tasks` | Таблицы нет в схеме сервиса — `search_path` ушёл дальше и нашёл чужую в `public` |
 | `is not an accepted origin` | `ORCHESTRATOR_ENVIRONMENT` не равен `local` |
 | `Invalid token: missing subject` | В realm клиентам не назначен scope `basic` |
 | `invalid_token` при входе | `OIDC_ISSUER` не совпадает посимвольно |
