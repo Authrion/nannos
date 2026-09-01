@@ -39,6 +39,7 @@
 - [x] Первая сборка
 - [x] Первый деплой
 - [x] Миграции консоли применены (83 шт., схема `console`)
+- [x] Форма входа Keycloak открывается (`redirect_uri` принят)
 - [ ] Вход в UI работает
 - [ ] Чат отвечает
 
@@ -633,7 +634,9 @@ OIDC_CLIENT_SECRET=kc-secret-agent-console
 
 ORCHESTRATOR_CLIENT_ID=orchestrator
 ORCHESTRATOR_BASE_DOMAIN=orchestrator:10001
-ORCHESTRATOR_ENVIRONMENT=local
+ORCHESTRATOR_ENVIRONMENT=prod
+ENVIRONMENT=prod
+BASE_DOMAIN=13-48-218-238.sslip.io
 
 LLM_GATEWAY_URL=http://litellm:4000
 LLM_GATEWAY_API_KEY=sk-мастер-ключ
@@ -652,9 +655,12 @@ LOG_MODE=JSON
 > Консоль читает первую, оркестратор вторую. Без первой получите
 > `Illegal header value b'Bearer '` и пустой список моделей.
 >
-> `ORCHESTRATOR_ENVIRONMENT=local` остаётся `local` даже на проде. Список разрешённых
-> источников для Socket.IO захардкожен в `app.py`, а наш nginx подменяет `Origin` под
-> ветку `local`. При другом значении соединение будет отвергнуто.
+> `ORCHESTRATOR_ENVIRONMENT=prod`, и вместе с ним обязательно `BASE_DOMAIN` — в не-local
+> режиме `app.py` читает его напрямую через `os.environ`, без него старт падает.
+> Локально мы держали `local` ради списка CORS для Socket.IO, но то же значение
+> отключает `ProxyHeadersMiddleware`: `request.url_for` тогда строит `http://`, и
+> Keycloak отвечает `Invalid parameter: redirect_uri`. На `prod` список CORS
+> собирается из `BASE_DOMAIN`, так что обходной путь не нужен вовсе.
 >
 > `DOCSTORE_*` смотрит в схему оркестратора, поэтому там роль `nannos`, а не `console`.
 > Права на чтение выдаёт `GRANT SELECT ON ALL TABLES IN SCHEMA nannos TO console`
@@ -761,6 +767,7 @@ docker compose -f docker-compose.prod.yml logs --tail 40 caddy
 | 404 на `/auth/realms/...` | В Caddyfile `handle_path` вместо `handle` — префикс срезается |
 | 502 на `/api/` от nginx | Бэкенд перезапускался и сменил IP, nginx держит старый |
 | `unauthorized_client` при старте | `OIDC_CLIENT_SECRET` не совпадает с `realm-export.json` |
+| `Invalid parameter: redirect_uri` | `ENVIRONMENT=local` — прокси-заголовки не читаются, адрес строится как `http://` |
 | `is not an accepted origin` | `ORCHESTRATOR_ENVIRONMENT` не равен `local` |
 | `Invalid token: missing subject` | В realm клиентам не назначен scope `basic` |
 | `invalid_token` при входе | `OIDC_ISSUER` не совпадает посимвольно |
