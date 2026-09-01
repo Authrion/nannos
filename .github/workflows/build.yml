@@ -54,12 +54,17 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
           target: ${{ matrix.target }}
-          # Shared packages come in as named contexts, mirroring the local
-          # docker-compose.yml.
+          # Shared packages come in as named contexts. The same five the
+          # justfile passes: console-frontend resolves its dependencies from
+          # the root manifest and imports @nannos/embed-sdk as a workspace
+          # member, so it needs workspace-root and embed-sdk on top of the
+          # three the Python services use.
           build-contexts: |
             ringier-a2a-sdk=packages/ringier-a2a-sdk
             agent-common=packages/agent-common
             object-storage=packages/object-storage
+            embed-sdk=packages/embed-sdk
+            workspace-root=.
           push: true
           # The SHA tag is what makes a rollback cheap: re-run deploy with an
           # earlier SHA and nothing has to be rebuilt.
