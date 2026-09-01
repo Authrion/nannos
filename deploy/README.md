@@ -267,6 +267,7 @@ SELECT extname, nspname FROM pg_extension e
 ```bash
 echo "роль console:           $(openssl rand -hex 16)"
 echo "роль nannos:            $(openssl rand -hex 16)"
+echo "SECRET_KEY консоли:     $(openssl rand -hex 32)"
 echo "litellm master:         sk-$(openssl rand -hex 24)"
 echo "keycloak admin:         $(openssl rand -base64 18)"
 echo "kc-secret orchestrator: $(openssl rand -hex 32)"
@@ -649,6 +650,11 @@ LOCAL_STORAGE_PATH=/data/storage
 API_PORT=5001
 LOG_LEVEL=INFO
 LOG_MODE=JSON
+
+# Подписывает сессионные cookie. Без него берётся встроенное
+# "change-me-in-production", то есть подпись предсказуема.
+# Смена значения разлогинивает всех.
+SECRET_KEY=сгенерировать-openssl-rand-hex-32
 ```
 
 > **Две ловушки, проверенные на практике.**
