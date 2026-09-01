@@ -1,0 +1,99 @@
+# Серверный вариант стека Nannos. Образы берутся готовыми из GHCR — сборка
+# идёт в GitHub Actions, машина на неё ресурсов не тратит.
+#
+# Файлы окружения (*.env) на сервер кладёт workflow deploy из секретов
+# репозитория; в git их нет.
+
+name: nannos
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: nannos-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}
+    depends_on:
+      - console-frontend
+      - keycloak
+
+  console-frontend:
+    image: ghcr.io/authrion/nannos-console-frontend:${TAG:-latest}
+    container_name: nannos-console-frontend
+    restart: unless-stopped
+    volumes:
+      # Свой конфиг вместо того, что в образе: добавляет проксирование /api/
+      # на console-backend и подменяет заголовок Origin на разрешённый.
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - console-backend
+
+  console-backend:
+    image: ghcr.io/authrion/nannos-console-backend:${TAG:-latest}
+    container_name: nannos-console-backend
+    restart: unless-stopped
+    env_file:
+      - ./console-backend.env
+    # RAMBLER_SSLMODE не переопределяем: в образе стоит require, и для Neon
+    # это как раз верно — база принимает только TLS.
+    volumes:
+      - console-storage:/data/storage
+
+  orchestrator:
+    image: ghcr.io/authrion/nannos-orchestrator:${TAG:-latest}
+    container_name: nannos-orchestrator
+    restart: unless-stopped
+    env_file:
+      - ./orchestrator.env
+    volumes:
+      - orchestrator-storage:/data/storage
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.5.5
+    container_name: nannos-keycloak
+    restart: unless-stopped
+    command: start --optimized --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      # Публичный адрес: он попадает в поле iss каждого токена, и оба сервиса
+      # сверяют его посимвольно. Должен совпадать с OIDC_ISSUER в env-файлах.
+      KC_HOSTNAME: https://${PUBLIC_HOST}/auth
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      # Своя схема в общей базе: без внешнего хранилища пользователи и клиенты
+      # пропадут при первом же пересоздании контейнера.
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://${KC_DB_HOST}/${KC_DB_NAME}?sslmode=require
+      KC_DB_USERNAME: ${KC_DB_USER}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      KC_DB_SCHEMA: keycloak
+    volumes:
+      # Импортируется только при первом старте с пустой схемой; дальше
+      # настройки меняются через админку Keycloak.
+      - ./realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: nannos-litellm
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    env_file:
+      - ./litellm.env
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+
+volumes:
+  caddy-data:
+  caddy-config:
+  console-storage:
+  orchestrator-storage:

@@ -1,0 +1,14 @@
+# Единственный сервис, смотрящий наружу. Сам получает сертификат Let's Encrypt
+# (проверка идёт по порту 80) и продлевает его без участия человека.
+{$PUBLIC_HOST} {
+	# Keycloak живёт на своём пути, чтобы обойтись одним доменом и одним
+	# сертификатом. KC_HTTP_RELATIVE_PATH=/auth в compose должен совпадать.
+	handle_path /auth/* {
+		reverse_proxy keycloak:8080
+	}
+
+	# Всё остальное — SPA. Её nginx сам проксирует /api/ на console-backend.
+	handle {
+		reverse_proxy console-frontend:8081
+	}
+}
