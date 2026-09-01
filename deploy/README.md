@@ -3,8 +3,8 @@
 Перенос локального контура на одну виртуальную машину AWS. Elysco и база остаются
 в Replit. Код приложений не меняется — только переменные окружения.
 
-**Схема доступа к базе:** сервисы Nannos ходят под той же учётной записью Neon, что
-и Elysco. Разделение по схемам, не по ролям.
+**Схема доступа к базе:** у каждого сервиса Nannos своя роль Neon, названная так же,
+как его схема. База общая с Elysco, изоляция — на уровне ролей.
 
 ---
 
@@ -21,7 +21,8 @@
 | Ключ SSH | `~/pems/RT/kp_nannos.pem` |
 | ОС | Ubuntu 26.04 LTS |
 | База | Neon, регион `us-east-2` (Огайо) |
-| Пользователь БД | `neondb_owner`, база `neondb` |
+| База | `neondb`, владелец `neondb_owner` (Elysco) |
+| Роли Nannos | `console` → схема `console`, `nannos` → схема `nannos` |
 
 Прогресс:
 
@@ -32,9 +33,10 @@
 - [x] Docker установлен
 - [x] Ключ для GitHub Actions добавлен
 - [x] Схемы в базе Neon созданы
+- [x] Роли `console` и `nannos` созданы, схемы переданы им во владение
 - [x] Файлы в репозитории
 - [x] Секреты в GitHub
-- [ ] Первая сборка
+- [x] Первая сборка
 - [ ] Первый деплой
 - [ ] Вход в UI работает
 - [ ] Чат отвечает
@@ -178,35 +180,73 @@ HTTPS обязателен — без него ломаются сессионн
 postgresql://ПОЛЬЗОВАТЕЛЬ:ПАРОЛЬ@ep-xxx.eu-central-1.aws.neon.tech/ИМЯ_БАЗЫ?sslmode=require
 ```
 
-Нужны четыре части: пользователь, пароль, хост, имя базы. Это та же учётка, под
-которой работает Elysco.
+Нужны четыре части: пользователь, пароль, хост, имя базы. Под этой учёткой
+(`neondb_owner`) работает Elysco — она же понадобится, чтобы создать роли ниже.
 
-### Схемы
+### Схемы и роли
+
+Хост базы общий с Elysco, поэтому важно, чтобы сервисы Nannos физически не могли
+попасть в её таблицы. Решает это одно правило Postgres.
+
+`search_path` по умолчанию равен `"$user", public`. Плейсхолдер `$user`
+разворачивается в **имя текущей роли**. Значит, если назвать роль так же, как
+схему, всё безымянное — создаваемые таблицы, служебная таблица миграций rambler —
+автоматически попадает в нужную схему, впереди `public`.
+
+Ничего настраивать не надо: ни `ALTER ROLE ... SET search_path`, ни `RAMBLER_TABLE`.
+
+Выполните под `neondb_owner`:
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS nannos;
 CREATE SCHEMA IF NOT EXISTS console;
 CREATE SCHEMA IF NOT EXISTS keycloak;
-```
 
-Всё. Гранты не нужны — вы владелец того, что создаёте.
+-- Console: своя роль, своя схема
+CREATE ROLE console LOGIN PASSWORD 'ПАРОЛЬ_CONSOLE';
+GRANT console TO neondb_owner;          -- ALTER SCHEMA требует членства в целевой роли
+ALTER SCHEMA console OWNER TO console;
+GRANT CONNECT ON DATABASE neondb TO console;
+GRANT USAGE ON SCHEMA public TO console; -- нужен только для расширения vector
+
+-- Orchestrator: то же самое
+CREATE ROLE nannos LOGIN PASSWORD 'ПАРОЛЬ_NANNOS';
+GRANT nannos TO neondb_owner;
+ALTER SCHEMA nannos OWNER TO nannos;
+GRANT CONNECT ON DATABASE neondb TO nannos;
+GRANT USAGE ON SCHEMA public TO nannos;
+
+-- Консоль читает хранилище оркестратора
+GRANT USAGE ON SCHEMA nannos TO console;
+GRANT SELECT ON ALL TABLES IN SCHEMA nannos TO console;
+```
 
 > **Схемы создать обязательно.** Ни одна из 83 миграций консоли не выполняет
 > `CREATE SCHEMA`. Пропустите шаг — миграции упадут на первой таблице.
 
-Если схема `nannos` уже есть из дампа и принадлежит другой роли:
+Если схема `nannos` уже была из дампа, таблицы в ней всё ещё принадлежат старому
+владельцу — передайте их роли:
 
 ```sql
-ALTER SCHEMA nannos OWNER TO пользователь-neon;
 DO $$ DECLARE r record; BEGIN
   FOR r IN SELECT tablename FROM pg_tables WHERE schemaname='nannos' LOOP
-    EXECUTE format('ALTER TABLE nannos.%I OWNER TO пользователь-neon', r.tablename);
+    EXECUTE format('ALTER TABLE nannos.%I OWNER TO nannos', r.tablename);
   END LOOP;
 END $$;
 ```
 
 Миграция выполняет `CREATE INDEX IF NOT EXISTS`, а это требует владения таблицей.
-Локально мы на этом получили `must be owner of table store`.
+Без передачи получите `must be owner of table store`.
+
+**Проверка.** Подключитесь под ролью `console` и создайте таблицу без указания схемы:
+
+```sql
+CREATE TABLE probe_test (id int);
+SELECT schemaname FROM pg_tables WHERE tablename = 'probe_test';  -- должно быть: console
+DROP TABLE probe_test;
+```
+
+Если вернулось `public` — роль названа не так, как схема, либо схема не создана.
 
 ### Расширение vector
 
@@ -218,22 +258,21 @@ SELECT extname, nspname FROM pg_extension e
 Должно вернуть `vector | public`. Пул подключения ставит `search_path = схема, public`,
 поэтому тип найдётся.
 
-### Пароли для остального
-
-Учётка базы общая, но три значения сгенерировать всё же нужно:
+### Пароли
 
 ```bash
+echo "роль console:           $(openssl rand -hex 16)"
+echo "роль nannos:            $(openssl rand -hex 16)"
 echo "litellm master:         sk-$(openssl rand -hex 24)"
 echo "keycloak admin:         $(openssl rand -base64 18)"
 echo "kc-secret orchestrator: $(openssl rand -hex 32)"
 echo "kc-secret agent-console: $(openssl rand -hex 32)"
 ```
 
-Сохраните в менеджере паролей.
+Сохраните в менеджере паролей. Первые два — пароли ролей из блока выше.
 
-> **Изоляции между сервисами нет.** Общая учётка означает, что консоль может писать
-> в схему оркестратора, а оба — в схемы Elysco. Для одного контура приемлемо, но
-> ошибка в конфигурации теперь способна задеть данные Elysco.
+> **Keycloak** ходит под `neondb_owner`: свою схему он создаёт и мигрирует сам,
+> и `search_path` для этого не использует. Отдельная роль ему не нужна.
 
 ---
 
@@ -535,8 +574,8 @@ git show --stat HEAD | grep -i env
 POSTGRES_HOST=ep-xxx.eu-central-1.aws.neon.tech
 POSTGRES_PORT=5432
 POSTGRES_DB=имя-базы
-POSTGRES_USER=пользователь-neon
-POSTGRES_PASSWORD=пароль-neon
+POSTGRES_USER=nannos
+POSTGRES_PASSWORD=пароль-роли-nannos
 POSTGRES_SCHEMA=nannos
 
 OIDC_ISSUER=https://13-48-218-238.sslip.io/auth/realms/nannos
@@ -564,15 +603,15 @@ SUBAGENT_STREAM_STALL_TIMEOUT_SECONDS=60
 POSTGRES_HOST=ep-xxx.eu-central-1.aws.neon.tech
 POSTGRES_PORT=5432
 POSTGRES_DB=имя-базы
-POSTGRES_USER=пользователь-neon
-POSTGRES_PASSWORD=пароль-neon
+POSTGRES_USER=console
+POSTGRES_PASSWORD=пароль-роли-console
 POSTGRES_SCHEMA=console
 
 DOCSTORE_HOST=ep-xxx.eu-central-1.aws.neon.tech
 DOCSTORE_PORT=5432
 DOCSTORE_DB=имя-базы
-DOCSTORE_USER=пользователь-neon
-DOCSTORE_PASSWORD=пароль-neon
+DOCSTORE_USER=nannos
+DOCSTORE_PASSWORD=пароль-роли-nannos
 
 OIDC_ISSUER=https://13-48-218-238.sslip.io/auth/realms/nannos
 OIDC_CLIENT_ID=agent-console
@@ -602,6 +641,10 @@ LOG_MODE=JSON
 > `ORCHESTRATOR_ENVIRONMENT=local` остаётся `local` даже на проде. Список разрешённых
 > источников для Socket.IO захардкожен в `app.py`, а наш nginx подменяет `Origin` под
 > ветку `local`. При другом значении соединение будет отвергнуто.
+>
+> `DOCSTORE_*` смотрит в схему оркестратора, поэтому там роль `nannos`, а не `console`.
+> Права на чтение выдаёт `GRANT SELECT ON ALL TABLES IN SCHEMA nannos TO console`
+> из раздела 5, но подключение всё равно идёт под ролью-владельцем.
 
 ### LITELLM_ENV
 
@@ -696,7 +739,9 @@ docker compose -f docker-compose.prod.yml logs --tail 40 caddy
 | `Permission denied (publickey)` | Ключа нет в `authorized_keys`, или права не 600 |
 | `denied` при pull образов | Образы приватные — сделайте публичными |
 | `password authentication failed` | Пароль в секрете не совпал с базой |
-| `must be owner of table store` | Схема принадлежит другой роли |
+| `must be owner of table store` | Таблицы схемы принадлежат другой роли |
+| `relation "users" already exists` | Роль названа не как схема — миграции ушли в `public` |
+| `relation "migrations" already exists` | То же самое: rambler нашёл таблицу Elysco |
 | `Illegal header value b'Bearer '` | Нет `LITELLM_MASTER_KEY` в `CONSOLE_BACKEND_ENV` |
 | `is not an accepted origin` | `ORCHESTRATOR_ENVIRONMENT` не равен `local` |
 | `Invalid token: missing subject` | В realm клиентам не назначен scope `basic` |
@@ -709,6 +754,21 @@ docker compose -f docker-compose.prod.yml logs --tail 40 caddy
 docker compose -f docker-compose.prod.yml exec console-backend \
   sh -c 'echo "LITELLM_MASTER_KEY задан: ${LITELLM_MASTER_KEY:+да}"'
 ```
+
+### Миграции создают таблицы не в той схеме
+
+Самая коварная ошибка: миграции проходят, но таблицы появляются в `public` и
+конфликтуют с Elysco. Проверьте, куда смотрит роль:
+
+```sql
+-- под ролью сервиса, не под neondb_owner
+SELECT current_user, current_schema, setting AS search_path
+  FROM pg_settings WHERE name = 'search_path';
+```
+
+`current_schema` должна совпадать с именем роли. Если там `public` — роль названа
+иначе, чем схема, либо схема не создана. Исправляется только созданием роли с
+правильным именем; `RAMBLER_TABLE` эту проблему не решает, мы проверяли.
 
 ### Что не заработает — и это нормально
 
