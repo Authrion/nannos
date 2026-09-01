@@ -42,11 +42,6 @@ services:
     restart: unless-stopped
     env_file:
       - ./console-backend.env
-    environment:
-      # rambler resolves its bookkeeping table through search_path, which
-      # includes public — and Elysco already owns a public.migrations there.
-      # A distinct name keeps the two apart in the shared database.
-      RAMBLER_TABLE: console_migrations
     # RAMBLER_SSLMODE stays at the image default of "require": Neon accepts
     # TLS connections only.
     volumes:
@@ -58,10 +53,6 @@ services:
     restart: unless-stopped
     env_file:
       - ./orchestrator.env
-    environment:
-      # Same collision as console-backend: keep this service's rambler
-      # bookkeeping out of Elysco's public.migrations.
-      RAMBLER_TABLE: nannos_migrations
     volumes:
       - orchestrator-storage:/data/storage
 
