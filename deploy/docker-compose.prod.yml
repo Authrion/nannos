@@ -60,6 +60,11 @@ services:
           # for "localhost" in ORCHESTRATOR_BASE_DOMAIN — there is no separate
           # scheme setting. Nothing terminates TLS inside the compose network,
           # so an alias carrying that substring keeps the call on plain http.
+          #
+          # AGENT_BASE_URL must name this alias too. The console matches the
+          # URL the agent card advertises against its own configured host, and
+          # only then attaches the Authorization header — a mismatch sends the
+          # message unauthenticated and the orchestrator answers 401.
           - orchestrator-localhost
     volumes:
       - orchestrator-storage:/data/storage

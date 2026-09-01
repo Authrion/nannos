@@ -605,7 +605,7 @@ LLM_GATEWAY_API_KEY=sk-мастер-ключ
 
 CONSOLE_BACKEND_URL=http://console-backend:5001
 CONSOLE_FRONTEND_URL=https://13-48-218-238.sslip.io
-AGENT_BASE_URL=http://orchestrator:10001
+AGENT_BASE_URL=http://orchestrator-localhost:10001
 
 OBJECT_STORAGE_TYPE=local
 LOCAL_STORAGE_PATH=/data/storage
@@ -636,7 +636,7 @@ OIDC_CLIENT_ID=agent-console
 OIDC_CLIENT_SECRET=kc-secret-agent-console
 
 ORCHESTRATOR_CLIENT_ID=orchestrator
-ORCHESTRATOR_BASE_DOMAIN=orchestrator:10001
+ORCHESTRATOR_BASE_DOMAIN=orchestrator-localhost:10001
 ORCHESTRATOR_ENVIRONMENT=prod
 ENVIRONMENT=prod
 BASE_DOMAIN=13-48-218-238.sslip.io
@@ -669,6 +669,14 @@ SECRET_KEY=сгенерировать-openssl-rand-hex-32
 > отключает `ProxyHeadersMiddleware`: `request.url_for` тогда строит `http://`, и
 > Keycloak отвечает `Invalid parameter: redirect_uri`. На `prod` список CORS
 > собирается из `BASE_DOMAIN`, так что обходной путь не нужен вовсе.
+>
+> **`orchestrator-localhost` — не опечатка.** Консоль выбирает `http://` или `https://`
+> по наличию подстроки `localhost` в адресе, отдельной настройки схемы нет. Внутри
+> сети TLS никто не терминирует, поэтому контейнеру задан сетевой алиас с таким
+> именем. Оба значения — `AGENT_BASE_URL` у оркестратора и `ORCHESTRATOR_BASE_DOMAIN`
+> у консоли — должны совпадать: адрес из карты агента консоль сверяет со своим,
+> и при расхождении не подставляет заголовок `Authorization`. В логах это выглядит
+> как `Missing Authorization header` у оркестратора и `HTTP Error: 401` у консоли.
 >
 > `DOCSTORE_*` смотрит в схему оркестратора, поэтому там роль `nannos`, а не `console`.
 > Права на чтение выдаёт `GRANT SELECT ON ALL TABLES IN SCHEMA nannos TO console`
@@ -778,6 +786,8 @@ docker compose -f docker-compose.prod.yml logs --tail 40 caddy
 | `Invalid parameter: redirect_uri` | `ENVIRONMENT=local` — прокси-заголовки не читаются, адрес строится как `http://` |
 | `CSRF Warning! State not equal` | Старая cookie в браузере. Смена `local`→`prod` добавила флаг `secure`, и браузер держит две cookie `session` под одним именем. Очистить данные сайта |
 | `Invalid redirect uri` при выходе | Отдельный список `post.logout.redirect.uris`. Значение `+` наследует его из `redirectUris` |
+| `SSL: WRONG_VERSION_NUMBER` | Консоль пошла к оркестратору по https. В адресе нет `localhost` — нужен алиас |
+| `Missing Authorization header` | `AGENT_BASE_URL` и `ORCHESTRATOR_BASE_DOMAIN` указывают на разные имена |
 | `is not an accepted origin` | `ORCHESTRATOR_ENVIRONMENT` не равен `local` |
 | `Invalid token: missing subject` | В realm клиентам не назначен scope `basic` |
 | `invalid_token` при входе | `OIDC_ISSUER` не совпадает посимвольно |
